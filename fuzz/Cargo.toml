@@ -1,0 +1,29 @@
+[package]
+name = "durability-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+durability = { path = ".." }
+
+[[bin]]
+name = "fuzz_wal_entry_decode"
+path = "fuzz_targets/fuzz_wal_entry_decode.rs"
+
+[[bin]]
+name = "fuzz_checkpoint_read"
+path = "fuzz_targets/fuzz_checkpoint_read.rs"
+
+[[bin]]
+name = "fuzz_recordlog_read"
+path = "fuzz_targets/fuzz_recordlog_read.rs"
+
+[[bin]]
+name = "fuzz_wal_dir_replay"
+path = "fuzz_targets/fuzz_wal_dir_replay.rs"
