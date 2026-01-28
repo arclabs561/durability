@@ -6,6 +6,8 @@ rust-version = "1.80"
 license = "MIT OR Apache-2.0"
 authors = ["Arc <attobop@gmail.com>"]
 description = "Persistence primitives for segment-based indices: directory, WAL, checkpoints, and formats."
+repository = "https://github.com/arclabs561/durability"
+documentation = "https://docs.rs/durability"
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
