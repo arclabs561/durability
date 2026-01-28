@@ -133,7 +133,7 @@ impl CheckpointFile {
 
     /// Write a checkpoint and attempt to make it durable on stable storage.
     ///
-    /// This is stronger than [`write_postcard`]:
+    /// This is stronger than [`CheckpointFile::write_postcard`]:
     /// - `write_postcard` relies on `Directory::atomic_write` for atomic publish.
     /// - `write_postcard_durable` additionally performs explicit stable-storage barriers on the
     ///   final path (file + parent dir), so “success” better matches “survives power loss”.

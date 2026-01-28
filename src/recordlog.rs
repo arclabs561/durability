@@ -13,9 +13,7 @@
 //!
 //! - **File header**: `[RECORDLOG_MAGIC][FORMAT_VERSION]` at byte 0.
 //! - **Record framing** (little-endian):
-//!   \[
-//!     [\texttt{len:u32}][\texttt{crc32:u32}][\texttt{payload bytes...}]
-//!   \]
+//!   `len:u32 | crc32:u32 | payload bytes...`
 //! - **Checksum**: `crc32fast` over the payload bytes.
 //! - **Limits**: payload length is capped at `MAX_RECORD_BYTES`.
 //!

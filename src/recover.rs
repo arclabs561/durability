@@ -71,7 +71,7 @@ impl RecoveryManager {
         self.recover(ckpt.as_deref())
     }
 
-    /// Best-effort variant of [`recover_latest`].
+    /// Best-effort variant of [`RecoveryManager::recover_latest`].
     ///
     /// - WAL is scanned in best-effort mode.
     /// - If the latest checkpoint marker points to a missing/corrupt checkpoint, it is ignored
