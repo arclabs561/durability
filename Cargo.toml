@@ -7,7 +7,11 @@ license = "MIT OR Apache-2.0"
 authors = ["Arc <attobop@gmail.com>"]
 description = "Persistence primitives for segment-based indices: directory, WAL, checkpoints, and formats."
 repository = "https://github.com/arclabs561/durability"
+homepage = "https://github.com/arclabs561/durability"
 documentation = "https://docs.rs/durability"
+readme = "README.md"
+keywords = ["persistence", "wal", "checkpoint", "durability"]
+categories = ["filesystem", "database-implementations"]
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
