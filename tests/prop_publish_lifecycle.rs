@@ -108,7 +108,7 @@ proptest! {
             .unwrap();
 
         // A marker must exist in WAL, and truncation must not remove segments incorrectly.
-        prop_assert!(pubr.wal_checkpoint_entry_id >= last_id + 1);
+        prop_assert!(pubr.wal_checkpoint_entry_id > last_id);
 
         // Recovery from checkpoint should equal recovery from scratch after publish.
         let mgr = RecoveryManager::new(dir.clone());

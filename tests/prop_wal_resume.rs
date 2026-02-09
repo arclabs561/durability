@@ -68,7 +68,7 @@ proptest! {
         let wal_path = "wal/wal_1.log";
         if let Some(fs_path) = dir.file_path(wal_path) {
             let mut bytes = std::fs::read(&fs_path).unwrap();
-            if bytes.len() > 0 {
+            if !bytes.is_empty() {
                 let drop = tear_bytes.min(bytes.len().saturating_sub(1)).max(1);
                 bytes.truncate(bytes.len().saturating_sub(drop));
                 std::fs::write(&fs_path, &bytes).unwrap();
@@ -104,7 +104,7 @@ proptest! {
 
         // After resume+append, strict replay must succeed and be: prefix + appended.
         let out = reader.replay().unwrap();
-        prop_assert!(out.len() >= 1);
+        prop_assert!(!out.is_empty());
         prop_assert_eq!(&out[..prefix.len()], &prefix[..]);
         prop_assert_eq!(entry_id(out.last().unwrap()), appended_id);
     }

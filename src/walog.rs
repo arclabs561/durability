@@ -448,29 +448,24 @@ impl WalWriter {
 
             // Non-last segment: decode strictly and update monotone entry_id tracking.
             let _h = WalSegmentHeader::read(&mut f)?;
-            loop {
-                match WalEntryOnDisk::decode(&mut f, WalReplayMode::Strict)? {
-                    Some(e) => {
-                        let entry_id = match &e {
-                            WalEntry::AddSegment { entry_id, .. }
-                            | WalEntry::StartMerge { entry_id, .. }
-                            | WalEntry::CancelMerge { entry_id, .. }
-                            | WalEntry::EndMerge { entry_id, .. }
-                            | WalEntry::DeleteDocuments { entry_id, .. }
-                            | WalEntry::Checkpoint { entry_id, .. } => *entry_id,
-                        };
-                        if let Some(prev) = last_seen_entry_id {
-                            if entry_id <= prev {
-                                return Err(PersistenceError::Format(format!(
-                                    "WAL entry_id is not strictly increasing (prev={prev}, got={entry_id})"
-                                )));
-                            }
-                        }
-                        last_seen_entry_id = Some(entry_id);
-                        last_entry_id = entry_id;
+            while let Some(e) = WalEntryOnDisk::decode(&mut f, WalReplayMode::Strict)? {
+                let entry_id = match &e {
+                    WalEntry::AddSegment { entry_id, .. }
+                    | WalEntry::StartMerge { entry_id, .. }
+                    | WalEntry::CancelMerge { entry_id, .. }
+                    | WalEntry::EndMerge { entry_id, .. }
+                    | WalEntry::DeleteDocuments { entry_id, .. }
+                    | WalEntry::Checkpoint { entry_id, .. } => *entry_id,
+                };
+                if let Some(prev) = last_seen_entry_id {
+                    if entry_id <= prev {
+                        return Err(PersistenceError::Format(format!(
+                            "WAL entry_id is not strictly increasing (prev={prev}, got={entry_id})"
+                        )));
                     }
-                    None => break,
                 }
+                last_seen_entry_id = Some(entry_id);
+                last_entry_id = entry_id;
             }
         }
 
@@ -773,39 +768,34 @@ impl WalReader {
                     }
                 }
             };
-            loop {
-                match WalEntryOnDisk::decode(&mut file, segment_mode)? {
-                    Some(e) => {
-                        if first_entry_id_in_segment.is_none() {
-                            first_entry_id_in_segment = Some(match &e {
-                                WalEntry::AddSegment { entry_id, .. }
-                                | WalEntry::StartMerge { entry_id, .. }
-                                | WalEntry::CancelMerge { entry_id, .. }
-                                | WalEntry::EndMerge { entry_id, .. }
-                                | WalEntry::DeleteDocuments { entry_id, .. }
-                                | WalEntry::Checkpoint { entry_id, .. } => *entry_id,
-                            });
-                        }
-                        let entry_id = match &e {
-                            WalEntry::AddSegment { entry_id, .. }
-                            | WalEntry::StartMerge { entry_id, .. }
-                            | WalEntry::CancelMerge { entry_id, .. }
-                            | WalEntry::EndMerge { entry_id, .. }
-                            | WalEntry::DeleteDocuments { entry_id, .. }
-                            | WalEntry::Checkpoint { entry_id, .. } => *entry_id,
-                        };
-                        if let Some(prev) = last_seen_entry_id {
-                            if entry_id <= prev {
-                                return Err(PersistenceError::Format(format!(
-                                    "WAL entry_id is not strictly increasing (prev={prev}, got={entry_id})"
-                                )));
-                            }
-                        }
-                        last_seen_entry_id = Some(entry_id);
-                        entries.push(e);
-                    }
-                    None => break,
+            while let Some(e) = WalEntryOnDisk::decode(&mut file, segment_mode)? {
+                if first_entry_id_in_segment.is_none() {
+                    first_entry_id_in_segment = Some(match &e {
+                        WalEntry::AddSegment { entry_id, .. }
+                        | WalEntry::StartMerge { entry_id, .. }
+                        | WalEntry::CancelMerge { entry_id, .. }
+                        | WalEntry::EndMerge { entry_id, .. }
+                        | WalEntry::DeleteDocuments { entry_id, .. }
+                        | WalEntry::Checkpoint { entry_id, .. } => *entry_id,
+                    });
                 }
+                let entry_id = match &e {
+                    WalEntry::AddSegment { entry_id, .. }
+                    | WalEntry::StartMerge { entry_id, .. }
+                    | WalEntry::CancelMerge { entry_id, .. }
+                    | WalEntry::EndMerge { entry_id, .. }
+                    | WalEntry::DeleteDocuments { entry_id, .. }
+                    | WalEntry::Checkpoint { entry_id, .. } => *entry_id,
+                };
+                if let Some(prev) = last_seen_entry_id {
+                    if entry_id <= prev {
+                        return Err(PersistenceError::Format(format!(
+                            "WAL entry_id is not strictly increasing (prev={prev}, got={entry_id})"
+                        )));
+                    }
+                }
+                last_seen_entry_id = Some(entry_id);
+                entries.push(e);
             }
 
             if let Some(first_id) = first_entry_id_in_segment {
@@ -869,24 +859,19 @@ impl WalMaintenance {
             let header = WalSegmentHeader::read(&mut f)?;
             let mut end: Option<u64> = None;
             let mut first: Option<u64> = None;
-            loop {
-                match WalEntryOnDisk::decode(&mut f, WalReplayMode::Strict)? {
-                    Some(e) => {
-                        let id = match &e {
-                            WalEntry::AddSegment { entry_id, .. }
-                            | WalEntry::StartMerge { entry_id, .. }
-                            | WalEntry::CancelMerge { entry_id, .. }
-                            | WalEntry::EndMerge { entry_id, .. }
-                            | WalEntry::DeleteDocuments { entry_id, .. }
-                            | WalEntry::Checkpoint { entry_id, .. } => *entry_id,
-                        };
-                        if first.is_none() {
-                            first = Some(id);
-                        }
-                        end = Some(id);
-                    }
-                    None => break,
+            while let Some(e) = WalEntryOnDisk::decode(&mut f, WalReplayMode::Strict)? {
+                let id = match &e {
+                    WalEntry::AddSegment { entry_id, .. }
+                    | WalEntry::StartMerge { entry_id, .. }
+                    | WalEntry::CancelMerge { entry_id, .. }
+                    | WalEntry::EndMerge { entry_id, .. }
+                    | WalEntry::DeleteDocuments { entry_id, .. }
+                    | WalEntry::Checkpoint { entry_id, .. } => *entry_id,
+                };
+                if first.is_none() {
+                    first = Some(id);
                 }
+                end = Some(id);
             }
             if let Some(first_id) = first {
                 if first_id != header.start_entry_id {

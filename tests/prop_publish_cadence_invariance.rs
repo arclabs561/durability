@@ -3,6 +3,7 @@
 //! We run the same operation stream twice:
 //! - cadence A: checkpoint every `k_a` ops
 //! - cadence B: checkpoint every `k_b` ops
+//!
 //! In both cases, we publish+truncate and then assert `recover_latest()` matches
 //! the reference model.
 

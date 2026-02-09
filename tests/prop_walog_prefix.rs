@@ -74,9 +74,8 @@ proptest! {
         for (i, e) in entries.iter_mut().enumerate() {
             // rewrite entry_id to strict increasing (1..n) regardless of sampled value
             let id = (i as u64) + 1;
-            match e {
-                WalEntry::AddSegment { entry_id, .. } => *entry_id = id,
-                _ => {}
+            if let WalEntry::AddSegment { entry_id, .. } = e {
+                *entry_id = id;
             }
         }
 

@@ -63,7 +63,7 @@ impl Directory for FaultyDirectory {
         if Self::is_wal_path(path) {
             cfg.delete_calls += 1;
             if cfg.fail_wal_delete {
-                return Err(io::Error::new(io::ErrorKind::Other, "injected delete failure").into());
+                return Err(io::Error::other("injected delete failure").into());
             }
         }
         drop(cfg);
@@ -85,7 +85,7 @@ impl Directory for FaultyDirectory {
     fn append_file(&self, path: &str) -> durability::PersistenceResult<Box<dyn io::Write>> {
         let cfg = self.cfg.lock().unwrap();
         if cfg.fail_wal_append_file && Self::is_wal_path(path) {
-            return Err(io::Error::new(io::ErrorKind::Other, "injected append failure").into());
+            return Err(io::Error::other("injected append failure").into());
         }
         drop(cfg);
         self.inner.append_file(path)

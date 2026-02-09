@@ -128,7 +128,7 @@ proptest! {
 
         // After resume+append, strict replay must succeed and begin with the best-effort prefix.
         let out = reader.replay().unwrap();
-        prop_assert!(out.len() >= prefix.len() + 1);
+        prop_assert!(out.len() > prefix.len());
         prop_assert_eq!(&out[..prefix.len()], &prefix[..]);
         prop_assert_eq!(entry_id(out.last().unwrap()), got);
     }
