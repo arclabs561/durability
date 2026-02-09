@@ -1,8 +1,13 @@
-# `durability`
+# durability
 
 Crash-consistent persistence primitives for segment-based indices: directory abstraction, record logs, WAL segments, checkpoints, and recovery.
 
-This crate is intentionally **not** an index. It is the persistence substrate that higher-level crates can reuse.
+## Not Provided (and why)
+
+- **Multi-process locking**: This crate does not manage `flock` or IPC locks.
+  - *Recommendation*: Use an external lock manager or a single-writer process architecture.
+- **Strong consistency by default**: `write` calls are buffered.
+  - *Recommendation*: Use `sync_all` explicitly when you need a durability barrier.
 
 ## What really matters (failure model)
 
@@ -11,11 +16,6 @@ Most bugs in persistence layers come from being vague about failures. This crate
 - **Crash / torn writes**: partial writes at the tail (e.g. process crash mid-record).
 - **Corruption detection**: CRC/magic/version/type mismatches are treated as errors (even in “best-effort” modes).
 - **Stable storage vs “reported success”**: unless you add explicit barriers, a successful write may still be only in OS caches.
-
-Out of scope (today):
-
-- Multi-process concurrency semantics / file locking.
-- Strong stable-storage guarantees by default for every operation (requires a dedicated barrier API).
 
 ## Contract surface (what you get)
 
@@ -64,9 +64,9 @@ After truncation, recovery should start from the latest checkpoint marker (see `
 
 ## Running
 
-- Tests: `cargo test -p durability --all-targets`
-- Heavier property runs: `PROPTEST_CASES=512 cargo test -p durability --test prop_wal_resume`
-- Benches: `cargo bench -p durability`
+- Tests: `cargo test`
+- Heavier property runs: `PROPTEST_CASES=512 cargo test --test prop_wal_resume`
+- Benches: `cargo bench`
 
 ## Fuzzing (opt-in)
 
