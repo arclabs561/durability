@@ -1,5 +1,9 @@
 # durability
 
+[![crates.io](https://img.shields.io/crates/v/durability.svg)](https://crates.io/crates/durability)
+[![Documentation](https://docs.rs/durability/badge.svg)](https://docs.rs/durability)
+[![CI](https://github.com/arclabs561/durability/actions/workflows/ci.yml/badge.svg)](https://github.com/arclabs561/durability/actions/workflows/ci.yml)
+
 Crash-consistent persistence primitives for segment-based indices: directory abstraction, record logs, WAL segments, checkpoints, and recovery.
 
 ## Not Provided (and why)
