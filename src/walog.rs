@@ -17,6 +17,21 @@
 //! - **Entry framing**: `[length:u32][entry_id:u64][crc32:u32][postcard payload...]`.
 //! - **Checksum**: `crc32fast` over the postcard payload bytes.
 //!
+//! ## On-disk layout
+//!
+//! ```text
+//! Segment file (wal/wal_<id>.log):
+//!   [WAL_MAGIC:4][WAL_FORMAT_VERSION:u32][start_entry_id:u64][segment_id:u64]
+//!   [entry 1][entry 2][...][entry N]
+//!
+//! Entry frame:
+//!   [length:u32][entry_id:u64][crc32:u32][postcard payload...]
+//!   length covers the entire frame (4 + 8 + 4 + payload_len).
+//!   CRC covers only the postcard payload bytes.
+//! ```
+//!
+//! All integers are little-endian.
+//!
 //! ## Recovery posture
 //!
 //! `WalReader::replay_best_effort()` matches the common WAL recovery stance used by
