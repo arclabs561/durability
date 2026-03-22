@@ -189,6 +189,30 @@ impl CheckpointFile {
             postcard::from_bytes(&payload).map_err(|e| PersistenceError::Decode(e.to_string()))?;
         Ok((h.last_applied_id, val))
     }
+
+    /// Write a CRC-validated blob without log-entry-id semantics.
+    ///
+    /// Convenience wrapper: equivalent to `write_postcard(path, 0, value)`.
+    /// Use when you want integrity protection but don't track a log position.
+    pub fn write_validated<T: serde::Serialize>(
+        &self,
+        path: &str,
+        value: &T,
+    ) -> PersistenceResult<()> {
+        self.write_postcard(path, 0, value)
+    }
+
+    /// Read a CRC-validated blob, ignoring the log-entry-id.
+    ///
+    /// Convenience wrapper: equivalent to `read_postcard(path)` but discards the
+    /// `last_applied_id` field.
+    pub fn read_validated<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> PersistenceResult<T> {
+        let (_, val) = self.read_postcard(path)?;
+        Ok(val)
+    }
 }
 
 #[cfg(test)]

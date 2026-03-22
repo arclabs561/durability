@@ -1,7 +1,7 @@
 #![no_main]
 
 use durability::storage::{Directory, MemoryDirectory};
-use durability::walog::{WalMaintenance, WalReader};
+use durability::walog::{WalEntry, WalMaintenance, WalReader};
 use libfuzzer_sys::fuzz_target;
 use std::sync::Arc;
 
@@ -31,11 +31,15 @@ fuzz_target!(|data: &[u8]| {
         i = end;
 
         // Cap per-segment size to keep the fuzzer fast.
-        let blob = if blob.len() > 4096 { &blob[..4096] } else { blob };
+        let blob = if blob.len() > 4096 {
+            &blob[..4096]
+        } else {
+            blob
+        };
         let _ = dir.atomic_write(&format!("wal/wal_{seg_id}.log"), blob);
     }
 
-    let r = WalReader::new(dir.clone());
+    let r = WalReader::<WalEntry>::new(dir.clone());
     let _ = r.replay_best_effort();
     let _ = r.replay();
 
@@ -43,4 +47,3 @@ fuzz_target!(|data: &[u8]| {
     let m = WalMaintenance::new(dir);
     let _ = m.segment_ranges_strict();
 });
-

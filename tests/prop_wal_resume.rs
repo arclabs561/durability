@@ -6,7 +6,7 @@
 //! - `resume` repairs the tail, continues entry ids, and allows strict replay again
 
 use durability::storage::{Directory, FsDirectory};
-use durability::walog::{WalEntry, WalReader, WalWriter};
+use durability::walog::{WalEntry, WalReader, WalRecord, WalWriter};
 use proptest::prelude::*;
 use std::sync::Arc;
 
@@ -15,28 +15,15 @@ fn arb_entries() -> impl Strategy<Value = Vec<WalEntry>> {
     prop::collection::vec(
         prop_oneof![
             (1u64..50u64, 0u32..500u32).prop_map(|(seg, dc)| WalEntry::AddSegment {
-                entry_id: 0,
                 segment_id: seg,
                 doc_count: dc,
             }),
             (1u64..50u64, 0u32..500u32).prop_map(|(seg, doc)| WalEntry::DeleteDocuments {
-                entry_id: 0,
                 deletes: vec![(seg, doc)],
             }),
         ],
         1..120,
     )
-}
-
-fn entry_id(e: &WalEntry) -> u64 {
-    match e {
-        WalEntry::AddSegment { entry_id, .. }
-        | WalEntry::StartMerge { entry_id, .. }
-        | WalEntry::CancelMerge { entry_id, .. }
-        | WalEntry::EndMerge { entry_id, .. }
-        | WalEntry::DeleteDocuments { entry_id, .. }
-        | WalEntry::Checkpoint { entry_id, .. } => *entry_id,
-    }
 }
 
 proptest! {
@@ -57,9 +44,9 @@ proptest! {
 
         // Write entries, then flush.
         {
-            let mut w = WalWriter::new(dir.clone());
+            let mut w = WalWriter::<WalEntry>::new(dir.clone());
             for e in &entries {
-                let _ = w.append(e.clone()).unwrap();
+                let _ = w.append(e).unwrap();
             }
             w.flush().unwrap();
         }
@@ -77,15 +64,15 @@ proptest! {
             panic!("FsDirectory must return file_path()");
         }
 
-        let reader = WalReader::new(dir.clone());
+        let reader = WalReader::<WalEntry>::new(dir.clone());
         // Strict should generally fail under a tail tear; if it doesn't (rare boundary case),
         // the property still holds because resume should be a no-op.
         let _ = reader.replay(); // just ensure it runs
-        let prefix = match reader.replay_best_effort() {
+        let prefix: Vec<WalRecord<WalEntry>> = match reader.replay_best_effort() {
             Ok(p) => p,
             // If the tear cut into the segment header itself, `WalReader` does not
             // currently treat that as recoverable (it can't even read magic/version).
-            // `WalWriter::resume` *does* treat a torn header as “empty WAL”.
+            // `WalWriter::resume` *does* treat a torn header as "empty WAL".
             Err(durability::PersistenceError::Io(e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
@@ -95,17 +82,19 @@ proptest! {
         };
 
         // Resume should repair (if needed) and continue entry ids after the prefix.
-        let mut w2 = WalWriter::resume(dir.clone()).unwrap();
-        let appended_id = w2.append(WalEntry::AddSegment { entry_id: 0, segment_id: 999, doc_count: 1 }).unwrap();
+        let mut w2 = WalWriter::<WalEntry>::resume(dir.clone()).unwrap();
+        let appended_id = w2.append(&WalEntry::AddSegment { segment_id: 999, doc_count: 1 }).unwrap();
         w2.flush().unwrap();
 
-        let want_next = prefix.last().map(entry_id).unwrap_or(0) + 1;
+        let want_next = prefix.last().map(|r| r.entry_id).unwrap_or(0) + 1;
         prop_assert_eq!(appended_id, want_next);
 
         // After resume+append, strict replay must succeed and be: prefix + appended.
         let out = reader.replay().unwrap();
         prop_assert!(!out.is_empty());
-        prop_assert_eq!(&out[..prefix.len()], &prefix[..]);
-        prop_assert_eq!(entry_id(out.last().unwrap()), appended_id);
+        for (i, rec) in prefix.iter().enumerate() {
+            prop_assert_eq!(&out[i].payload, &rec.payload);
+        }
+        prop_assert_eq!(out.last().unwrap().entry_id, appended_id);
     }
 }

@@ -7,8 +7,8 @@ use crate::walog::{WalEntry, WalReader};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-#[derive(Debug, Clone)]
 /// State recovered from checkpoint + WAL.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RecoveredState {
     /// Active segments in the recovered view.
     pub segments: Vec<RecoveredSegment>,
@@ -16,8 +16,8 @@ pub struct RecoveredState {
     pub last_entry_id: u64,
 }
 
-#[derive(Debug, Clone)]
 /// Per-segment recovered state.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RecoveredSegment {
     /// Segment identifier.
     pub segment_id: u64,
@@ -41,10 +41,6 @@ impl RecoveryManager {
     }
 
     /// Recover state using an optional checkpoint, then WAL replay.
-    ///
-    /// If `checkpoint_path` is provided:
-    /// - missing checkpoint file is treated as “no checkpoint”
-    /// - *present but unreadable/corrupt* checkpoint is an error (strict)
     pub fn recover(&self, checkpoint_path: Option<&str>) -> PersistenceResult<RecoveredState> {
         self.recover_with_mode(checkpoint_path, RecoveryMode::Strict)
     }
@@ -58,24 +54,12 @@ impl RecoveryManager {
     }
 
     /// Recover state using the latest committed checkpoint recorded in the WAL (if any).
-    ///
-    /// This is the “post-truncation” recovery entrypoint:
-    /// after WAL prefix truncation, `recover(None)` no longer has enough information to
-    /// reconstruct full state. The system must start from a checkpoint.
-    ///
-    /// Behavior:
-    /// - If the WAL contains no `WalEntry::Checkpoint`, this is equivalent to `recover(None)`.
-    /// - If a checkpoint marker exists but the checkpoint file is missing/corrupt, this errors.
     pub fn recover_latest(&self) -> PersistenceResult<RecoveredState> {
         let ckpt = self.latest_checkpoint_from_wal(/*best_effort_wal=*/ false)?;
         self.recover(ckpt.as_deref())
     }
 
     /// Best-effort variant of [`RecoveryManager::recover_latest`].
-    ///
-    /// - WAL is scanned in best-effort mode.
-    /// - If the latest checkpoint marker points to a missing/corrupt checkpoint, it is ignored
-    ///   and we fall back to `recover(None)`.
     pub fn recover_latest_best_effort(&self) -> PersistenceResult<RecoveredState> {
         let ckpt = self.latest_checkpoint_from_wal(/*best_effort_wal=*/ true)?;
         self.recover_best_effort(ckpt.as_deref())
@@ -85,20 +69,19 @@ impl RecoveryManager {
         &self,
         best_effort_wal: bool,
     ) -> PersistenceResult<Option<String>> {
-        let wal = WalReader::new(self.directory.clone());
-        let entries = if best_effort_wal {
+        let wal = WalReader::<WalEntry>::new(self.directory.clone());
+        let records = if best_effort_wal {
             wal.replay_best_effort()?
         } else {
             wal.replay()?
         };
         let mut best: Option<(u64, String)> = None;
-        for e in entries {
+        for r in records {
             if let WalEntry::Checkpoint {
-                entry_id,
-                checkpoint_path,
-                ..
-            } = e
+                checkpoint_path, ..
+            } = r.payload
             {
+                let entry_id = r.entry_id;
                 match &best {
                     None => best = Some((entry_id, checkpoint_path)),
                     Some((prev_id, _)) if entry_id > *prev_id => {
@@ -145,30 +128,23 @@ impl RecoveryManager {
             );
         }
 
-        let wal = WalReader::new(self.directory.clone());
-        let entries = match mode {
+        let wal = WalReader::<WalEntry>::new(self.directory.clone());
+        let records = match mode {
             RecoveryMode::Strict => wal.replay()?,
             RecoveryMode::BestEffort => wal.replay_best_effort()?,
         };
-        for entry in entries {
-            let entry_id = match &entry {
-                WalEntry::AddSegment { entry_id, .. }
-                | WalEntry::StartMerge { entry_id, .. }
-                | WalEntry::CancelMerge { entry_id, .. }
-                | WalEntry::EndMerge { entry_id, .. }
-                | WalEntry::DeleteDocuments { entry_id, .. }
-                | WalEntry::Checkpoint { entry_id, .. } => *entry_id,
-            };
+
+        for record in records {
+            let entry_id = record.entry_id;
             if entry_id <= last_entry_id {
                 continue;
             }
             last_entry_id = entry_id;
 
-            match entry {
+            match record.payload {
                 WalEntry::AddSegment {
                     segment_id,
                     doc_count,
-                    ..
                 } => {
                     map.insert(
                         segment_id,
@@ -179,7 +155,7 @@ impl RecoveryManager {
                         },
                     );
                 }
-                WalEntry::DeleteDocuments { deletes, .. } => {
+                WalEntry::DeleteDocuments { deletes } => {
                     for (segment_id, doc_id) in deletes {
                         if let Some(seg) = map.get_mut(&segment_id) {
                             seg.deleted_docs.insert(doc_id);
@@ -230,8 +206,6 @@ impl RecoveryManager {
             .map(|s| CheckpointSegment {
                 segment_id: s.segment_id,
                 doc_count: s.doc_count,
-                // Determinism: `HashSet` iteration order is not stable, so sort for a
-                // reproducible checkpoint encoding.
                 deleted_docs: {
                     let mut v: Vec<u32> = s.deleted_docs.iter().copied().collect();
                     v.sort_unstable();
@@ -239,7 +213,6 @@ impl RecoveryManager {
                 },
             })
             .collect();
-        // Determinism: keep segments ordered.
         segments.sort_by_key(|s| s.segment_id);
         CheckpointState { segments }
     }
@@ -262,7 +235,6 @@ mod tests {
     fn recovery_applies_checkpoint_then_wal() {
         let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
 
-        // Initial checkpoint with segment 7 (one delete) at last_entry_id=0.
         let ckpt = CheckpointManager::new(dir.clone());
         let state = CheckpointState {
             segments: vec![CheckpointSegment {
@@ -274,15 +246,12 @@ mod tests {
         ckpt.write_checkpoint(&state, 0, "checkpoints/c1.chk")
             .unwrap();
 
-        // WAL entries after the checkpoint.
-        let mut wal = WalWriter::new(dir.clone());
-        wal.append(WalEntry::DeleteDocuments {
-            entry_id: 0,
+        let mut wal = WalWriter::<WalEntry>::new(dir.clone());
+        wal.append(&WalEntry::DeleteDocuments {
             deletes: vec![(7, 2)],
         })
         .unwrap();
-        wal.append(WalEntry::AddSegment {
-            entry_id: 0,
+        wal.append(&WalEntry::AddSegment {
             segment_id: 9,
             doc_count: 5,
         })
@@ -307,7 +276,6 @@ mod tests {
     fn recover_strict_errors_on_corrupt_checkpoint() {
         let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
 
-        // Write a checkpoint, then corrupt it.
         let ckpt = CheckpointManager::new(dir.clone());
         let state = CheckpointState { segments: vec![] };
         ckpt.write_checkpoint(&state, 0, "checkpoints/c1.chk")
@@ -327,7 +295,6 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("invalid checkpoint magic"));
 
-        // Best-effort ignores the checkpoint and still succeeds (empty state).
         let ok = RecoveryManager::new(dir)
             .recover_best_effort(Some("checkpoints/c1.chk"))
             .unwrap();

@@ -132,7 +132,7 @@ fn run_seed(seed: u64) {
     durable_barrier_snapshot(&work, &durable);
 
     let mut dir = mk_dir();
-    let mut wal = WalWriter::new(dir.clone());
+    let mut wal = WalWriter::<WalEntry>::new(dir.clone());
     wal.set_segment_size_limit_bytes(512); // keep segments small so truncation paths get exercised
 
     let mut rng = TinyRng::new(seed);
@@ -149,8 +149,7 @@ fn run_seed(seed: u64) {
                     let seg = next_segment_id;
                     next_segment_id += 1;
                     segment_doc_counts.insert(seg, doc_count);
-                    wal.append(WalEntry::AddSegment {
-                        entry_id: 0,
+                    wal.append(&WalEntry::AddSegment {
                         segment_id: seg,
                         doc_count,
                     })
@@ -163,8 +162,7 @@ fn run_seed(seed: u64) {
                     let seg = rng.gen_range_u64(1, next_segment_id);
                     let max_doc = segment_doc_counts.get(&seg).copied().unwrap_or(1).max(1);
                     let doc = rng.gen_range_u64(0, max_doc as u64) as u32;
-                    wal.append(WalEntry::DeleteDocuments {
-                        entry_id: 0,
+                    wal.append(&WalEntry::DeleteDocuments {
                         deletes: vec![(seg, doc)],
                     })
                     .unwrap();
@@ -185,7 +183,7 @@ fn run_seed(seed: u64) {
                 let ckpt_state = RecoveryManager::to_checkpoint_state(&before);
                 let last = before.last_entry_id;
 
-                let mut publisher_wal = WalWriter::resume(dir.clone()).unwrap();
+                let mut publisher_wal = WalWriter::<WalEntry>::resume(dir.clone()).unwrap();
                 publisher_wal.set_segment_size_limit_bytes(512);
 
                 let res = CheckpointPublisher::new(dir.clone()).publish_checkpoint(
@@ -206,7 +204,7 @@ fn run_seed(seed: u64) {
                 expected = after;
 
                 // Continue with a fresh WAL writer (simulate app restarting after maintenance).
-                wal = WalWriter::resume(dir.clone()).unwrap();
+                wal = WalWriter::<WalEntry>::resume(dir.clone()).unwrap();
                 wal.set_segment_size_limit_bytes(512);
             }
             // Crash + power loss restore
@@ -227,7 +225,7 @@ fn run_seed(seed: u64) {
 
                 // Continue appending to WAL after restart.
                 dir = mk_dir();
-                wal = WalWriter::resume(dir.clone()).unwrap();
+                wal = WalWriter::<WalEntry>::resume(dir.clone()).unwrap();
                 wal.set_segment_size_limit_bytes(512);
             }
         }

@@ -1,6 +1,6 @@
-//! Bounded “soak” test: repeated publish + truncation cycles preserve correctness.
+//! Bounded "soak" test: repeated publish + truncation cycles preserve correctness.
 //!
-//! This is not an unbounded stress test. It’s a deterministic, medium-sized run that
+//! This is not an unbounded stress test. It's a deterministic, medium-sized run that
 //! catches lifecycle bugs: rotation, truncation, and recovery drift.
 
 use durability::checkpointing::{CheckpointSegment, CheckpointState};
@@ -31,6 +31,7 @@ fn apply_entry(model: &mut HashMap<u64, (u32, HashSet<u32>)>, e: &WalEntry) {
         | WalEntry::StartMerge { .. }
         | WalEntry::CancelMerge { .. }
         | WalEntry::Checkpoint { .. } => {}
+        _ => {}
     }
 }
 
@@ -62,7 +63,7 @@ fn soak_publish_truncate_cycle() {
     let tmp = tempfile::tempdir().unwrap();
     let dir: Arc<dyn Directory> = Arc::new(FsDirectory::new(tmp.path()).unwrap());
 
-    let mut wal = WalWriter::new(dir.clone());
+    let mut wal = WalWriter::<WalEntry>::new(dir.clone());
     wal.set_segment_size_limit_bytes(1024); // force multi-segment behavior for truncation
 
     let mut model: HashMap<u64, (u32, HashSet<u32>)> = HashMap::new();
@@ -76,18 +77,16 @@ fn soak_publish_truncate_cycle() {
         let seg = (step % 30) + 1;
         if step % 7 == 0 {
             let e = WalEntry::AddSegment {
-                entry_id: 0,
                 segment_id: seg,
                 doc_count: (step as u32) % 500,
             };
-            last_id = wal.append(e.clone()).unwrap();
+            last_id = wal.append(&e).unwrap();
             apply_entry(&mut model, &e);
         } else {
             let e = WalEntry::DeleteDocuments {
-                entry_id: 0,
                 deletes: vec![(seg, (step as u32) % 200)],
             };
-            last_id = wal.append(e.clone()).unwrap();
+            last_id = wal.append(&e).unwrap();
             apply_entry(&mut model, &e);
         }
 

@@ -41,7 +41,7 @@ fn recovered_to_model(state: &RecoveredState) -> HashMap<u64, (u32, HashSet<u32>
 
 fn arb_ops() -> impl Strategy<Value = Vec<Op>> {
     // Keep numbers small so we get collisions (deletes for missing segments),
-    // exercising “ignore delete for unknown segment”.
+    // exercising "ignore delete for unknown segment".
     prop::collection::vec(
         prop_oneof![
             (1u64..20, 0u32..200).prop_map(|(seg, dc)| Op::AddSeg { seg, doc_count: dc }),
@@ -73,15 +73,15 @@ proptest! {
 
         // Append prefix ops into WAL; record the last entry id applied so the checkpoint
         // can correctly skip replaying the prefix.
-        let mut wal = WalWriter::new(dir.clone());
+        let mut wal = WalWriter::<WalEntry>::new(dir.clone());
         let mut last_prefix_entry_id: u64 = 0;
         for op in &ops[..split] {
             match *op {
                 Op::AddSeg { seg, doc_count } => {
-                    last_prefix_entry_id = wal.append(WalEntry::AddSegment { entry_id: 0, segment_id: seg, doc_count }).unwrap();
+                    last_prefix_entry_id = wal.append(&WalEntry::AddSegment { segment_id: seg, doc_count }).unwrap();
                 }
                 Op::Del { seg, doc } => {
-                    last_prefix_entry_id = wal.append(WalEntry::DeleteDocuments { entry_id: 0, deletes: vec![(seg, doc)] }).unwrap();
+                    last_prefix_entry_id = wal.append(&WalEntry::DeleteDocuments { deletes: vec![(seg, doc)] }).unwrap();
                 }
             }
         }
@@ -107,10 +107,10 @@ proptest! {
         for op in &ops[split..] {
             match *op {
                 Op::AddSeg { seg, doc_count } => {
-                    wal.append(WalEntry::AddSegment { entry_id: 0, segment_id: seg, doc_count }).unwrap();
+                    wal.append(&WalEntry::AddSegment { segment_id: seg, doc_count }).unwrap();
                 }
                 Op::Del { seg, doc } => {
-                    wal.append(WalEntry::DeleteDocuments { entry_id: 0, deletes: vec![(seg, doc)] }).unwrap();
+                    wal.append(&WalEntry::DeleteDocuments { deletes: vec![(seg, doc)] }).unwrap();
                 }
             }
         }

@@ -76,7 +76,7 @@ fn run_with_cadence(ops: &[Op], cadence: usize) -> HashMap<u64, (u32, HashSet<u3
     let tmp = tempfile::tempdir().unwrap();
     let dir: Arc<dyn Directory> = Arc::new(FsDirectory::new(tmp.path()).unwrap());
 
-    let mut wal = WalWriter::new(dir.clone());
+    let mut wal = WalWriter::<WalEntry>::new(dir.clone());
     wal.set_segment_size_limit_bytes(1024); // encourage multi-segment behavior
 
     let mut model: HashMap<u64, (u32, HashSet<u32>)> = HashMap::new();
@@ -88,20 +88,18 @@ fn run_with_cadence(ops: &[Op], cadence: usize) -> HashMap<u64, (u32, HashSet<u3
         match *op {
             Op::AddSeg { seg, doc_count } => {
                 let e = WalEntry::AddSegment {
-                    entry_id: 0,
                     segment_id: seg,
                     doc_count,
                 };
-                last_id = wal.append(e.clone()).unwrap();
+                last_id = wal.append(&e).unwrap();
                 // apply to model
                 model.insert(seg, (doc_count, HashSet::new()));
             }
             Op::Del { seg, doc } => {
                 let e = WalEntry::DeleteDocuments {
-                    entry_id: 0,
                     deletes: vec![(seg, doc)],
                 };
-                last_id = wal.append(e.clone()).unwrap();
+                last_id = wal.append(&e).unwrap();
                 if let Some((_dc, dels)) = model.get_mut(&seg) {
                     dels.insert(doc);
                 }

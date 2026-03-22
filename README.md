@@ -4,7 +4,32 @@
 [![Documentation](https://docs.rs/durability/badge.svg)](https://docs.rs/durability)
 [![CI](https://github.com/arclabs561/durability/actions/workflows/ci.yml/badge.svg)](https://github.com/arclabs561/durability/actions/workflows/ci.yml)
 
-Crash-consistent persistence primitives for segment-based indices: directory abstraction, record logs, WAL segments, checkpoints, and recovery.
+Crash-consistent persistence primitives: directory abstraction, record logs, generic WAL, checkpoints, and recovery.
+
+## Quick start
+
+```rust
+use durability::storage::MemoryDirectory;
+use durability::walog::{WalWriter, WalReader, WalEntry};
+use std::sync::Arc;
+
+let dir: Arc<dyn durability::Directory> = Arc::new(MemoryDirectory::new());
+
+// Write
+let mut w = WalWriter::<WalEntry>::new(dir.clone());
+w.append(&WalEntry::AddSegment { segment_id: 1, doc_count: 100 }).unwrap();
+w.append(&WalEntry::DeleteDocuments { deletes: vec![(1, 42)] }).unwrap();
+w.flush().unwrap();
+
+// Recover
+let records = WalReader::<WalEntry>::new(dir).replay().unwrap();
+assert_eq!(records.len(), 2);
+assert_eq!(records[0].entry_id, 1); // entry_id assigned by writer
+```
+
+`WalWriter<E>` and `WalReader<E>` are generic -- define your own entry type with
+`#[derive(Serialize, Deserialize)]` and use `WalWriter::<YourType>::new(dir)`.
+Entry IDs are assigned by the writer and stored in the frame header, not in your payload.
 
 ## Not Provided (and why)
 
@@ -61,8 +86,9 @@ After truncation, recovery should start from the latest checkpoint marker (see `
 
 - `storage`: `Directory` abstraction + `FsDirectory`/`MemoryDirectory` + sync helpers.
 - `recordlog`: generic append-only log with CRC framing + strict/best-effort replay.
-- `walog`: multi-segment WAL under `wal/` with strict/best-effort replay and `WalWriter::resume` repair.
+- `walog`: generic multi-segment WAL (`WalWriter<E>` / `WalReader<E>`) under `wal/` with strict/best-effort replay and `WalWriter::resume` repair. Includes `WalEntry` for segment-index use cases.
 - `checkpoint` / `checkpointing`: checksumed snapshot files (postcard payloads).
+- `replay`: generic record-log replay helpers (checkpoint + suffix pattern).
 - `recover`: checkpoint + WAL recovery for a “segments + deletes” view.
 - `publish`: crash-safe checkpoint publish + WAL truncation.
 

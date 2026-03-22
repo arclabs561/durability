@@ -1,4 +1,4 @@
-//! Minimal “consumer” example for `durability`.
+//! Minimal "consumer" example for `durability`.
 //!
 //! This does **not** implement an index. It exercises the durability machinery:
 //! - WAL append (segment added, deletes)
@@ -18,16 +18,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tmp = tempfile::tempdir()?;
     let dir: Arc<dyn durability::Directory> = Arc::new(FsDirectory::new(tmp.path())?);
 
-    let mut wal = WalWriter::new(dir.clone());
+    let mut wal = WalWriter::<WalEntry>::new(dir.clone());
 
     // Segment 1 appears.
-    let _ = wal.append(WalEntry::AddSegment {
-        entry_id: 0,
+    let _ = wal.append(&WalEntry::AddSegment {
         segment_id: 1,
         doc_count: 5,
     })?;
-    let _ = wal.append(WalEntry::DeleteDocuments {
-        entry_id: 0,
+    let _ = wal.append(&WalEntry::DeleteDocuments {
         deletes: vec![(1, 4)],
     })?;
     wal.flush()?;
@@ -40,8 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     CheckpointManager::new(dir.clone()).write_checkpoint(&ckpt_state, ckpt_last, ckpt_path)?;
 
     // WAL suffix.
-    let _ = wal.append(WalEntry::AddSegment {
-        entry_id: 0,
+    let _ = wal.append(&WalEntry::AddSegment {
         segment_id: 2,
         doc_count: 7,
     })?;

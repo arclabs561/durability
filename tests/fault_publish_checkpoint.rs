@@ -6,6 +6,7 @@
 
 mod support;
 
+use durability::formats::WAL_FORMAT_VERSION;
 use durability::publish::CheckpointPublisher;
 use durability::recover::RecoveryManager;
 use durability::storage::{Directory, FsDirectory};
@@ -15,16 +16,14 @@ use std::sync::Arc;
 use support::FaultyDirectory;
 
 fn write_some_wal(dir: Arc<dyn Directory>) -> u64 {
-    let mut wal = WalWriter::new(dir);
-    wal.append(WalEntry::AddSegment {
-        entry_id: 0,
+    let mut wal = WalWriter::<WalEntry>::new(dir);
+    wal.append(&WalEntry::AddSegment {
         segment_id: 1,
         doc_count: 5,
     })
     .unwrap();
     let last = wal
-        .append(WalEntry::DeleteDocuments {
-            entry_id: 0,
+        .append(&WalEntry::DeleteDocuments {
             deletes: vec![(1, 4)],
         })
         .unwrap();
@@ -36,20 +35,20 @@ fn write_wal_segment(
     dir: &Arc<dyn Directory>,
     seg_id: u64,
     start_entry_id: u64,
-    entries: &[WalEntry],
+    entries: &[(u64, &WalEntry)],
 ) {
     dir.create_dir_all("wal").unwrap();
     let mut bytes = Vec::new();
     WalSegmentHeader {
         magic: durability::formats::WAL_MAGIC,
-        version: durability::formats::FORMAT_VERSION,
+        version: WAL_FORMAT_VERSION,
         start_entry_id,
         segment_id: seg_id,
     }
     .write(&mut bytes)
     .unwrap();
-    for e in entries {
-        let enc = WalEntryOnDisk::encode(e).unwrap();
+    for &(eid, e) in entries {
+        let enc = WalEntryOnDisk::encode(eid, e).unwrap();
         bytes.extend_from_slice(&enc);
     }
     dir.atomic_write(&format!("wal/wal_{seg_id}.log"), &bytes)
@@ -67,7 +66,7 @@ fn publish_fails_before_wal_marker_and_does_not_truncate() {
     let last = write_some_wal(dir.clone());
 
     // Resume so `append` needs to call `append_file` (fault-injectable path).
-    let mut wal = WalWriter::resume(dir.clone()).unwrap();
+    let mut wal = WalWriter::<WalEntry>::resume(dir.clone()).unwrap();
 
     // State for checkpoint.
     let mgr = RecoveryManager::new(dir.clone());
@@ -89,10 +88,10 @@ fn publish_fails_before_wal_marker_and_does_not_truncate() {
     assert!(dir.exists("checkpoints/c1.chk"));
 
     // WAL must not contain a checkpoint marker, and no truncation deletions should be attempted.
-    let entries = WalReader::new(dir.clone()).replay().unwrap();
-    assert!(!entries
+    let records = WalReader::<WalEntry>::new(dir.clone()).replay().unwrap();
+    assert!(!records
         .iter()
-        .any(|e| matches!(e, WalEntry::Checkpoint { .. })));
+        .any(|r| matches!(&r.payload, WalEntry::Checkpoint { .. })));
     assert_eq!(cfg.lock().unwrap().delete_calls, 0);
 }
 
@@ -104,7 +103,7 @@ fn publish_fails_on_wal_durability_proof_and_does_not_truncate() {
     let dir: Arc<dyn Directory> = Arc::new(faulty);
 
     let last = write_some_wal(dir.clone());
-    let mut wal = WalWriter::resume(dir.clone()).unwrap();
+    let mut wal = WalWriter::<WalEntry>::resume(dir.clone()).unwrap();
 
     let mgr = RecoveryManager::new(dir.clone());
     let before = mgr.recover(None).unwrap();
@@ -142,15 +141,19 @@ fn publish_truncation_failure_does_not_break_recovery() {
         1,
         1,
         &[
-            WalEntry::AddSegment {
-                entry_id: 1,
-                segment_id: 1,
-                doc_count: 5,
-            },
-            WalEntry::DeleteDocuments {
-                entry_id: 2,
-                deletes: vec![(1, 4)],
-            },
+            (
+                1,
+                &WalEntry::AddSegment {
+                    segment_id: 1,
+                    doc_count: 5,
+                },
+            ),
+            (
+                2,
+                &WalEntry::DeleteDocuments {
+                    deletes: vec![(1, 4)],
+                },
+            ),
         ],
     );
     // Segment 2: entry 3.
@@ -158,15 +161,17 @@ fn publish_truncation_failure_does_not_break_recovery() {
         &dir,
         2,
         3,
-        &[WalEntry::AddSegment {
-            entry_id: 3,
-            segment_id: 2,
-            doc_count: 1,
-        }],
+        &[(
+            3,
+            &WalEntry::AddSegment {
+                segment_id: 2,
+                doc_count: 1,
+            },
+        )],
     );
 
     // Resume from this WAL; next id will be 4.
-    let mut wal = WalWriter::resume(dir.clone()).unwrap();
+    let mut wal = WalWriter::<WalEntry>::resume(dir.clone()).unwrap();
 
     let mgr = RecoveryManager::new(dir.clone());
     let before = mgr.recover(None).unwrap();
@@ -185,10 +190,12 @@ fn publish_truncation_failure_does_not_break_recovery() {
     assert!(res.is_err());
 
     // Even if truncation failed, the WAL should now contain a checkpoint marker (write phase ran).
-    let entries = WalReader::new(dir.clone()).replay_best_effort().unwrap();
-    assert!(entries
+    let records = WalReader::<WalEntry>::new(dir.clone())
+        .replay_best_effort()
+        .unwrap();
+    assert!(records
         .iter()
-        .any(|e| matches!(e, WalEntry::Checkpoint { .. })));
+        .any(|r| matches!(&r.payload, WalEntry::Checkpoint { .. })));
 
     // Recovery must still succeed from scratch.
     let after = mgr.recover(None).unwrap();

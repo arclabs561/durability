@@ -46,6 +46,7 @@ pub mod walog;
 pub use error::{PersistenceError, PersistenceResult};
 pub use publish::{CheckpointPublisher, PublishResult};
 pub use storage::{Directory, DurableDirectory, FsDirectory, MemoryDirectory};
+pub use walog::{WalEntry, WalRecord};
 
 #[cfg(test)]
 mod tests {
@@ -60,10 +61,9 @@ mod tests {
     fn wal_recovery_roundtrip_in_memory() {
         let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
 
-        let mut w = WalWriter::new(dir.clone());
+        let mut w = WalWriter::<WalEntry>::new(dir.clone());
         let id1 = w
-            .append(WalEntry::AddSegment {
-                entry_id: 0,
+            .append(&WalEntry::AddSegment {
                 segment_id: 10,
                 doc_count: 3,
             })
@@ -71,8 +71,7 @@ mod tests {
         assert_eq!(id1, 1);
 
         let id2 = w
-            .append(WalEntry::DeleteDocuments {
-                entry_id: 0,
+            .append(&WalEntry::DeleteDocuments {
                 deletes: vec![(10, 2)],
             })
             .unwrap();
@@ -97,23 +96,19 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir: Arc<dyn Directory> = Arc::new(FsDirectory::new(tmp.path()).unwrap());
 
-        // WAL prefix.
-        let mut w = WalWriter::new(dir.clone());
-        w.append(WalEntry::AddSegment {
-            entry_id: 0,
+        let mut w = WalWriter::<WalEntry>::new(dir.clone());
+        w.append(&WalEntry::AddSegment {
             segment_id: 1,
             doc_count: 5,
         })
         .unwrap();
-        w.append(WalEntry::DeleteDocuments {
-            entry_id: 0,
+        w.append(&WalEntry::DeleteDocuments {
             deletes: vec![(1, 4)],
         })
         .unwrap();
 
         w.flush().unwrap();
 
-        // Build checkpoint from recovered prefix.
         let mgr = RecoveryManager::new(dir.clone());
         let prefix = mgr.recover(None).unwrap();
         let ckpt_state: CheckpointState = RecoveryManager::to_checkpoint_state(&prefix);
@@ -124,9 +119,7 @@ mod tests {
         ckpt.write_checkpoint(&ckpt_state, ckpt_last, ckpt_path)
             .unwrap();
 
-        // WAL suffix (should apply after checkpoint).
-        w.append(WalEntry::AddSegment {
-            entry_id: 0,
+        w.append(&WalEntry::AddSegment {
             segment_id: 2,
             doc_count: 7,
         })

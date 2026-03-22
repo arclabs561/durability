@@ -32,24 +32,22 @@ fn run_case(fp: FailPoint) {
     let dir: Arc<dyn Directory> = Arc::new(faulty);
 
     // Create some WAL state.
-    let mut wal = WalWriter::new(dir.clone());
+    let mut wal = WalWriter::<WalEntry>::new(dir.clone());
     let id1 = wal
-        .append(WalEntry::AddSegment {
-            entry_id: 0,
+        .append(&WalEntry::AddSegment {
             segment_id: 1,
             doc_count: 5,
         })
         .unwrap();
     let id2 = wal
-        .append(WalEntry::DeleteDocuments {
-            entry_id: 0,
+        .append(&WalEntry::DeleteDocuments {
             deletes: vec![(1, 4)],
         })
         .unwrap();
     wal.flush_and_sync().unwrap();
 
     // Resume so marker append uses append_file path.
-    let mut wal = WalWriter::resume(dir.clone()).unwrap();
+    let mut wal = WalWriter::<WalEntry>::resume(dir.clone()).unwrap();
     // Force the checkpoint marker into a *new* segment so truncation has a prefix
     // segment it can delete (segment 1 end_entry_id == checkpoint_last_entry_id).
     wal.set_segment_size_limit_bytes(1);
@@ -101,16 +99,18 @@ fn run_case(fp: FailPoint) {
     assert!(seg1.deleted_docs.contains(&4));
 
     // Marker presence: only guaranteed when marker append+sync succeeded.
-    let entries = WalReader::new(dir).replay_best_effort().unwrap_or_default();
-    let has_marker = entries
+    let records = WalReader::<WalEntry>::new(dir)
+        .replay_best_effort()
+        .unwrap_or_default();
+    let has_marker = records
         .iter()
-        .any(|e| matches!(e, WalEntry::Checkpoint { .. }));
+        .any(|r| matches!(&r.payload, WalEntry::Checkpoint { .. }));
     match fp {
         FailPoint::None | FailPoint::WalDelete => assert!(has_marker),
         FailPoint::WalAppendFile => assert!(!has_marker),
         // If `flush_and_sync` fails due to missing file_path, the marker may have been appended
         // but not proven durable; treat both outcomes as acceptable (the safety invariant is
-        // “no truncation + recoverability preserved”).
+        // "no truncation + recoverability preserved").
         FailPoint::WalFilePath => {}
     }
 }

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub type PersistenceResult<T> = Result<T, PersistenceError>;
 
 /// Errors returned by the `durability` crate.
+#[non_exhaustive]
 #[derive(thiserror::Error, Debug)]
 pub enum PersistenceError {
     /// I/O error.

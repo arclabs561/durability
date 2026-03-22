@@ -7,32 +7,19 @@ use durability::storage::{Directory, FsDirectory};
 use durability::walog::{WalEntry, WalReader, WalWriter};
 use std::sync::Arc;
 
-fn entry_id(e: &WalEntry) -> u64 {
-    match e {
-        WalEntry::AddSegment { entry_id, .. }
-        | WalEntry::StartMerge { entry_id, .. }
-        | WalEntry::CancelMerge { entry_id, .. }
-        | WalEntry::EndMerge { entry_id, .. }
-        | WalEntry::DeleteDocuments { entry_id, .. }
-        | WalEntry::Checkpoint { entry_id, .. } => *entry_id,
-    }
-}
-
 #[test]
 fn publish_checkpoint_records_commit_and_recovery_matches() {
     let tmp = tempfile::tempdir().unwrap();
     let dir: Arc<dyn Directory> = Arc::new(FsDirectory::new(tmp.path()).unwrap());
 
     // Create some WAL state.
-    let mut wal = WalWriter::new(dir.clone());
-    wal.append(WalEntry::AddSegment {
-        entry_id: 0,
+    let mut wal = WalWriter::<WalEntry>::new(dir.clone());
+    wal.append(&WalEntry::AddSegment {
         segment_id: 1,
         doc_count: 5,
     })
     .unwrap();
-    wal.append(WalEntry::DeleteDocuments {
-        entry_id: 0,
+    wal.append(&WalEntry::DeleteDocuments {
         deletes: vec![(1, 4)],
     })
     .unwrap();
@@ -51,9 +38,9 @@ fn publish_checkpoint_records_commit_and_recovery_matches() {
     assert!(pubr.wal_checkpoint_entry_id > last);
 
     // WAL must contain a checkpoint record with that id.
-    let entries = WalReader::new(dir.clone()).replay().unwrap();
-    let has = entries.iter().any(|e| matches!(e, WalEntry::Checkpoint { entry_id, checkpoint_path, last_entry_id, .. }
-        if *entry_id == pubr.wal_checkpoint_entry_id && checkpoint_path == "checkpoints/c1.chk" && *last_entry_id == last));
+    let records = WalReader::<WalEntry>::new(dir.clone()).replay().unwrap();
+    let has = records.iter().any(|r| matches!(&r.payload, WalEntry::Checkpoint { checkpoint_path, last_entry_id, .. }
+        if r.entry_id == pubr.wal_checkpoint_entry_id && checkpoint_path == "checkpoints/c1.chk" && *last_entry_id == last));
     assert!(has);
 
     // After publish+truncate, recovery should prefer the latest checkpoint marker.
@@ -70,6 +57,6 @@ fn publish_checkpoint_records_commit_and_recovery_matches() {
     assert!(seg1.deleted_docs.contains(&4));
 
     // Basic monotonicity sanity for the recorded checkpoint entry id.
-    let max_id = entries.iter().map(entry_id).max().unwrap_or(0);
+    let max_id = records.iter().map(|r| r.entry_id).max().unwrap_or(0);
     assert_eq!(max_id, pubr.wal_checkpoint_entry_id);
 }

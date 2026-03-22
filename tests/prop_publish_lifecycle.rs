@@ -1,6 +1,6 @@
 //! Property-based tests for the checkpoint publish lifecycle.
 //!
-//! Goal: stress the “what really matters” contract:
+//! Goal: stress the "what really matters" contract:
 //! - checkpoint publish records a commit marker in the WAL
 //! - truncation never breaks recoverability (at worst leaves extra WAL segments)
 //! - recovery from checkpoint matches recovery from scratch after publish
@@ -73,15 +73,15 @@ proptest! {
         let dir: Arc<dyn Directory> = Arc::new(FsDirectory::new(tmp.path()).unwrap());
 
         // Write the full op stream to WAL.
-        let mut wal = WalWriter::new(dir.clone());
+        let mut wal = WalWriter::<WalEntry>::new(dir.clone());
         let mut last_id: u64 = 0;
         for op in &ops {
             match *op {
                 Op::AddSeg { seg, doc_count } => {
-                    last_id = wal.append(WalEntry::AddSegment { entry_id: 0, segment_id: seg, doc_count }).unwrap();
+                    last_id = wal.append(&WalEntry::AddSegment { segment_id: seg, doc_count }).unwrap();
                 }
                 Op::Del { seg, doc } => {
-                    last_id = wal.append(WalEntry::DeleteDocuments { entry_id: 0, deletes: vec![(seg, doc)] }).unwrap();
+                    last_id = wal.append(&WalEntry::DeleteDocuments { deletes: vec![(seg, doc)] }).unwrap();
                 }
             }
         }

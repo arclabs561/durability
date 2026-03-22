@@ -32,12 +32,11 @@ fn bench_recover_checkpoint_plus_wal(c: &mut Criterion) {
                     .unwrap();
 
                 // WAL: 10k deletes spread across segments.
-                let mut wal = WalWriter::new(dir.clone());
+                let mut wal = WalWriter::<WalEntry>::new(dir.clone());
                 for i in 0..10_000u64 {
                     let seg = (i % 1000) + 1;
                     let doc = (i % 100) as u32;
-                    wal.append(WalEntry::DeleteDocuments {
-                        entry_id: 0,
+                    wal.append(&WalEntry::DeleteDocuments {
                         deletes: vec![(seg, doc)],
                     })
                     .unwrap();

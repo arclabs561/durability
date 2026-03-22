@@ -8,7 +8,7 @@
 use durability::checkpoint::CheckpointHeader;
 use durability::recordlog::{RecordLogReadMode, RecordLogReader};
 use durability::storage::{Directory, FsDirectory};
-use durability::walog::{WalEntryOnDisk, WalReplayMode, WalSegmentHeader};
+use durability::walog::{WalEntry, WalEntryOnDisk, WalReplayMode, WalSegmentHeader};
 use proptest::prelude::*;
 use std::io::Write;
 use std::sync::Arc;
@@ -23,7 +23,7 @@ proptest! {
     #[test]
     fn wal_entry_decode_never_panics_on_arbitrary_bytes(bytes in prop::collection::vec(any::<u8>(), 0..2048)) {
         let mut cur = std::io::Cursor::new(bytes);
-        let _ = WalEntryOnDisk::decode(&mut cur, WalReplayMode::BestEffortTail);
+        let _ = WalEntryOnDisk::decode::<WalEntry, _>(&mut cur, WalReplayMode::BestEffortTail);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Crash-safe checkpoint publishing and WAL truncation helpers.
 //!
-//! This module exists because “checkpoint + WAL + truncation” is where real systems most
+//! This module exists because "checkpoint + WAL + truncation" is where real systems most
 //! often get the durability story wrong. The safe rule is:
 //!
 //! 1) write checkpoint (ideally with stable-storage barriers),
@@ -14,7 +14,7 @@ use crate::walog::{WalEntry, WalMaintenance, WalWriter};
 use std::sync::Arc;
 
 /// Result of publishing a checkpoint.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PublishResult {
     /// Path where the checkpoint was written.
     pub checkpoint_path: String,
@@ -40,20 +40,9 @@ impl CheckpointPublisher {
     }
 
     /// Publish a checkpoint and (safely) truncate WAL segments covered by it.
-    ///
-    /// Steps:
-    /// 1) write the checkpoint with stable-storage barriers (`write_checkpoint_durable`)
-    /// 2) append `WalEntry::Checkpoint` and make that WAL write durable
-    /// 3) delete WAL segments whose max entry id is `<= checkpoint_last_entry_id`
-    ///
-    /// Safety notes:
-    /// - If step (1) succeeds but step (2) fails, the checkpoint may exist but is not recorded
-    ///   as committed in the WAL. We return an error and do NOT truncate.
-    /// - Truncation is best-effort: deletion failures are returned as errors, but directory-sync
-    ///   after deletion is not required for correctness (it only affects “durable deletion”).
     pub fn publish_checkpoint(
         &self,
-        wal: &mut WalWriter,
+        wal: &mut WalWriter<WalEntry>,
         state: &CheckpointState,
         checkpoint_last_entry_id: u64,
         checkpoint_path: &str,
@@ -61,8 +50,7 @@ impl CheckpointPublisher {
         let mgr = CheckpointManager::new(self.directory.clone());
         mgr.write_checkpoint_durable(state, checkpoint_last_entry_id, checkpoint_path)?;
 
-        let wal_checkpoint_entry_id = wal.append(WalEntry::Checkpoint {
-            entry_id: 0,
+        let wal_checkpoint_entry_id = wal.append(&WalEntry::Checkpoint {
             checkpoint_path: checkpoint_path.to_string(),
             last_entry_id: checkpoint_last_entry_id,
         })?;
