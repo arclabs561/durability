@@ -1,14 +1,147 @@
 //! Crash recovery using checkpoint + WAL replay.
 //!
-//! Contains segment-specific checkpoint types (`CheckpointState`, `CheckpointSegment`)
-//! and the `RecoveryManager` that applies checkpoint + WAL to produce `RecoveredState`.
+//! Two levels of API:
+//!
+//! - **Generic**: [`recover_with_wal`] coordinates checkpoint loading and WAL replay for
+//!   any entry type `E` and checkpoint state `C`. Callers provide an `init` closure
+//!   (to convert checkpoint state into working state) and an `apply` closure (to fold
+//!   each WAL entry).
+//!
+//! - **Segment-specific**: [`RecoveryManager`] is a concrete implementation for
+//!   segment-index WALs using [`WalEntry`](crate::walog::WalEntry).
 
 use crate::checkpoint::CheckpointFile;
 use crate::error::PersistenceResult;
 use crate::storage::Directory;
-use crate::walog::{WalEntry, WalReader};
+use crate::walog::{WalEntry, WalReader, WalReplayMode};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+// ---------------------------------------------------------------------------
+// Generic recovery
+// ---------------------------------------------------------------------------
+
+/// Options controlling recovery behavior.
+#[derive(Debug, Clone, Copy)]
+pub struct RecoveryOptions {
+    /// How to handle WAL tail corruption.
+    pub wal_mode: WalReplayMode,
+    /// If true, treat an unreadable/corrupt checkpoint as empty state
+    /// rather than returning an error.
+    pub ignore_corrupt_checkpoint: bool,
+}
+
+impl RecoveryOptions {
+    /// Strict: any corruption is an error.
+    pub fn strict() -> Self {
+        Self {
+            wal_mode: WalReplayMode::Strict,
+            ignore_corrupt_checkpoint: false,
+        }
+    }
+
+    /// Best-effort: tolerate torn WAL tail and corrupt checkpoints.
+    pub fn best_effort() -> Self {
+        Self {
+            wal_mode: WalReplayMode::BestEffortTail,
+            ignore_corrupt_checkpoint: true,
+        }
+    }
+}
+
+/// Result of a generic recovery operation.
+#[derive(Debug, Clone)]
+pub struct Recovery<S> {
+    /// The recovered working state.
+    pub state: S,
+    /// The last WAL entry ID applied during recovery (0 if no entries).
+    pub last_entry_id: u64,
+}
+
+/// Recover state from an optional checkpoint file and WAL replay.
+///
+/// Generic over:
+/// - `C`: the checkpoint state type (deserialized from the checkpoint file).
+/// - `E`: the WAL entry type.
+/// - `W`: the working state built during recovery.
+///
+/// The `init` closure receives the deserialized checkpoint (or `None` if no
+/// checkpoint exists) and returns the initial working state.
+///
+/// The `apply` closure folds each WAL entry (with entry_id > checkpoint's
+/// `last_applied_id`) into the working state.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use durability::recover::{recover_with_wal, RecoveryOptions};
+/// use durability::storage::MemoryDirectory;
+/// use std::sync::Arc;
+///
+/// #[derive(Default, serde::Serialize, serde::Deserialize)]
+/// struct MyCheckpoint { counter: u64 }
+///
+/// #[derive(serde::Serialize, serde::Deserialize)]
+/// enum MyEntry { Increment, Decrement }
+///
+/// let dir = MemoryDirectory::arc();
+/// let result = recover_with_wal::<MyCheckpoint, MyEntry, _>(
+///     &dir,
+///     None,
+///     RecoveryOptions::strict(),
+///     |ckpt| ckpt.unwrap_or_default().counter,
+///     |counter, _entry_id, entry| {
+///         match entry {
+///             MyEntry::Increment => *counter += 1,
+///             MyEntry::Decrement => *counter = counter.saturating_sub(1),
+///         }
+///     },
+/// ).unwrap();
+/// ```
+pub fn recover_with_wal<C, E, W>(
+    dir: &Arc<dyn Directory>,
+    checkpoint_path: Option<&str>,
+    options: RecoveryOptions,
+    init: impl FnOnce(Option<C>) -> W,
+    mut apply: impl FnMut(&mut W, u64, E),
+) -> PersistenceResult<Recovery<W>>
+where
+    C: serde::de::DeserializeOwned,
+    E: serde::de::DeserializeOwned,
+{
+    // Step 1: load checkpoint (if any).
+    let (mut state, mut last_entry_id) = match checkpoint_path {
+        Some(path) if dir.exists(path) => {
+            let ckpt = CheckpointFile::new(dir.clone());
+            match ckpt.read_postcard::<C>(path) {
+                Ok((last_id, checkpoint_state)) => (init(Some(checkpoint_state)), last_id),
+                Err(e) if options.ignore_corrupt_checkpoint => {
+                    // Best-effort: skip corrupt checkpoint, start from empty.
+                    let _ = e; // consumed
+                    (init(None), 0u64)
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        _ => (init(None), 0u64),
+    };
+
+    // Step 2: replay WAL entries with entry_id > last_entry_id.
+    let wal = WalReader::<E>::new(dir.clone());
+    let since = last_entry_id;
+    wal.replay_each_with_mode(options.wal_mode, |record| {
+        if record.entry_id > since {
+            last_entry_id = record.entry_id;
+            apply(&mut state, record.entry_id, record.payload);
+        }
+        Ok(())
+    })?;
+
+    Ok(Recovery {
+        state,
+        last_entry_id,
+    })
+}
 
 /// The durable index state stored in a checkpoint.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -29,7 +162,7 @@ pub struct CheckpointSegment {
 }
 
 /// State recovered from checkpoint + WAL.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct RecoveredState {
     /// Active segments in the recovered view.
     pub segments: Vec<RecoveredSegment>,
@@ -38,7 +171,7 @@ pub struct RecoveredState {
 }
 
 /// Per-segment recovered state.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct RecoveredSegment {
     /// Segment identifier.
     pub segment_id: u64,
@@ -120,103 +253,93 @@ impl RecoveryManager {
         checkpoint_path: Option<&str>,
         mode: RecoveryMode,
     ) -> PersistenceResult<RecoveredState> {
-        let (mut segments, mut last_entry_id) = if let Some(path) = checkpoint_path {
-            if !self.directory.exists(path) {
-                (Vec::new(), 0)
-            } else {
-                let ckpt = CheckpointFile::new(self.directory.clone());
-                match ckpt.read_postcard::<CheckpointState>(path) {
-                    Ok((last, state)) => (state.segments, last),
-                    Err(e) => match mode {
-                        RecoveryMode::Strict => return Err(e),
-                        RecoveryMode::BestEffort => (Vec::new(), 0),
-                    },
-                }
-            }
-        } else {
-            (Vec::new(), 0)
+        let options = match mode {
+            RecoveryMode::Strict => RecoveryOptions::strict(),
+            RecoveryMode::BestEffort => RecoveryOptions::best_effort(),
         };
 
-        let mut map: HashMap<u64, RecoveredSegment> = HashMap::new();
-        for s in segments.drain(..) {
-            map.insert(
-                s.segment_id,
-                RecoveredSegment {
-                    segment_id: s.segment_id,
-                    doc_count: s.doc_count,
-                    deleted_docs: s.deleted_docs.into_iter().collect(),
-                },
-            );
-        }
-
-        let wal = WalReader::<WalEntry>::new(self.directory.clone());
-        let records = match mode {
-            RecoveryMode::Strict => wal.replay()?,
-            RecoveryMode::BestEffort => wal.replay_best_effort()?,
-        };
-
-        for record in records {
-            let entry_id = record.entry_id;
-            if entry_id <= last_entry_id {
-                continue;
-            }
-            last_entry_id = entry_id;
-
-            match record.payload {
-                WalEntry::AddSegment {
-                    segment_id,
-                    doc_count,
-                } => {
-                    map.insert(
-                        segment_id,
-                        RecoveredSegment {
-                            segment_id,
-                            doc_count,
-                            deleted_docs: HashSet::new(),
-                        },
-                    );
-                }
-                WalEntry::DeleteDocuments { deletes } => {
-                    for (segment_id, doc_id) in deletes {
-                        if let Some(seg) = map.get_mut(&segment_id) {
-                            seg.deleted_docs.insert(doc_id);
-                        }
+        let result = recover_with_wal::<CheckpointState, WalEntry, _>(
+            &self.directory,
+            checkpoint_path,
+            options,
+            |ckpt| {
+                let mut map: HashMap<u64, RecoveredSegment> = HashMap::new();
+                if let Some(state) = ckpt {
+                    for s in state.segments {
+                        map.insert(
+                            s.segment_id,
+                            RecoveredSegment {
+                                segment_id: s.segment_id,
+                                doc_count: s.doc_count,
+                                deleted_docs: s.deleted_docs.into_iter().collect(),
+                            },
+                        );
                     }
                 }
-                WalEntry::EndMerge {
-                    new_segment_id,
-                    old_segment_ids,
-                    remapped_deletes,
-                    ..
-                } => {
-                    for old in old_segment_ids {
-                        map.remove(&old);
-                    }
-                    let mut new_seg = RecoveredSegment {
-                        segment_id: new_segment_id,
-                        doc_count: 0,
-                        deleted_docs: HashSet::new(),
-                    };
-                    for (seg_id, doc_id) in remapped_deletes {
-                        if seg_id == new_segment_id {
-                            new_seg.deleted_docs.insert(doc_id);
-                        }
-                    }
-                    map.insert(new_segment_id, new_seg);
-                }
-                WalEntry::StartMerge { .. }
-                | WalEntry::CancelMerge { .. }
-                | WalEntry::Checkpoint { .. } => {}
-            }
-        }
+                map
+            },
+            |map, _entry_id, entry| {
+                Self::apply_entry(map, entry);
+            },
+        )?;
 
-        let mut segments: Vec<RecoveredSegment> = map.into_values().collect();
+        let mut segments: Vec<RecoveredSegment> = result.state.into_values().collect();
         segments.sort_by_key(|s| s.segment_id);
 
         Ok(RecoveredState {
             segments,
-            last_entry_id,
+            last_entry_id: result.last_entry_id,
         })
+    }
+
+    /// Apply a single WAL entry to the segment map.
+    fn apply_entry(map: &mut HashMap<u64, RecoveredSegment>, entry: WalEntry) {
+        match entry {
+            WalEntry::AddSegment {
+                segment_id,
+                doc_count,
+            } => {
+                map.insert(
+                    segment_id,
+                    RecoveredSegment {
+                        segment_id,
+                        doc_count,
+                        deleted_docs: HashSet::new(),
+                    },
+                );
+            }
+            WalEntry::DeleteDocuments { deletes } => {
+                for (segment_id, doc_id) in deletes {
+                    if let Some(seg) = map.get_mut(&segment_id) {
+                        seg.deleted_docs.insert(doc_id);
+                    }
+                }
+            }
+            WalEntry::EndMerge {
+                new_segment_id,
+                old_segment_ids,
+                remapped_deletes,
+                ..
+            } => {
+                for old in old_segment_ids {
+                    map.remove(&old);
+                }
+                let mut new_seg = RecoveredSegment {
+                    segment_id: new_segment_id,
+                    doc_count: 0,
+                    deleted_docs: HashSet::new(),
+                };
+                for (seg_id, doc_id) in remapped_deletes {
+                    if seg_id == new_segment_id {
+                        new_seg.deleted_docs.insert(doc_id);
+                    }
+                }
+                map.insert(new_segment_id, new_seg);
+            }
+            WalEntry::StartMerge { .. }
+            | WalEntry::CancelMerge { .. }
+            | WalEntry::Checkpoint { .. } => {}
+        }
     }
 
     /// Convert a recovered state back into a checkpoint payload.

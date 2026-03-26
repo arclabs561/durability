@@ -478,26 +478,8 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
         let mut ids = Vec::with_capacity(entries.len());
         for (entry_id, encoded) in encoded_pairs {
             let _wal_path = self.ensure_segment_open(entry_id)?;
-
-            let projected =
-                self.current_offset + (self.write_buffer.len() as u64) + (encoded.len() as u64);
-            if projected > self.segment_size_limit
-                && self.current_offset > WalSegmentHeader::SIZE as u64
-            {
-                self.flush()?;
-                self.current_segment_id += 1;
-                self.current_offset = 0;
-                self.current_path = None;
-                self.current_file = None;
-                self.since_flush = 0;
-                let _ = self.ensure_segment_open(entry_id)?;
-            }
-
-            self.write_buffer.extend_from_slice(&encoded);
-            if self.write_buffer_limit == 0 || self.write_buffer.len() >= self.write_buffer_limit {
-                self.drain_buffer_to_file()?;
-            }
-
+            self.rotate_if_needed(entry_id, encoded.len() as u64)?;
+            self.buffer_encoded(&encoded)?;
             self.current_entry_id = entry_id + 1;
             ids.push(entry_id);
         }
@@ -589,16 +571,38 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
         if !self.wal_dir_ready {
             self.directory.create_dir_all("wal")?;
             // Advisory lockfile: catch accidental double-instantiation.
-            if self.directory.exists("wal/.lock") {
-                return Err(PersistenceError::InvalidState(
-                    "WAL lockfile wal/.lock exists; another WalWriter may be active. \
-                     Remove the lockfile manually if this is a stale lock from a crash."
-                        .into(),
-                ));
+            // Use O_CREAT|O_EXCL (create_new) on real filesystems for atomic acquire.
+            // Falls back to exists()+write() for non-filesystem backends (e.g. MemoryDirectory).
+            if let Some(lock_fs_path) = self.directory.file_path("wal/.lock") {
+                if let Some(parent) = lock_fs_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&lock_fs_path)
+                {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return Err(PersistenceError::InvalidState(
+                            "WAL lockfile wal/.lock exists; another WalWriter may be active. \
+                             Remove the lockfile manually if this is a stale lock from a crash."
+                                .into(),
+                        ));
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            } else {
+                // Non-filesystem backend: best-effort TOCTOU check.
+                if self.directory.exists("wal/.lock") {
+                    return Err(PersistenceError::InvalidState(
+                        "WAL lockfile wal/.lock exists; another WalWriter may be active. \
+                         Remove the lockfile manually if this is a stale lock from a crash."
+                            .into(),
+                    ));
+                }
+                let _ = self.directory.atomic_write("wal/.lock", b"locked");
             }
-            // Write a lockfile. Ignore errors on MemoryDirectory (atomic_write might not work
-            // with non-file backends, but create_file does).
-            let _ = self.directory.atomic_write("wal/.lock", b"locked");
             self.holds_lock = true;
             // Safety: prevent silent entry-id collision when called via new() on existing WAL
             if self.current_entry_id == 1 && self.current_segment_id == 1 {
@@ -679,16 +683,9 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
         Ok(())
     }
 
-    /// Append an entry, returning its assigned entry id.
-    pub fn append(&mut self, entry: &E) -> PersistenceResult<u64> {
-        let entry_id = self.current_entry_id;
-
-        let _wal_path = self.ensure_segment_open(entry_id)?;
-
-        let encoded = WalEntryOnDisk::encode(entry_id, entry)?;
-
-        let projected =
-            self.current_offset + (self.write_buffer.len() as u64) + (encoded.len() as u64);
+    /// Rotate to a new segment if the encoded bytes would exceed the size limit.
+    fn rotate_if_needed(&mut self, entry_id: u64, encoded_len: u64) -> PersistenceResult<()> {
+        let projected = self.current_offset + (self.write_buffer.len() as u64) + encoded_len;
         if projected > self.segment_size_limit
             && self.current_offset > WalSegmentHeader::SIZE as u64
         {
@@ -698,15 +695,22 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
             self.current_path = None;
             self.current_file = None;
             self.since_flush = 0;
-
             let _ = self.ensure_segment_open(entry_id)?;
         }
+        Ok(())
+    }
 
-        self.write_buffer.extend_from_slice(&encoded);
+    /// Buffer encoded bytes and drain if the write buffer is full.
+    fn buffer_encoded(&mut self, encoded: &[u8]) -> PersistenceResult<()> {
+        self.write_buffer.extend_from_slice(encoded);
         if self.write_buffer_limit == 0 || self.write_buffer.len() >= self.write_buffer_limit {
             self.drain_buffer_to_file()?;
         }
+        Ok(())
+    }
 
+    /// Apply the configured flush policy after an append.
+    fn apply_flush_policy(&mut self) -> PersistenceResult<()> {
         self.since_flush = self.since_flush.saturating_add(1);
         match self.flush_policy {
             FlushPolicy::PerAppend => {
@@ -720,6 +724,18 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
             }
             FlushPolicy::Manual => {}
         }
+        Ok(())
+    }
+
+    /// Append an entry, returning its assigned entry id.
+    pub fn append(&mut self, entry: &E) -> PersistenceResult<u64> {
+        let entry_id = self.current_entry_id;
+        let _wal_path = self.ensure_segment_open(entry_id)?;
+        let encoded = WalEntryOnDisk::encode(entry_id, entry)?;
+
+        self.rotate_if_needed(entry_id, encoded.len() as u64)?;
+        self.buffer_encoded(&encoded)?;
+        self.apply_flush_policy()?;
 
         self.current_entry_id += 1;
         Ok(entry_id)
@@ -853,6 +869,19 @@ impl<E: serde::de::DeserializeOwned> WalReader<E> {
         apply: impl FnMut(WalRecord<E>) -> PersistenceResult<()>,
     ) -> PersistenceResult<u64> {
         self.replay_each_inner(WalReplayMode::BestEffortTail, apply)
+    }
+
+    /// Streaming replay with explicit mode selection.
+    ///
+    /// Combines [`replay_each`](Self::replay_each) and
+    /// [`replay_each_best_effort`](Self::replay_each_best_effort) behind a mode parameter.
+    /// Returns the number of entries replayed.
+    pub fn replay_each_with_mode(
+        &self,
+        mode: WalReplayMode,
+        apply: impl FnMut(WalRecord<E>) -> PersistenceResult<()>,
+    ) -> PersistenceResult<u64> {
+        self.replay_each_inner(mode, apply)
     }
 
     /// Count entries in the WAL without collecting them.

@@ -15,7 +15,7 @@ use crate::walog::{WalEntry, WalMaintenance, WalWriter};
 use std::sync::Arc;
 
 /// Result of publishing a checkpoint.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct PublishResult {
     /// Path where the checkpoint was written.
     pub checkpoint_path: String,

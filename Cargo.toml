@@ -11,7 +11,7 @@ homepage = "https://github.com/arclabs561/durability"
 documentation = "https://docs.rs/durability"
 publish = true
 readme = "README.md"
-keywords = ["persistence", "wal", "checkpoint", "durability"]
+keywords = ["persistence", "wal", "checkpoint", "write-ahead-log", "recovery"]
 categories = ["filesystem", "database-implementations"]
 
 [dependencies]

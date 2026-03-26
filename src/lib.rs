@@ -6,7 +6,7 @@
 //! - append-only record log (`recordlog`)
 //! - generic write-ahead log (`walog`)
 //! - CRC-validated checkpoint snapshots (`checkpoint`)
-//! - segment-specific recovery (`recover`, `publish`)
+//! - generic recovery (`recover::recover_with_wal`) and segment-specific recovery (`recover`, `publish`)
 //!
 //! ## Contract (what you can rely on)
 //!

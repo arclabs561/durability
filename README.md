@@ -60,6 +60,9 @@ reader.replay_each(|record| {
 
 - **Multi-process locking**: This crate does not manage `flock` or IPC locks.
   Single-writer-per-directory is assumed. Multiple writers silently corrupt data.
+  `WalWriter` creates an advisory lockfile (`wal/.lock`) to catch accidental
+  double-instantiation within a process, but this does not guarantee cross-process
+  exclusion.
 - **Strong consistency by default**: `write` calls are buffered.
   Use `flush_and_sync()` when you need a durability barrier.
 - **fsync failure recovery**: A failed `fsync` on Linux clears dirty pages; retrying
@@ -110,7 +113,7 @@ start from the latest checkpoint marker (see `RecoveryManager::recover_latest`).
 - `recordlog`: append-only log with CRC framing + strict/best-effort replay.
 - `walog`: generic multi-segment WAL (`WalWriter<E>` / `WalReader<E>`) with strict/best-effort replay and `resume` repair. Includes `WalEntry` for segment-index use cases.
 - `checkpoint`: CRC-validated snapshot files (postcard payloads).
-- `recover`: checkpoint + WAL recovery for segment-index state. Contains `CheckpointState`/`CheckpointSegment` types.
+- `recover`: generic `recover_with_wal()` for any checkpoint + WAL entry types, plus segment-specific `RecoveryManager`.
 - `publish`: crash-safe checkpoint publish + WAL truncation.
 
 ## Running

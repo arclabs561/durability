@@ -30,23 +30,6 @@ pub fn sync_file<D: Directory + ?Sized>(dir: &D, path: &str) -> PersistenceResul
     Ok(())
 }
 
-/// Make **all data and metadata** of `path` durable (`fsync`).
-///
-/// Stronger than [`sync_file`]: also syncs metadata (file size, timestamps).
-/// Use this after operations where file size changes must be durable
-/// (e.g. checkpoint writes). For append-only WAL segments, [`sync_file`]
-/// (fdatasync) is sufficient and faster.
-pub fn sync_file_full<D: Directory + ?Sized>(dir: &D, path: &str) -> PersistenceResult<()> {
-    let Some(p) = dir.file_path(path) else {
-        return Err(PersistenceError::NotSupported(
-            "sync_file_full requires Directory::file_path()".into(),
-        ));
-    };
-    let f = std::fs::OpenOptions::new().read(true).open(&p)?;
-    f.sync_all()?;
-    Ok(())
-}
-
 /// Attempt to `fsync`/`sync_all` the parent directory of `path`.
 ///
 /// This is the commonly-missed step needed to make *names* durable:
@@ -88,7 +71,7 @@ pub enum FlushPolicy {
     PerAppend,
     /// Call `flush()` every N logical append operations.
     ///
-    /// `n=1` is equivalent to `PerAppend`. `n=0` is treated as `Manual`.
+    /// `n=1` is equivalent to `PerAppend`. `n=0` is treated as `PerAppend`.
     EveryN(usize),
     /// Do not call `flush()` implicitly; callers may flush explicitly (if supported by the backend).
     Manual,
@@ -239,14 +222,27 @@ impl FsDirectory {
         Ok(std::sync::Arc::new(Self::new(root)?))
     }
 
-    fn resolve_path(&self, path: &str) -> PathBuf {
-        self.root.join(path)
+    fn resolve_path(&self, path: &str) -> PersistenceResult<PathBuf> {
+        // Reject path traversal: `..`, absolute paths, and prefix components.
+        for component in std::path::Path::new(path).components() {
+            match component {
+                std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_) => {
+                    return Err(PersistenceError::InvalidConfig(format!(
+                        "path must not contain '..', absolute, or prefix components: {path}"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        Ok(self.root.join(path))
     }
 }
 
 impl Directory for FsDirectory {
     fn create_file(&self, path: &str) -> PersistenceResult<Box<dyn Write>> {
-        let full_path = self.resolve_path(path);
+        let full_path = self.resolve_path(path)?;
         if let Some(parent) = full_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -254,7 +250,7 @@ impl Directory for FsDirectory {
     }
 
     fn open_file(&self, path: &str) -> PersistenceResult<Box<dyn Read>> {
-        let full_path = self.resolve_path(path);
+        let full_path = self.resolve_path(path)?;
         if !full_path.exists() {
             return Err(PersistenceError::NotFound(full_path.display().to_string()));
         }
@@ -262,11 +258,11 @@ impl Directory for FsDirectory {
     }
 
     fn exists(&self, path: &str) -> bool {
-        self.resolve_path(path).exists()
+        self.resolve_path(path).map(|p| p.exists()).unwrap_or(false)
     }
 
     fn delete(&self, path: &str) -> PersistenceResult<()> {
-        let full_path = self.resolve_path(path);
+        let full_path = self.resolve_path(path)?;
         if full_path.is_dir() {
             std::fs::remove_dir_all(full_path)?;
         } else if full_path.exists() {
@@ -276,8 +272,8 @@ impl Directory for FsDirectory {
     }
 
     fn atomic_rename(&self, from: &str, to: &str) -> PersistenceResult<()> {
-        let from_path = self.resolve_path(from);
-        let to_path = self.resolve_path(to);
+        let from_path = self.resolve_path(from)?;
+        let to_path = self.resolve_path(to)?;
         if let Some(parent) = to_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -286,12 +282,12 @@ impl Directory for FsDirectory {
     }
 
     fn create_dir_all(&self, path: &str) -> PersistenceResult<()> {
-        std::fs::create_dir_all(self.resolve_path(path))?;
+        std::fs::create_dir_all(self.resolve_path(path)?)?;
         Ok(())
     }
 
     fn list_dir(&self, path: &str) -> PersistenceResult<Vec<String>> {
-        let full_path = self.resolve_path(path);
+        let full_path = self.resolve_path(path)?;
         if !full_path.exists() {
             return Ok(Vec::new());
         }
@@ -306,7 +302,7 @@ impl Directory for FsDirectory {
     }
 
     fn append_file(&self, path: &str) -> PersistenceResult<Box<dyn Write>> {
-        let full_path = self.resolve_path(path);
+        let full_path = self.resolve_path(path)?;
         if let Some(parent) = full_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -319,7 +315,7 @@ impl Directory for FsDirectory {
 
     fn atomic_write(&self, path: &str, data: &[u8]) -> PersistenceResult<()> {
         let temp_path = format!("{path}.tmp");
-        let full_temp_path = self.resolve_path(&temp_path);
+        let full_temp_path = self.resolve_path(&temp_path)?;
         if let Some(parent) = full_temp_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -328,7 +324,7 @@ impl Directory for FsDirectory {
         temp_file.write_all(data)?;
         temp_file.sync_all()?;
 
-        let full_path = self.resolve_path(path);
+        let full_path = self.resolve_path(path)?;
         std::fs::rename(&full_temp_path, &full_path)?;
 
         if let Some(parent) = full_path.parent() {
@@ -339,7 +335,7 @@ impl Directory for FsDirectory {
     }
 
     fn file_path(&self, path: &str) -> Option<PathBuf> {
-        Some(self.resolve_path(path))
+        self.resolve_path(path).ok()
     }
 }
 
