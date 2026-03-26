@@ -37,6 +37,25 @@ Entry IDs are assigned by the writer and stored in the frame header, not in your
 exist. Use `WalWriter::resume()` to continue an existing WAL (it handles both empty
 and non-empty directories).
 
+For batch writes (amortize flush cost across multiple entries):
+
+```rust
+let ids = w.append_batch(&[
+    WalEntry::AddSegment { segment_id: 3, doc_count: 50 },
+    WalEntry::DeleteDocuments { deletes: vec![(1, 10)] },
+]).unwrap();
+// Single flush for both entries
+```
+
+For large WALs, use streaming replay to avoid collecting into a `Vec`:
+
+```rust
+reader.replay_each(|record| {
+    println!("entry {}: {:?}", record.entry_id, record.payload);
+    Ok(())
+})?;
+```
+
 ## Not provided (and why)
 
 - **Multi-process locking**: This crate does not manage `flock` or IPC locks.

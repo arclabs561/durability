@@ -442,6 +442,71 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
         self.current_entry_id
     }
 
+    /// Return the current WAL segment ID.
+    pub fn current_segment_id(&self) -> u64 {
+        self.current_segment_id
+    }
+
+    /// Return the approximate byte offset within the current segment.
+    pub fn current_segment_bytes(&self) -> u64 {
+        self.current_offset + self.write_buffer.len() as u64
+    }
+
+    /// Append multiple entries atomically (single flush).
+    ///
+    /// All entries are buffered and written together, then flushed once.
+    /// This amortizes the cost of `flush()` across multiple entries --
+    /// the same benefit as group commit, without thread coordination.
+    ///
+    /// Returns the entry IDs assigned to each entry (in order).
+    /// If any entry fails to encode, no entries are written.
+    pub fn append_batch(&mut self, entries: &[E]) -> PersistenceResult<Vec<u64>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Pre-encode all entries to detect errors before writing any.
+        let mut encoded_pairs: Vec<(u64, Vec<u8>)> = Vec::with_capacity(entries.len());
+        let mut next_id = self.current_entry_id;
+        for entry in entries {
+            let encoded = WalEntryOnDisk::encode(next_id, entry)?;
+            encoded_pairs.push((next_id, encoded));
+            next_id += 1;
+        }
+
+        // Write all entries.
+        let mut ids = Vec::with_capacity(entries.len());
+        for (entry_id, encoded) in encoded_pairs {
+            let _wal_path = self.ensure_segment_open(entry_id)?;
+
+            let projected =
+                self.current_offset + (self.write_buffer.len() as u64) + (encoded.len() as u64);
+            if projected > self.segment_size_limit
+                && self.current_offset > WalSegmentHeader::SIZE as u64
+            {
+                self.flush()?;
+                self.current_segment_id += 1;
+                self.current_offset = 0;
+                self.current_path = None;
+                self.current_file = None;
+                self.since_flush = 0;
+                let _ = self.ensure_segment_open(entry_id)?;
+            }
+
+            self.write_buffer.extend_from_slice(&encoded);
+            if self.write_buffer_limit == 0 || self.write_buffer.len() >= self.write_buffer_limit {
+                self.drain_buffer_to_file()?;
+            }
+
+            self.current_entry_id = entry_id + 1;
+            ids.push(entry_id);
+        }
+
+        // Single flush for the entire batch.
+        self.flush()?;
+        Ok(ids)
+    }
+
     /// Resume appending to an existing WAL (if present).
     ///
     /// If no `wal/` files exist, this is equivalent to `WalWriter::new`.
@@ -788,6 +853,18 @@ impl<E: serde::de::DeserializeOwned> WalReader<E> {
         apply: impl FnMut(WalRecord<E>) -> PersistenceResult<()>,
     ) -> PersistenceResult<u64> {
         self.replay_each_inner(WalReplayMode::BestEffortTail, apply)
+    }
+
+    /// Count entries in the WAL without collecting them.
+    ///
+    /// Equivalent to `replay()?.len()` but avoids building the `Vec`.
+    pub fn entry_count(&self) -> PersistenceResult<u64> {
+        self.replay_each_inner(WalReplayMode::Strict, |_| Ok(()))
+    }
+
+    /// Count entries (best-effort mode).
+    pub fn entry_count_best_effort(&self) -> PersistenceResult<u64> {
+        self.replay_each_inner(WalReplayMode::BestEffortTail, |_| Ok(()))
     }
 
     fn replay_each_inner(
@@ -1431,5 +1508,122 @@ mod tests {
                 key: "hello".into()
             }
         );
+    }
+
+    #[test]
+    fn wal_append_batch_writes_atomically() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let mut w = WalWriter::<WalEntry>::new(dir.clone());
+
+        let entries = vec![
+            WalEntry::AddSegment {
+                segment_id: 1,
+                doc_count: 10,
+            },
+            WalEntry::AddSegment {
+                segment_id: 2,
+                doc_count: 20,
+            },
+            WalEntry::DeleteDocuments {
+                deletes: vec![(1, 5)],
+            },
+        ];
+
+        let ids = w.append_batch(&entries).unwrap();
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert_eq!(w.last_entry_id(), Some(3));
+        assert_eq!(w.next_entry_id(), 4);
+
+        let r = WalReader::<WalEntry>::new(dir);
+        let records = r.replay().unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].entry_id, 1);
+        assert_eq!(records[2].entry_id, 3);
+    }
+
+    #[test]
+    fn wal_append_batch_empty_is_noop() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let mut w = WalWriter::<WalEntry>::new(dir.clone());
+
+        let ids = w.append_batch(&[]).unwrap();
+        assert!(ids.is_empty());
+        assert_eq!(w.last_entry_id(), None);
+    }
+
+    #[test]
+    fn wal_entry_count_matches_replay_len() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let mut w = WalWriter::<WalEntry>::new(dir.clone());
+
+        for i in 0..15u64 {
+            w.append(&WalEntry::AddSegment {
+                segment_id: i + 1,
+                doc_count: 0,
+            })
+            .unwrap();
+        }
+        w.flush().unwrap();
+        drop(w);
+
+        let r = WalReader::<WalEntry>::new(dir);
+        assert_eq!(r.entry_count().unwrap(), 15);
+        assert_eq!(r.replay().unwrap().len(), 15);
+    }
+
+    #[test]
+    fn wal_metadata_accessors() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let mut w = WalWriter::<WalEntry>::new(dir.clone());
+
+        assert_eq!(w.current_segment_id(), 1);
+        assert_eq!(w.current_segment_bytes(), 0);
+
+        w.append(&WalEntry::AddSegment {
+            segment_id: 1,
+            doc_count: 10,
+        })
+        .unwrap();
+        w.flush().unwrap();
+
+        // After writing, segment bytes should be > header size
+        assert!(w.current_segment_bytes() > WalSegmentHeader::SIZE as u64);
+    }
+
+    #[test]
+    fn wal_lockfile_prevents_double_writer() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+
+        let mut w1 = WalWriter::<WalEntry>::new(dir.clone());
+        w1.append(&WalEntry::AddSegment {
+            segment_id: 1,
+            doc_count: 1,
+        })
+        .unwrap();
+        w1.flush().unwrap();
+
+        // Second writer on same dir should fail
+        let mut w2 = WalWriter::<WalEntry>::with_flush_policy(
+            dir.clone(),
+            crate::storage::FlushPolicy::PerAppend,
+        );
+        let err = w2.append(&WalEntry::AddSegment {
+            segment_id: 2,
+            doc_count: 1,
+        });
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("lockfile"));
+
+        // Drop first writer, then second should work via resume
+        drop(w1);
+        let mut w3 = WalWriter::<WalEntry>::resume(dir.clone()).unwrap();
+        let id = w3
+            .append(&WalEntry::AddSegment {
+                segment_id: 2,
+                doc_count: 1,
+            })
+            .unwrap();
+        assert_eq!(id, 2);
+        w3.flush().unwrap();
     }
 }
