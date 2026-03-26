@@ -74,11 +74,6 @@ impl RecordLogWriter {
         Self::with_options(dir, path, FlushPolicy::EveryN(64), 64 * 1024)
     }
 
-    /// Conservative default: no buffering + flush after each append.
-    pub fn new_conservative(dir: impl Into<Arc<dyn Directory>>, path: impl Into<String>) -> Self {
-        Self::with_options(dir, path, FlushPolicy::PerAppend, 0)
-    }
-
     /// Create a record log writer with an explicit flush policy.
     pub fn with_flush_policy(
         dir: impl Into<Arc<dyn Directory>>,
