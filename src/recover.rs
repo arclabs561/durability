@@ -29,14 +29,20 @@ pub struct RecoveryOptions {
     /// If true, treat an unreadable/corrupt checkpoint as empty state
     /// rather than returning an error.
     pub ignore_corrupt_checkpoint: bool,
+    /// If set, stop replaying WAL entries after this entry ID.
+    ///
+    /// Enables point-in-time recovery: replay only entries up to (and including)
+    /// the specified ID. Entries with higher IDs are ignored.
+    pub up_to_entry_id: Option<u64>,
 }
 
 impl RecoveryOptions {
-    /// Strict: any corruption is an error.
+    /// Strict: any corruption is an error, replay all entries.
     pub fn strict() -> Self {
         Self {
             wal_mode: WalReplayMode::Strict,
             ignore_corrupt_checkpoint: false,
+            up_to_entry_id: None,
         }
     }
 
@@ -45,6 +51,16 @@ impl RecoveryOptions {
         Self {
             wal_mode: WalReplayMode::BestEffortTail,
             ignore_corrupt_checkpoint: true,
+            up_to_entry_id: None,
+        }
+    }
+
+    /// Point-in-time: replay entries up to (and including) `entry_id`.
+    pub fn up_to(entry_id: u64) -> Self {
+        Self {
+            wal_mode: WalReplayMode::Strict,
+            ignore_corrupt_checkpoint: false,
+            up_to_entry_id: Some(entry_id),
         }
     }
 }
@@ -129,8 +145,14 @@ where
     // Step 2: replay WAL entries with entry_id > last_entry_id.
     let wal = WalReader::<E>::new(dir.clone());
     let since = last_entry_id;
+    let ceiling = options.up_to_entry_id;
     wal.replay_each_with_mode(options.wal_mode, |record| {
         if record.entry_id > since {
+            if let Some(max) = ceiling {
+                if record.entry_id > max {
+                    return Ok(());
+                }
+            }
             last_entry_id = record.entry_id;
             apply(&mut state, record.entry_id, record.payload);
         }

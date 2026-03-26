@@ -377,6 +377,7 @@ pub struct WalWriter<E> {
     write_buffer: Vec<u8>,
     write_buffer_limit: usize,
     holds_lock: bool,
+    preallocate_bytes: u64,
     _marker: PhantomData<E>,
 }
 
@@ -418,6 +419,7 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
             write_buffer: Vec::new(),
             write_buffer_limit: write_buffer_limit_bytes,
             holds_lock: false,
+            preallocate_bytes: 0,
             _marker: PhantomData,
         }
     }
@@ -426,6 +428,18 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
     pub fn set_segment_size_limit_bytes(&mut self, bytes: u64) {
         let min = WalSegmentHeader::SIZE as u64 + 16;
         self.segment_size_limit = bytes.max(min);
+    }
+
+    /// Set the preallocation size for new segment files (in bytes).
+    ///
+    /// When creating a new segment, the file is extended to this size to
+    /// avoid filesystem block allocation on the write path. The file is
+    /// truncated to actual size on segment rotation or writer drop.
+    /// Set to 0 (default) to disable preallocation.
+    ///
+    /// Only effective on filesystem-backed directories (requires `file_path()`).
+    pub fn set_preallocate_bytes(&mut self, bytes: u64) {
+        self.preallocate_bytes = bytes;
     }
 
     /// Return the last assigned entry ID, or None if no entries have been appended.
@@ -637,6 +651,16 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
             if self.flush_policy == FlushPolicy::PerAppend {
                 file.flush()?;
             }
+            // Preallocate on filesystem backends to avoid block allocation on write path.
+            if self.preallocate_bytes > 0 {
+                if let Some(fs_path) = self.directory.file_path(&wal_path) {
+                    let target = self.preallocate_bytes.max(WalSegmentHeader::SIZE as u64);
+                    let _ = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&fs_path)
+                        .and_then(|f| f.set_len(target));
+                }
+            }
             self.current_offset = WalSegmentHeader::SIZE as u64;
             self.current_path = Some(wal_path.clone());
             self.current_file = Some(file);
@@ -683,6 +707,23 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
         Ok(())
     }
 
+    /// Truncate the current segment to its actual written size.
+    ///
+    /// Called on segment rotation and drop to reclaim preallocated space.
+    fn truncate_current_segment(&self) {
+        if self.preallocate_bytes == 0 {
+            return;
+        }
+        if let Some(path) = self.current_path.as_deref() {
+            if let Some(fs_path) = self.directory.file_path(path) {
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&fs_path)
+                    .and_then(|f| f.set_len(self.current_offset));
+            }
+        }
+    }
+
     /// Rotate to a new segment if the encoded bytes would exceed the size limit.
     fn rotate_if_needed(&mut self, entry_id: u64, encoded_len: u64) -> PersistenceResult<()> {
         let projected = self.current_offset + (self.write_buffer.len() as u64) + encoded_len;
@@ -690,6 +731,7 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
             && self.current_offset > WalSegmentHeader::SIZE as u64
         {
             self.flush()?;
+            self.truncate_current_segment();
             self.current_segment_id += 1;
             self.current_offset = 0;
             self.current_path = None;
@@ -803,6 +845,17 @@ fn scan_last_segment_prefix(
 
 impl<E> Drop for WalWriter<E> {
     fn drop(&mut self) {
+        // Truncate preallocated segment to actual written size.
+        if self.preallocate_bytes > 0 {
+            if let Some(path) = self.current_path.as_deref() {
+                if let Some(fs_path) = self.directory.file_path(path) {
+                    let _ = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&fs_path)
+                        .and_then(|f| f.set_len(self.current_offset));
+                }
+            }
+        }
         if self.holds_lock {
             let _ = self.directory.delete("wal/.lock");
         }
