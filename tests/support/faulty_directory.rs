@@ -42,7 +42,7 @@ impl FaultyDirectory {
     }
 
     fn is_wal_path(path: &str) -> bool {
-        path.starts_with("wal/") || path == "wal"
+        (path.starts_with("wal/") || path == "wal") && !path.ends_with(".lock")
     }
 }
 
