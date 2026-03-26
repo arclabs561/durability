@@ -218,6 +218,11 @@ impl FsDirectory {
         Ok(Self { root })
     }
 
+    /// Create a filesystem directory backend wrapped in `Arc<dyn Directory>`.
+    pub fn arc(root: impl Into<std::path::PathBuf>) -> PersistenceResult<std::sync::Arc<dyn Directory>> {
+        Ok(std::sync::Arc::new(Self::new(root)?))
+    }
+
     fn resolve_path(&self, path: &str) -> PathBuf {
         self.root.join(path)
     }
@@ -311,9 +316,8 @@ impl Directory for FsDirectory {
         std::fs::rename(&full_temp_path, &full_path)?;
 
         if let Some(parent) = full_path.parent() {
-            if let Ok(parent_file) = std::fs::File::open(parent) {
-                let _ = parent_file.sync_all();
-            }
+            let parent_file = std::fs::File::open(parent)?;
+            parent_file.sync_all()?;
         }
         Ok(())
     }
@@ -333,6 +337,11 @@ impl MemoryDirectory {
     /// Create an empty in-memory directory.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create an empty in-memory directory wrapped in `Arc<dyn Directory>`.
+    pub fn arc() -> std::sync::Arc<dyn Directory> {
+        std::sync::Arc::new(Self::new())
     }
 }
 
@@ -376,13 +385,17 @@ impl Directory for MemoryDirectory {
     }
 
     fn delete(&self, path: &str) -> PersistenceResult<()> {
-        self.files
+        let mut files = self
+            .files
             .write()
             .map_err(|_| PersistenceError::LockFailed {
                 resource: "memory directory".to_string(),
                 reason: "lock poisoned".to_string(),
-            })?
-            .remove(path);
+            })?;
+        files.remove(path);
+        // Also remove children (simulate remove_dir_all).
+        let prefix = format!("{path}/");
+        files.retain(|k, _| !k.starts_with(&prefix));
         Ok(())
     }
 
@@ -394,9 +407,10 @@ impl Directory for MemoryDirectory {
                 resource: "memory directory".to_string(),
                 reason: "lock poisoned".to_string(),
             })?;
-        if let Some(data) = files.remove(from) {
-            files.insert(to.to_string(), data);
-        }
+        let data = files
+            .remove(from)
+            .ok_or_else(|| PersistenceError::NotFound(from.to_string()))?;
+        files.insert(to.to_string(), data);
         Ok(())
     }
 
@@ -417,13 +431,20 @@ impl Directory for MemoryDirectory {
         } else {
             format!("{path}/")
         };
-        let mut result: Vec<String> = files
+        let result: std::collections::BTreeSet<String> = files
             .keys()
             .filter(|k| k.starts_with(&prefix))
-            .map(|k| k.strip_prefix(&prefix).unwrap_or(k).to_string())
+            .filter_map(|k| {
+                let rest = k.strip_prefix(&prefix).unwrap_or(k);
+                let first_component = rest.split('/').next().unwrap_or(rest);
+                if first_component.is_empty() {
+                    None
+                } else {
+                    Some(first_component.to_string())
+                }
+            })
             .collect();
-        result.sort();
-        Ok(result)
+        Ok(result.into_iter().collect())
     }
 
     fn append_file(&self, path: &str) -> PersistenceResult<Box<dyn Write>> {
