@@ -6,7 +6,7 @@
 mod support;
 
 use durability::storage::{Directory, FsDirectory, MemoryDirectory};
-use durability::walog::{WalEntry, WalReader, WalRecord, WalWriter};
+use durability::walog::{WalEntry, WalReader, WalWriter};
 use std::sync::Arc;
 use support::faulty_directory::CountdownDirectory;
 
