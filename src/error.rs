@@ -1,7 +1,5 @@
 //! Error types for `durability`.
 
-use std::path::PathBuf;
-
 /// Result type for durability/persistence operations.
 pub type PersistenceResult<T> = Result<T, PersistenceError>;
 
@@ -16,20 +14,6 @@ pub enum PersistenceError {
     /// Format error (corrupt, unexpected, unsupported).
     #[error("format error: {0}")]
     Format(String),
-
-    /// Format error with optional expected/actual context.
-    ///
-    /// `expected`/`actual` exist to make “format mismatch” debugging concrete without
-    /// forcing every caller into bespoke error enums.
-    #[error("format error: {message}")]
-    FormatDetail {
-        /// Short, human-readable description of the mismatch.
-        message: String,
-        /// Optional “expected” value (stringified) for debugging.
-        expected: Option<String>,
-        /// Optional “actual” value (stringified) for debugging.
-        actual: Option<String>,
-    },
 
     /// CRC mismatch (data corruption detected).
     #[error("crc mismatch (expected {expected:#010x}, got {actual:#010x})")]
@@ -72,8 +56,4 @@ pub enum PersistenceError {
     /// Resource not found (file/segment/etc).
     #[error("not found: {0}")]
     NotFound(String),
-
-    /// Requested path does not exist.
-    #[error("missing path: {0}")]
-    MissingPath(PathBuf),
 }

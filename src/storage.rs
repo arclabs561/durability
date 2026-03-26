@@ -235,7 +235,7 @@ impl Directory for FsDirectory {
     fn open_file(&self, path: &str) -> PersistenceResult<Box<dyn Read>> {
         let full_path = self.resolve_path(path);
         if !full_path.exists() {
-            return Err(PersistenceError::MissingPath(full_path));
+            return Err(PersistenceError::NotFound(full_path.display().to_string()));
         }
         Ok(Box::new(std::fs::File::open(full_path)?))
     }
