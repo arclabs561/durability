@@ -83,8 +83,10 @@ fn countdown_recovery_on_fs_produces_prefix() {
     let dir: Arc<dyn Directory> = countdown.clone();
 
     // Write 10 entries with per-append flush
-    let mut w =
-        WalWriter::<WalEntry>::with_flush_policy(dir.clone(), durability::storage::FlushPolicy::PerAppend);
+    let mut w = WalWriter::<WalEntry>::with_flush_policy(
+        dir.clone(),
+        durability::storage::FlushPolicy::PerAppend,
+    );
     let mut written_ids = Vec::new();
     for i in 0..10u64 {
         let id = w
@@ -105,17 +107,18 @@ fn countdown_recovery_on_fs_produces_prefix() {
     countdown.arm(0);
 
     // A new writer (resume) should fail because it needs to open files
-    let resume_result =
-        WalWriter::<WalEntry>::resume(dir.clone());
-    assert!(resume_result.is_err() || {
-        // If resume succeeds (it reads existing segments), the next append should fail
-        let mut w2 = resume_result.unwrap();
-        w2.append(&WalEntry::AddSegment {
-            segment_id: 99,
-            doc_count: 0,
-        })
-        .is_err()
-    });
+    let resume_result = WalWriter::<WalEntry>::resume(dir.clone());
+    assert!(
+        resume_result.is_err() || {
+            // If resume succeeds (it reads existing segments), the next append should fail
+            let mut w2 = resume_result.unwrap();
+            w2.append(&WalEntry::AddSegment {
+                segment_id: 99,
+                doc_count: 0,
+            })
+            .is_err()
+        }
+    );
 
     // Disarm and verify recovery sees exactly 10 entries
     countdown.disarm();
@@ -156,8 +159,10 @@ fn countdown_mid_segment_recovery() {
     let countdown = Arc::new(CountdownDirectory::new(Arc::new(fs) as Arc<dyn Directory>));
     let dir: Arc<dyn Directory> = countdown.clone();
 
-    let mut w =
-        WalWriter::<WalEntry>::with_flush_policy(dir.clone(), durability::storage::FlushPolicy::PerAppend);
+    let mut w = WalWriter::<WalEntry>::with_flush_policy(
+        dir.clone(),
+        durability::storage::FlushPolicy::PerAppend,
+    );
     // Small segments to force rotation
     w.set_segment_size_limit_bytes(100);
 
@@ -182,8 +187,6 @@ fn countdown_mid_segment_recovery() {
     assert_eq!(replayed.len(), 50);
 
     // Verify streaming replay agrees
-    let count = reader
-        .replay_each(|_| Ok(()))
-        .unwrap();
+    let count = reader.replay_each(|_| Ok(())).unwrap();
     assert_eq!(count, 50);
 }

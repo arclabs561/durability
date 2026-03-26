@@ -233,7 +233,9 @@ impl FsDirectory {
     }
 
     /// Create a filesystem directory backend wrapped in `Arc<dyn Directory>`.
-    pub fn arc(root: impl Into<std::path::PathBuf>) -> PersistenceResult<std::sync::Arc<dyn Directory>> {
+    pub fn arc(
+        root: impl Into<std::path::PathBuf>,
+    ) -> PersistenceResult<std::sync::Arc<dyn Directory>> {
         Ok(std::sync::Arc::new(Self::new(root)?))
     }
 

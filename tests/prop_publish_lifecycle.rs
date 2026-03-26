@@ -5,8 +5,8 @@
 //! - truncation never breaks recoverability (at worst leaves extra WAL segments)
 //! - recovery from checkpoint matches recovery from scratch after publish
 
-use durability::recover::{CheckpointSegment, CheckpointState};
 use durability::publish::CheckpointPublisher;
+use durability::recover::{CheckpointSegment, CheckpointState};
 use durability::recover::{RecoveredState, RecoveryManager};
 use durability::storage::{Directory, FsDirectory};
 use durability::walog::{WalEntry, WalMaintenance, WalWriter};

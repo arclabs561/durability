@@ -2,9 +2,9 @@
 #![allow(missing_docs)]
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use durability::recover::{CheckpointSegment, CheckpointState};
 use durability::checkpoint::CheckpointFile;
 use durability::recover::RecoveryManager;
+use durability::recover::{CheckpointSegment, CheckpointState};
 use durability::storage::{Directory, MemoryDirectory};
 use durability::walog::{WalEntry, WalWriter};
 use std::sync::Arc;

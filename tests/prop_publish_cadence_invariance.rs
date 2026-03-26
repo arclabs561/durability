@@ -7,9 +7,9 @@
 //! In both cases, we publish+truncate and then assert `recover_latest()` matches
 //! the reference model.
 
-use durability::recover::{CheckpointSegment, CheckpointState};
 use durability::publish::CheckpointPublisher;
 use durability::recover::RecoveryManager;
+use durability::recover::{CheckpointSegment, CheckpointState};
 use durability::storage::{Directory, FsDirectory};
 use durability::walog::{WalEntry, WalWriter};
 use proptest::prelude::*;

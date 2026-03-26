@@ -354,10 +354,8 @@ mod tests {
 
         let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
         let ckpt = CheckpointFile::new(dir.clone());
-        ckpt.write_postcard("checkpoints/a.chk", 123, &c1)
-            .unwrap();
-        ckpt.write_postcard("checkpoints/b.chk", 123, &c2)
-            .unwrap();
+        ckpt.write_postcard("checkpoints/a.chk", 123, &c1).unwrap();
+        ckpt.write_postcard("checkpoints/b.chk", 123, &c2).unwrap();
 
         let mut a = Vec::new();
         dir.open_file("checkpoints/a.chk")

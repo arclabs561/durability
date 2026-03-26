@@ -3,9 +3,9 @@
 //! This is not an unbounded stress test. It's a deterministic, medium-sized run that
 //! catches lifecycle bugs: rotation, truncation, and recovery drift.
 
-use durability::recover::{CheckpointSegment, CheckpointState};
 use durability::publish::CheckpointPublisher;
 use durability::recover::RecoveryManager;
+use durability::recover::{CheckpointSegment, CheckpointState};
 use durability::storage::{Directory, FsDirectory};
 use durability::walog::{WalEntry, WalMaintenance, WalWriter};
 use std::collections::{HashMap, HashSet};

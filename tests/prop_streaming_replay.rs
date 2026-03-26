@@ -7,8 +7,10 @@ use proptest::prelude::*;
 
 fn arb_wal_entry() -> impl Strategy<Value = WalEntry> {
     prop_oneof![
-        (1..100u64, 0..10000u32)
-            .prop_map(|(seg, cnt)| WalEntry::AddSegment { segment_id: seg, doc_count: cnt }),
+        (1..100u64, 0..10000u32).prop_map(|(seg, cnt)| WalEntry::AddSegment {
+            segment_id: seg,
+            doc_count: cnt
+        }),
         prop::collection::vec((1..100u64, 0..10000u32), 0..10)
             .prop_map(|v| WalEntry::DeleteDocuments { deletes: v }),
         (1..100u64,).prop_map(|(tid,)| WalEntry::StartMerge {
