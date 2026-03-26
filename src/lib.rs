@@ -38,7 +38,6 @@ pub mod formats;
 pub mod publish;
 pub mod recordlog;
 pub mod recover;
-pub mod replay;
 pub mod storage;
 pub mod walog;
 

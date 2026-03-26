@@ -716,18 +716,56 @@ impl<E: serde::de::DeserializeOwned> WalReader<E> {
 
     /// Replay all WAL entries in sorted segment-id order.
     pub fn replay(&self) -> PersistenceResult<Vec<WalRecord<E>>> {
-        self.replay_with_mode(WalReplayMode::Strict)
+        let mut records = Vec::new();
+        self.replay_each_inner(WalReplayMode::Strict, |r| {
+            records.push(r);
+            Ok(())
+        })?;
+        Ok(records)
     }
 
     /// Best-effort replay: stop at first truncated tail record in the final segment.
     pub fn replay_best_effort(&self) -> PersistenceResult<Vec<WalRecord<E>>> {
-        self.replay_with_mode(WalReplayMode::BestEffortTail)
+        let mut records = Vec::new();
+        self.replay_each_inner(WalReplayMode::BestEffortTail, |r| {
+            records.push(r);
+            Ok(())
+        })?;
+        Ok(records)
     }
 
-    fn replay_with_mode(&self, mode: WalReplayMode) -> PersistenceResult<Vec<WalRecord<E>>> {
-        let mut records = Vec::new();
+    /// Streaming replay: call `apply` for each WAL entry (strict mode).
+    ///
+    /// Unlike [`replay`](Self::replay), this does not collect entries into a `Vec`,
+    /// making it suitable for large WALs that would otherwise exhaust memory.
+    /// Returns the number of entries replayed.
+    pub fn replay_each(
+        &self,
+        apply: impl FnMut(WalRecord<E>) -> PersistenceResult<()>,
+    ) -> PersistenceResult<u64> {
+        self.replay_each_inner(WalReplayMode::Strict, apply)
+    }
+
+    /// Streaming best-effort replay: call `apply` for each WAL entry.
+    ///
+    /// Best-effort: stops at first truncated tail record in the final segment.
+    /// Returns the number of entries replayed.
+    pub fn replay_each_best_effort(
+        &self,
+        apply: impl FnMut(WalRecord<E>) -> PersistenceResult<()>,
+    ) -> PersistenceResult<u64> {
+        self.replay_each_inner(WalReplayMode::BestEffortTail, apply)
+    }
+
+    fn replay_each_inner(
+        &self,
+        mode: WalReplayMode,
+        mut apply: impl FnMut(WalRecord<E>) -> PersistenceResult<()>,
+    ) -> PersistenceResult<u64> {
         let wal_segments = enumerate_wal_segments(&*self.directory)?;
         let last_segment_id = wal_segments.last().map(|(id, _)| *id);
+        let mut count = 0u64;
+        let mut last_seen_entry_id: Option<u64> = None;
 
         for (segment_id, wal_file) in wal_segments {
             let wal_path = format!("wal/{wal_file}");
@@ -745,8 +783,6 @@ impl<E: serde::de::DeserializeOwned> WalReader<E> {
             };
 
             let mut first_entry_id_in_segment: Option<u64> = None;
-            let mut last_seen_entry_id: Option<u64> =
-                records.last().map(|r: &WalRecord<E>| r.entry_id);
 
             let segment_mode = match mode {
                 WalReplayMode::Strict => WalReplayMode::Strict,
@@ -772,7 +808,8 @@ impl<E: serde::de::DeserializeOwned> WalReader<E> {
                     }
                 }
                 last_seen_entry_id = Some(record.entry_id);
-                records.push(record);
+                apply(record)?;
+                count += 1;
             }
 
             if let Some(first_id) = first_entry_id_in_segment {
@@ -785,7 +822,7 @@ impl<E: serde::de::DeserializeOwned> WalReader<E> {
             }
         }
 
-        Ok(records)
+        Ok(count)
     }
 }
 
