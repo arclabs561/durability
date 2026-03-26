@@ -128,7 +128,6 @@ pub struct WalRecord<E> {
 // ---------------------------------------------------------------------------
 
 /// Per-file header for a WAL segment.
-#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct WalSegmentHeader {
     /// Magic bytes (should equal `WAL_MAGIC`).
@@ -334,6 +333,26 @@ pub enum WalReplayMode {
 }
 
 // ---------------------------------------------------------------------------
+// WAL segment enumeration
+// ---------------------------------------------------------------------------
+
+/// List WAL segment files, returning (segment_id, filename) pairs sorted by segment_id.
+fn enumerate_wal_segments(dir: &dyn Directory) -> PersistenceResult<Vec<(u64, String)>> {
+    let wal_files = dir.list_dir("wal")?;
+    let mut segments: Vec<(u64, String)> = wal_files
+        .into_iter()
+        .filter(|n| n.ends_with(".log"))
+        .filter_map(|n| {
+            let raw = n.strip_prefix("wal_")?.strip_suffix(".log")?;
+            let id = raw.parse::<u64>().ok()?;
+            Some((id, n))
+        })
+        .collect();
+    segments.sort_by_key(|(id, _)| *id);
+    Ok(segments)
+}
+
+// ---------------------------------------------------------------------------
 // WalWriter (generic)
 // ---------------------------------------------------------------------------
 
@@ -360,11 +379,6 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
     /// Fast-by-default: buffered writes (64 KiB) + flush every 64 appends.
     pub fn new(directory: impl Into<Arc<dyn Directory>>) -> Self {
         Self::with_options(directory, FlushPolicy::EveryN(64), 64 * 1024)
-    }
-
-    /// Conservative default: no buffering + flush after each append.
-    pub fn new_conservative(directory: impl Into<Arc<dyn Directory>>) -> Self {
-        Self::with_options(directory, FlushPolicy::PerAppend, 0)
     }
 
     /// Create a new WAL writer with an explicit flush policy.
@@ -400,20 +414,24 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
         }
     }
 
-    /// Return a reference to the underlying directory.
-    pub fn directory(&self) -> &Arc<dyn Directory> {
-        &self.directory
-    }
-
     /// Set the target maximum size of a WAL segment file (in bytes).
     pub fn set_segment_size_limit_bytes(&mut self, bytes: u64) {
         let min = WalSegmentHeader::SIZE as u64 + 16;
         self.segment_size_limit = bytes.max(min);
     }
 
-    /// Set the flush policy.
-    pub fn set_flush_policy(&mut self, policy: FlushPolicy) {
-        self.flush_policy = policy;
+    /// Return the last assigned entry ID, or None if no entries have been appended.
+    pub fn last_entry_id(&self) -> Option<u64> {
+        if self.current_entry_id <= 1 {
+            None
+        } else {
+            Some(self.current_entry_id - 1)
+        }
+    }
+
+    /// Return the entry ID that will be assigned to the next appended entry.
+    pub fn next_entry_id(&self) -> u64 {
+        self.current_entry_id
     }
 
     /// Resume appending to an existing WAL (if present).
@@ -424,17 +442,7 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
     pub fn resume(directory: impl Into<Arc<dyn Directory>>) -> PersistenceResult<Self> {
         let directory: Arc<dyn Directory> = directory.into();
 
-        let wal_files = directory.list_dir("wal")?;
-        let mut wal_segments: Vec<(u64, String)> = wal_files
-            .into_iter()
-            .filter(|n| n.ends_with(".log"))
-            .filter_map(|n| {
-                let raw = n.strip_prefix("wal_")?.strip_suffix(".log")?;
-                let id = raw.parse::<u64>().ok()?;
-                Some((id, n))
-            })
-            .collect();
-        wal_segments.sort_by_key(|(id, _)| *id);
+        let wal_segments = enumerate_wal_segments(&*directory)?;
 
         if wal_segments.is_empty() {
             return Ok(Self::new(directory));
@@ -502,6 +510,15 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
     fn ensure_wal_dir(&mut self) -> PersistenceResult<()> {
         if !self.wal_dir_ready {
             self.directory.create_dir_all("wal")?;
+            // Safety: prevent silent entry-id collision when called via new() on existing WAL
+            if self.current_entry_id == 1 && self.current_segment_id == 1 {
+                let existing = enumerate_wal_segments(&*self.directory)?;
+                if !existing.is_empty() {
+                    return Err(PersistenceError::InvalidState(
+                        "WAL directory already contains segments; use WalWriter::resume() to continue an existing WAL".into(),
+                    ));
+                }
+            }
             self.wal_dir_ready = true;
         }
         Ok(())
@@ -709,18 +726,7 @@ impl<E: serde::de::DeserializeOwned> WalReader<E> {
 
     fn replay_with_mode(&self, mode: WalReplayMode) -> PersistenceResult<Vec<WalRecord<E>>> {
         let mut records = Vec::new();
-        let wal_files = self.directory.list_dir("wal")?;
-
-        let mut wal_segments: Vec<(u64, String)> = wal_files
-            .into_iter()
-            .filter(|n| n.ends_with(".log"))
-            .filter_map(|n| {
-                let raw = n.strip_prefix("wal_")?.strip_suffix(".log")?;
-                let id = raw.parse::<u64>().ok()?;
-                Some((id, n))
-            })
-            .collect();
-        wal_segments.sort_by_key(|(id, _)| *id);
+        let wal_segments = enumerate_wal_segments(&*self.directory)?;
         let last_segment_id = wal_segments.last().map(|(id, _)| *id);
 
         for (segment_id, wal_file) in wal_segments {
@@ -815,17 +821,7 @@ impl WalMaintenance {
 
     /// Return per-segment entry-id ranges by decoding segments strictly.
     pub fn segment_ranges_strict(&self) -> PersistenceResult<Vec<WalSegmentRange>> {
-        let wal_files = self.directory.list_dir("wal")?;
-        let mut wal_segments: Vec<(u64, String)> = wal_files
-            .into_iter()
-            .filter(|n| n.ends_with(".log"))
-            .filter_map(|n| {
-                let raw = n.strip_prefix("wal_")?.strip_suffix(".log")?;
-                let id = raw.parse::<u64>().ok()?;
-                Some((id, n))
-            })
-            .collect();
-        wal_segments.sort_by_key(|(id, _)| *id);
+        let wal_segments = enumerate_wal_segments(&*self.directory)?;
 
         let mut out = Vec::new();
         for (segment_id, wal_file) in wal_segments {

@@ -26,7 +26,6 @@ use std::sync::Arc;
 /// choose their own smaller caps by rejecting large snapshots before writing.
 pub const MAX_CHECKPOINT_PAYLOAD_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 
-#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 /// Fixed-size header stored at the start of a checkpoint file.
 pub struct CheckpointHeader {
