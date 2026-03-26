@@ -357,6 +357,12 @@ fn enumerate_wal_segments(dir: &dyn Directory) -> PersistenceResult<Vec<(u64, St
 // ---------------------------------------------------------------------------
 
 /// WAL writer that appends entries to numbered segment files under `wal/`.
+///
+/// An advisory lockfile (`wal/.lock`) is created when the writer initializes
+/// its WAL directory and removed on drop. This catches accidental
+/// double-instantiation (two `WalWriter` instances against the same directory)
+/// but does not guarantee cross-process exclusion -- for that, use OS-level
+/// file locking.
 pub struct WalWriter<E> {
     directory: Arc<dyn Directory>,
     current_segment_id: u64,
@@ -370,6 +376,7 @@ pub struct WalWriter<E> {
     since_flush: usize,
     write_buffer: Vec<u8>,
     write_buffer_limit: usize,
+    holds_lock: bool,
     _marker: PhantomData<E>,
 }
 
@@ -410,6 +417,7 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
             since_flush: 0,
             write_buffer: Vec::new(),
             write_buffer_limit: write_buffer_limit_bytes,
+            holds_lock: false,
             _marker: PhantomData,
         }
     }
@@ -474,6 +482,11 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
 
                 let mut w =
                     Self::with_options(directory.clone(), FlushPolicy::EveryN(64), 64 * 1024);
+                // resume() is the crash-recovery path -- clean up any stale lockfile
+                // from a prior crash, then acquire a fresh one.
+                let _ = directory.delete("wal/.lock");
+                let _ = directory.atomic_write("wal/.lock", b"locked");
+                w.holds_lock = true;
                 w.wal_dir_ready = true;
                 w.current_segment_id = *segment_id;
                 w.current_entry_id = last_entry_id.saturating_add(1).max(1);
@@ -510,6 +523,18 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
     fn ensure_wal_dir(&mut self) -> PersistenceResult<()> {
         if !self.wal_dir_ready {
             self.directory.create_dir_all("wal")?;
+            // Advisory lockfile: catch accidental double-instantiation.
+            if self.directory.exists("wal/.lock") {
+                return Err(PersistenceError::InvalidState(
+                    "WAL lockfile wal/.lock exists; another WalWriter may be active. \
+                     Remove the lockfile manually if this is a stale lock from a crash."
+                        .into(),
+                ));
+            }
+            // Write a lockfile. Ignore errors on MemoryDirectory (atomic_write might not work
+            // with non-file backends, but create_file does).
+            let _ = self.directory.atomic_write("wal/.lock", b"locked");
+            self.holds_lock = true;
             // Safety: prevent silent entry-id collision when called via new() on existing WAL
             if self.current_entry_id == 1 && self.current_segment_id == 1 {
                 let existing = enumerate_wal_segments(&*self.directory)?;
@@ -691,6 +716,14 @@ fn scan_last_segment_prefix(
                 }
                 return Ok((prefix, last_id));
             }
+        }
+    }
+}
+
+impl<E> Drop for WalWriter<E> {
+    fn drop(&mut self) {
+        if self.holds_lock {
+            let _ = self.directory.delete("wal/.lock");
         }
     }
 }

@@ -11,21 +11,35 @@ use crate::error::{PersistenceError, PersistenceResult};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
-/// Attempt to `fsync`/`sync_all` the file at `path`.
+/// Make the **data** of `path` durable (`fdatasync`).
 ///
-/// This is the minimal stable-storage durability primitive: once you have written bytes and
-/// flushed userspace buffers, `sync_all` is the mechanism that asks the OS to persist them to
-/// stable storage (subject to filesystem semantics).
+/// Uses `sync_data()` (fdatasync) rather than `sync_all()` (fsync). For
+/// append-only logs, this is correct and faster: fdatasync skips unnecessary
+/// metadata updates (mtime, atime) that don't affect crash recovery. Use
+/// [`sync_file_full`] when metadata durability matters.
 ///
-/// Notes:
-/// - This requires a `Directory` backend that exposes `file_path()`. For backends that do not
-///   map to the OS filesystem, this returns `NotSupported`.
-/// - This does **not** sync the parent directory; if you are relying on file creation or rename
-///   being durable across power loss, also call [`sync_parent_dir`].
+/// Requires `Directory::file_path()`. Returns `NotSupported` if unavailable.
 pub fn sync_file<D: Directory + ?Sized>(dir: &D, path: &str) -> PersistenceResult<()> {
     let Some(p) = dir.file_path(path) else {
         return Err(PersistenceError::NotSupported(
             "sync_file requires Directory::file_path()".into(),
+        ));
+    };
+    let f = std::fs::OpenOptions::new().read(true).open(&p)?;
+    f.sync_data()?;
+    Ok(())
+}
+
+/// Make **all data and metadata** of `path` durable (`fsync`).
+///
+/// Stronger than [`sync_file`]: also syncs metadata (file size, timestamps).
+/// Use this after operations where file size changes must be durable
+/// (e.g. checkpoint writes). For append-only WAL segments, [`sync_file`]
+/// (fdatasync) is sufficient and faster.
+pub fn sync_file_full<D: Directory + ?Sized>(dir: &D, path: &str) -> PersistenceResult<()> {
+    let Some(p) = dir.file_path(path) else {
+        return Err(PersistenceError::NotSupported(
+            "sync_file_full requires Directory::file_path()".into(),
         ));
     };
     let f = std::fs::OpenOptions::new().read(true).open(&p)?;
