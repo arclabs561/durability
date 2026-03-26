@@ -8,7 +8,7 @@
 //!   each WAL entry).
 //!
 //! - **Segment-specific**: [`RecoveryManager`] is a concrete implementation for
-//!   segment-index WALs using [`WalEntry`](crate::walog::WalEntry).
+//!   segment-index WALs using [`WalEntry`].
 
 use crate::checkpoint::CheckpointFile;
 use crate::error::PersistenceResult;

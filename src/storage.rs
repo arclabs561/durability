@@ -15,8 +15,7 @@ use std::path::PathBuf;
 ///
 /// Uses `sync_data()` (fdatasync) rather than `sync_all()` (fsync). For
 /// append-only logs, this is correct and faster: fdatasync skips unnecessary
-/// metadata updates (mtime, atime) that don't affect crash recovery. Use
-/// [`sync_file_full`] when metadata durability matters.
+/// metadata updates (mtime, atime) that don't affect crash recovery.
 ///
 /// Requires `Directory::file_path()`. Returns `NotSupported` if unavailable.
 pub fn sync_file<D: Directory + ?Sized>(dir: &D, path: &str) -> PersistenceResult<()> {
