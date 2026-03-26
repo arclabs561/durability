@@ -7,8 +7,9 @@
 //! 2) record "checkpoint committed" in the WAL and make THAT durable,
 //! 3) only then delete/truncate WAL segments that are fully covered by the checkpoint.
 
-use crate::checkpointing::{CheckpointManager, CheckpointState};
+use crate::checkpoint::CheckpointFile;
 use crate::error::PersistenceResult;
+use crate::recover::CheckpointState;
 use crate::storage::Directory;
 use crate::walog::{WalEntry, WalMaintenance, WalWriter};
 use std::sync::Arc;
@@ -47,8 +48,8 @@ impl CheckpointPublisher {
         checkpoint_last_entry_id: u64,
         checkpoint_path: &str,
     ) -> PersistenceResult<PublishResult> {
-        let mgr = CheckpointManager::new(self.directory.clone());
-        mgr.write_checkpoint_durable(state, checkpoint_last_entry_id, checkpoint_path)?;
+        let ckpt = CheckpointFile::new(self.directory.clone());
+        ckpt.write_postcard_durable(checkpoint_path, checkpoint_last_entry_id, state)?;
 
         let wal_checkpoint_entry_id = wal.append(&WalEntry::Checkpoint {
             checkpoint_path: checkpoint_path.to_string(),

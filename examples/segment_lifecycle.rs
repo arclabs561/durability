@@ -8,7 +8,7 @@
 //! Run:
 //! `cargo run -p durability --example segment_lifecycle`
 
-use durability::checkpointing::CheckpointManager;
+use durability::checkpoint::CheckpointFile;
 use durability::recover::RecoveryManager;
 use durability::storage::FsDirectory;
 use durability::walog::{WalEntry, WalWriter};
@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ckpt_state = RecoveryManager::to_checkpoint_state(&rec);
     let ckpt_last = rec.last_entry_id;
     let ckpt_path = "checkpoints/example.ckpt";
-    CheckpointManager::new(dir.clone()).write_checkpoint(&ckpt_state, ckpt_last, ckpt_path)?;
+    CheckpointFile::new(dir.clone()).write_postcard(ckpt_path, ckpt_last, &ckpt_state)?;
 
     // WAL suffix.
     let _ = wal.append(&WalEntry::AddSegment {

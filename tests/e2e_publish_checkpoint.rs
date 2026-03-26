@@ -1,6 +1,6 @@
 //! End-to-end test for crash-safe checkpoint publishing.
 
-use durability::checkpointing::CheckpointState;
+use durability::recover::CheckpointState;
 use durability::publish::CheckpointPublisher;
 use durability::recover::RecoveryManager;
 use durability::storage::{Directory, FsDirectory};

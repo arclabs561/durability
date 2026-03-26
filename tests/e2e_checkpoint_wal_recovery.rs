@@ -1,7 +1,7 @@
 //! End-to-end property tests for checkpoint + WAL recovery.
 
-use durability::checkpointing::{CheckpointManager, CheckpointSegment, CheckpointState};
-use durability::recover::{RecoveredState, RecoveryManager};
+use durability::checkpoint::CheckpointFile;
+use durability::recover::{CheckpointSegment, CheckpointState, RecoveredState, RecoveryManager};
 use durability::storage::{Directory, FsDirectory};
 use durability::walog::{WalEntry, WalWriter};
 use proptest::prelude::*;
@@ -69,7 +69,7 @@ proptest! {
         let dir = FsDirectory::new(tmp.path()).unwrap();
         let dir: Arc<dyn Directory> = Arc::new(dir);
 
-        let ckpt_mgr = CheckpointManager::new(dir.clone());
+        let ckpt_mgr = CheckpointFile::new(dir.clone());
 
         // Append prefix ops into WAL; record the last entry id applied so the checkpoint
         // can correctly skip replaying the prefix.
@@ -100,7 +100,7 @@ proptest! {
         };
         let checkpoint_path = "checkpoints/c1.chk";
         ckpt_mgr
-            .write_checkpoint(&ckpt_state, last_prefix_entry_id, checkpoint_path)
+            .write_postcard(checkpoint_path, last_prefix_entry_id, &ckpt_state)
             .unwrap();
 
         // Append suffix ops (post-checkpoint) into WAL.

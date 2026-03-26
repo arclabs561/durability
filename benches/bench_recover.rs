@@ -2,7 +2,8 @@
 #![allow(missing_docs)]
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use durability::checkpointing::{CheckpointManager, CheckpointSegment, CheckpointState};
+use durability::recover::{CheckpointSegment, CheckpointState};
+use durability::checkpoint::CheckpointFile;
 use durability::recover::RecoveryManager;
 use durability::storage::{Directory, MemoryDirectory};
 use durability::walog::{WalEntry, WalWriter};
@@ -17,7 +18,7 @@ fn bench_recover_checkpoint_plus_wal(c: &mut Criterion) {
                 let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
 
                 // Build a checkpoint with 1k segments.
-                let ckpt_mgr = CheckpointManager::new(dir.clone());
+                let ckpt_mgr = CheckpointFile::new(dir.clone());
                 let mut segs = Vec::with_capacity(1000);
                 for sid in 1u64..=1000u64 {
                     segs.push(CheckpointSegment {
@@ -28,7 +29,7 @@ fn bench_recover_checkpoint_plus_wal(c: &mut Criterion) {
                 }
                 let state = CheckpointState { segments: segs };
                 ckpt_mgr
-                    .write_checkpoint(&state, 0, "checkpoints/c1.chk")
+                    .write_postcard("checkpoints/c1.chk", 0, &state)
                     .unwrap();
 
                 // WAL: 10k deletes spread across segments.

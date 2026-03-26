@@ -7,7 +7,7 @@
 //! In both cases, we publish+truncate and then assert `recover_latest()` matches
 //! the reference model.
 
-use durability::checkpointing::{CheckpointSegment, CheckpointState};
+use durability::recover::{CheckpointSegment, CheckpointState};
 use durability::publish::CheckpointPublisher;
 use durability::recover::RecoveryManager;
 use durability::storage::{Directory, FsDirectory};

@@ -1,13 +1,12 @@
-//! `durability`: crash-consistent persistence primitives for segment-based indices.
+//! `durability`: crash-consistent persistence primitives.
 //!
 //! Scope:
 //! - directory abstraction (`Directory`)
 //! - on-disk framing constants (`formats`)
-//! - write-ahead log (`walog`)
-//! - checkpoints (`checkpointing`)
-//! - crash recovery from WAL (`recover`)
-//!
-//! Non-goal: indexing algorithms or ranking (those belong in crates like `postings` / `jin`).
+//! - append-only record log (`recordlog`)
+//! - generic write-ahead log (`walog`)
+//! - CRC-validated checkpoint snapshots (`checkpoint`)
+//! - segment-specific recovery (`recover`, `publish`)
 //!
 //! ## Contract (what you can rely on)
 //!
@@ -33,8 +32,8 @@
 //! but some primitives (notably `walog`) assume a conventional `wal/` directory.
 
 pub mod checkpoint;
-pub mod checkpointing;
 pub mod error;
+#[doc(hidden)]
 pub mod formats;
 pub mod publish;
 pub mod recordlog;
@@ -44,15 +43,13 @@ pub mod storage;
 pub mod walog;
 
 pub use error::{PersistenceError, PersistenceResult};
-pub use publish::{CheckpointPublisher, PublishResult};
 pub use storage::{Directory, DurableDirectory, FsDirectory, MemoryDirectory};
-pub use walog::{WalEntry, WalRecord};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkpointing::{CheckpointManager, CheckpointState};
-    use crate::recover::RecoveryManager;
+    use crate::checkpoint::CheckpointFile;
+    use crate::recover::{CheckpointState, RecoveryManager};
     use crate::walog::{WalEntry, WalWriter};
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -115,8 +112,8 @@ mod tests {
         let ckpt_last = prefix.last_entry_id;
 
         let ckpt_path = "checkpoints/c1.bin";
-        let ckpt = CheckpointManager::new(dir.clone());
-        ckpt.write_checkpoint(&ckpt_state, ckpt_last, ckpt_path)
+        let ckpt = CheckpointFile::new(dir.clone());
+        ckpt.write_postcard(ckpt_path, ckpt_last, &ckpt_state)
             .unwrap();
 
         w.append(&WalEntry::AddSegment {

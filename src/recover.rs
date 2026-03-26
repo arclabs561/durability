@@ -1,11 +1,32 @@
 //! Crash recovery using checkpoint + WAL replay.
+//!
+//! Contains segment-specific checkpoint types (`CheckpointState`, `CheckpointSegment`)
+//! and the `RecoveryManager` that applies checkpoint + WAL to produce `RecoveredState`.
 
-use crate::checkpointing::{CheckpointManager, CheckpointSegment, CheckpointState};
+use crate::checkpoint::CheckpointFile;
 use crate::error::PersistenceResult;
 use crate::storage::Directory;
 use crate::walog::{WalEntry, WalReader};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// The durable index state stored in a checkpoint.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CheckpointState {
+    /// Known segments and their delete sets.
+    pub segments: Vec<CheckpointSegment>,
+}
+
+/// Per-segment data stored in the checkpoint.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CheckpointSegment {
+    /// Segment identifier.
+    pub segment_id: u64,
+    /// Number of documents in that segment.
+    pub doc_count: u32,
+    /// Deleted doc ids within that segment.
+    pub deleted_docs: Vec<u32>,
+}
 
 /// State recovered from checkpoint + WAL.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -103,9 +124,9 @@ impl RecoveryManager {
             if !self.directory.exists(path) {
                 (Vec::new(), 0)
             } else {
-                let ckpt = CheckpointManager::new(self.directory.clone());
-                match ckpt.read_checkpoint(path) {
-                    Ok((state, last)) => (state.segments, last),
+                let ckpt = CheckpointFile::new(self.directory.clone());
+                match ckpt.read_postcard::<CheckpointState>(path) {
+                    Ok((last, state)) => (state.segments, last),
                     Err(e) => match mode {
                         RecoveryMode::Strict => return Err(e),
                         RecoveryMode::BestEffort => (Vec::new(), 0),
@@ -235,7 +256,7 @@ mod tests {
     fn recovery_applies_checkpoint_then_wal() {
         let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
 
-        let ckpt = CheckpointManager::new(dir.clone());
+        let ckpt = CheckpointFile::new(dir.clone());
         let state = CheckpointState {
             segments: vec![CheckpointSegment {
                 segment_id: 7,
@@ -243,7 +264,7 @@ mod tests {
                 deleted_docs: vec![0],
             }],
         };
-        ckpt.write_checkpoint(&state, 0, "checkpoints/c1.chk")
+        ckpt.write_postcard("checkpoints/c1.chk", 0, &state)
             .unwrap();
 
         let mut wal = WalWriter::<WalEntry>::new(dir.clone());
@@ -276,9 +297,9 @@ mod tests {
     fn recover_strict_errors_on_corrupt_checkpoint() {
         let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
 
-        let ckpt = CheckpointManager::new(dir.clone());
+        let ckpt = CheckpointFile::new(dir.clone());
         let state = CheckpointState { segments: vec![] };
-        ckpt.write_checkpoint(&state, 0, "checkpoints/c1.chk")
+        ckpt.write_postcard("checkpoints/c1.chk", 0, &state)
             .unwrap();
 
         let mut bytes = {
@@ -332,10 +353,10 @@ mod tests {
         assert_eq!(c2.segments.len(), 2);
 
         let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
-        let ckpt = CheckpointManager::new(dir.clone());
-        ckpt.write_checkpoint(&c1, 123, "checkpoints/a.chk")
+        let ckpt = CheckpointFile::new(dir.clone());
+        ckpt.write_postcard("checkpoints/a.chk", 123, &c1)
             .unwrap();
-        ckpt.write_checkpoint(&c2, 123, "checkpoints/b.chk")
+        ckpt.write_postcard("checkpoints/b.chk", 123, &c2)
             .unwrap();
 
         let mut a = Vec::new();
