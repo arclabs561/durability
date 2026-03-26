@@ -12,11 +12,10 @@ use durability::checkpoint::CheckpointFile;
 use durability::recover::RecoveryManager;
 use durability::storage::FsDirectory;
 use durability::walog::{WalEntry, WalWriter};
-use std::sync::Arc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tmp = tempfile::tempdir()?;
-    let dir: Arc<dyn durability::Directory> = Arc::new(FsDirectory::new(tmp.path())?);
+    let dir = FsDirectory::arc(tmp.path())?;
 
     let mut wal = WalWriter::<WalEntry>::new(dir.clone());
 
