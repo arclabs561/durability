@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 durability = { path = ".." }
+serde = { version = "1", features = ["derive"] }
 
 [[bin]]
 name = "fuzz_wal_entry_decode"
@@ -27,3 +28,7 @@ path = "fuzz_targets/fuzz_recordlog_read.rs"
 [[bin]]
 name = "fuzz_wal_dir_replay"
 path = "fuzz_targets/fuzz_wal_dir_replay.rs"
+
+[[bin]]
+name = "fuzz_generic_recovery"
+path = "fuzz_targets/fuzz_generic_recovery.rs"
