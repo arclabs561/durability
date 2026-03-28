@@ -4,7 +4,7 @@
 [![Documentation](https://docs.rs/durability/badge.svg)](https://docs.rs/durability)
 [![CI](https://github.com/arclabs561/durability/actions/workflows/ci.yml/badge.svg)](https://github.com/arclabs561/durability/actions/workflows/ci.yml)
 
-Crash-consistent persistence primitives: directory abstraction, record logs, generic WAL, checkpoints, and recovery.
+Durability primitives for local persistence.
 
 ## Quick start
 
