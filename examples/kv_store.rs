@@ -75,7 +75,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write checkpoint.
     let snap = KvSnapshot {
-        pairs: recovered.state.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        pairs: recovered
+            .state
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
     };
     CheckpointFile::new(dir.clone()).write_postcard(
         "checkpoints/kv.chk",
