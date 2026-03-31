@@ -26,7 +26,6 @@
 use crate::error::{PersistenceError, PersistenceResult};
 use crate::formats::{FORMAT_VERSION, RECORDLOG_MAGIC};
 use crate::storage::{self, Directory, FlushPolicy};
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};
 use std::sync::Arc;
 
@@ -115,7 +114,9 @@ impl RecordLogWriter {
             if magic != RECORDLOG_MAGIC {
                 return Err(PersistenceError::Format("invalid recordlog magic".into()));
             }
-            let version = r.read_u32::<LittleEndian>()?;
+            let mut vbuf = [0u8; 4];
+            r.read_exact(&mut vbuf)?;
+            let version = u32::from_le_bytes(vbuf);
             if version != FORMAT_VERSION {
                 return Err(PersistenceError::Format(
                     "recordlog version mismatch".into(),
@@ -127,7 +128,7 @@ impl RecordLogWriter {
 
         let mut w = self.dir.create_file(&self.path)?;
         w.write_all(&RECORDLOG_MAGIC)?;
-        w.write_u32::<LittleEndian>(FORMAT_VERSION)?;
+        w.write_all(&FORMAT_VERSION.to_le_bytes())?;
         if self.flush_policy == FlushPolicy::PerAppend {
             w.flush()?;
         }
@@ -254,7 +255,9 @@ impl RecordLogReader {
         if magic != RECORDLOG_MAGIC {
             return Err(PersistenceError::Format("invalid recordlog magic".into()));
         }
-        let version = f.read_u32::<LittleEndian>()?;
+        let mut vbuf = [0u8; 4];
+        f.read_exact(&mut vbuf)?;
+        let version = u32::from_le_bytes(vbuf);
         if version != FORMAT_VERSION {
             return Err(PersistenceError::Format(
                 "recordlog version mismatch".into(),
@@ -294,15 +297,18 @@ impl RecordLogReader {
             )));
         }
 
-        let expected_crc = match r.read_u32::<LittleEndian>() {
-            Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return match mode {
-                    RecordLogReadMode::Strict => Err(e.into()),
-                    RecordLogReadMode::BestEffort => Ok(None),
-                };
+        let expected_crc = {
+            let mut crc_buf = [0u8; 4];
+            match r.read_exact(&mut crc_buf) {
+                Ok(()) => u32::from_le_bytes(crc_buf),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return match mode {
+                        RecordLogReadMode::Strict => Err(e.into()),
+                        RecordLogReadMode::BestEffort => Ok(None),
+                    };
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => return Err(e.into()),
         };
         let mut payload = vec![0u8; len as usize];
         if let Err(e) = r.read_exact(&mut payload) {
