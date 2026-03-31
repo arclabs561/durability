@@ -146,6 +146,11 @@ impl CountdownDirectory {
         self.remaining.load(Ordering::SeqCst) == 0
     }
 
+    /// Return the current remaining count.
+    pub fn remaining(&self) -> u64 {
+        self.remaining.load(Ordering::SeqCst)
+    }
+
     /// Decrement the countdown. Returns Err if we've hit zero.
     fn check_write(&self) -> durability::PersistenceResult<()> {
         loop {
