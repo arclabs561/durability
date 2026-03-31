@@ -218,7 +218,7 @@ impl RecoveryManager {
 
     /// Recover state using an optional checkpoint, then WAL replay.
     pub fn recover(&self, checkpoint_path: Option<&str>) -> PersistenceResult<RecoveredState> {
-        self.recover_with_mode(checkpoint_path, RecoveryMode::Strict)
+        self.recover_with_options(checkpoint_path, RecoveryOptions::strict())
     }
 
     /// Best-effort recovery: if the checkpoint exists but is unreadable/corrupt, ignore it.
@@ -226,7 +226,7 @@ impl RecoveryManager {
         &self,
         checkpoint_path: Option<&str>,
     ) -> PersistenceResult<RecoveredState> {
-        self.recover_with_mode(checkpoint_path, RecoveryMode::BestEffort)
+        self.recover_with_options(checkpoint_path, RecoveryOptions::best_effort())
     }
 
     /// Recover state using the latest committed checkpoint recorded in the WAL (if any).
@@ -270,16 +270,11 @@ impl RecoveryManager {
         Ok(best.map(|(_, p)| p))
     }
 
-    fn recover_with_mode(
+    fn recover_with_options(
         &self,
         checkpoint_path: Option<&str>,
-        mode: RecoveryMode,
+        options: RecoveryOptions,
     ) -> PersistenceResult<RecoveredState> {
-        let options = match mode {
-            RecoveryMode::Strict => RecoveryOptions::strict(),
-            RecoveryMode::BestEffort => RecoveryOptions::best_effort(),
-        };
-
         let result = recover_with_wal::<CheckpointState, WalEntry, _>(
             &self.directory,
             checkpoint_path,
@@ -382,12 +377,6 @@ impl RecoveryManager {
         segments.sort_by_key(|s| s.segment_id);
         CheckpointState { segments }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum RecoveryMode {
-    Strict,
-    BestEffort,
 }
 
 #[cfg(test)]
