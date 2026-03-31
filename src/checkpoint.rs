@@ -15,7 +15,6 @@
 use crate::error::{PersistenceError, PersistenceResult};
 use crate::formats::{CHECKPOINT_MAGIC, FORMAT_VERSION};
 use crate::storage::{self, Directory};
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};
 use std::sync::Arc;
 
@@ -26,8 +25,11 @@ use std::sync::Arc;
 /// choose their own smaller caps by rejecting large snapshots before writing.
 pub const MAX_CHECKPOINT_PAYLOAD_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 
-#[derive(Debug, Clone, Copy)]
 /// Fixed-size header stored at the start of a checkpoint file.
+///
+/// Internal wire format; exposed for testing and fuzzing.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
 pub struct CheckpointHeader {
     /// Magic bytes (should equal `CHECKPOINT_MAGIC`).
     pub magic: [u8; 4],
@@ -55,10 +57,10 @@ impl CheckpointHeader {
     /// Write the header to a stream.
     pub fn write<W: Write>(&self, w: &mut W) -> PersistenceResult<()> {
         w.write_all(&self.magic)?;
-        w.write_u32::<LittleEndian>(self.version)?;
-        w.write_u64::<LittleEndian>(self.last_applied_id)?;
-        w.write_u64::<LittleEndian>(self.payload_len)?;
-        w.write_u32::<LittleEndian>(self.checksum)?;
+        w.write_all(&self.version.to_le_bytes())?;
+        w.write_all(&self.last_applied_id.to_le_bytes())?;
+        w.write_all(&self.payload_len.to_le_bytes())?;
+        w.write_all(&self.checksum.to_le_bytes())?;
         Ok(())
     }
 
@@ -69,18 +71,27 @@ impl CheckpointHeader {
         if magic != CHECKPOINT_MAGIC {
             return Err(PersistenceError::Format("invalid checkpoint magic".into()));
         }
-        let version = r.read_u32::<LittleEndian>()?;
+        let mut buf4 = [0u8; 4];
+        let mut buf8 = [0u8; 8];
+        r.read_exact(&mut buf4)?;
+        let version = u32::from_le_bytes(buf4);
         if version != FORMAT_VERSION {
             return Err(PersistenceError::Format(
                 "checkpoint version mismatch".into(),
             ));
         }
+        r.read_exact(&mut buf8)?;
+        let last_applied_id = u64::from_le_bytes(buf8);
+        r.read_exact(&mut buf8)?;
+        let payload_len = u64::from_le_bytes(buf8);
+        r.read_exact(&mut buf4)?;
+        let checksum = u32::from_le_bytes(buf4);
         Ok(Self {
             magic,
             version,
-            last_applied_id: r.read_u64::<LittleEndian>()?,
-            payload_len: r.read_u64::<LittleEndian>()?,
-            checksum: r.read_u32::<LittleEndian>()?,
+            last_applied_id,
+            payload_len,
+            checksum,
         })
     }
 }

@@ -128,6 +128,9 @@ pub struct WalRecord<E> {
 // ---------------------------------------------------------------------------
 
 /// Per-file header for a WAL segment.
+///
+/// Internal wire format; exposed for testing and fuzzing.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
 pub struct WalSegmentHeader {
     /// Magic bytes (should equal `WAL_MAGIC`).
@@ -146,36 +149,40 @@ impl WalSegmentHeader {
 
     /// Write the header to a stream.
     pub fn write<W: Write>(&self, writer: &mut W) -> PersistenceResult<()> {
-        use byteorder::{LittleEndian, WriteBytesExt};
         writer.write_all(&self.magic)?;
-        writer.write_u32::<LittleEndian>(self.version)?;
-        writer.write_u64::<LittleEndian>(self.start_entry_id)?;
-        writer.write_u64::<LittleEndian>(self.segment_id)?;
+        writer.write_all(&self.version.to_le_bytes())?;
+        writer.write_all(&self.start_entry_id.to_le_bytes())?;
+        writer.write_all(&self.segment_id.to_le_bytes())?;
         Ok(())
     }
 
     /// Read the header from a stream.
     pub fn read<R: Read>(reader: &mut R) -> PersistenceResult<Self> {
-        use byteorder::{LittleEndian, ReadBytesExt};
-
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
         if magic != WAL_MAGIC {
             return Err(PersistenceError::Format("invalid WAL magic".into()));
         }
 
-        let version = reader.read_u32::<LittleEndian>()?;
+        let mut buf4 = [0u8; 4];
+        let mut buf8 = [0u8; 8];
+        reader.read_exact(&mut buf4)?;
+        let version = u32::from_le_bytes(buf4);
         if version != WAL_FORMAT_VERSION {
             return Err(PersistenceError::Format(format!(
                 "WAL version mismatch (got {version}, expected {WAL_FORMAT_VERSION})"
             )));
         }
 
+        reader.read_exact(&mut buf8)?;
+        let start_entry_id = u64::from_le_bytes(buf8);
+        reader.read_exact(&mut buf8)?;
+        let segment_id = u64::from_le_bytes(buf8);
         Ok(Self {
             magic,
             version,
-            start_entry_id: reader.read_u64::<LittleEndian>()?,
-            segment_id: reader.read_u64::<LittleEndian>()?,
+            start_entry_id,
+            segment_id,
         })
     }
 }
@@ -188,6 +195,9 @@ impl WalSegmentHeader {
 ///
 /// Frame layout: `[length:u32][entry_id:u64][crc32:u32][postcard payload...]`
 /// where `length` = 4 (len) + 8 (entry_id) + 4 (crc) + payload_len.
+///
+/// Internal wire format; exposed for testing and fuzzing.
+#[doc(hidden)]
 pub struct WalEntryOnDisk;
 
 impl WalEntryOnDisk {
@@ -243,32 +253,36 @@ impl WalEntryOnDisk {
         reader: &mut R,
         mode: WalReplayMode,
     ) -> PersistenceResult<Option<(u64, Vec<u8>)>> {
-        use byteorder::{LittleEndian, ReadBytesExt};
-
         let Some(length) = Self::read_u32_len(reader, mode)? else {
             return Ok(None);
         };
 
-        let entry_id = match reader.read_u64::<LittleEndian>() {
-            Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return match mode {
-                    WalReplayMode::Strict => Err(e.into()),
-                    WalReplayMode::BestEffortTail => Ok(None),
-                };
+        let entry_id = {
+            let mut buf = [0u8; 8];
+            match reader.read_exact(&mut buf) {
+                Ok(()) => u64::from_le_bytes(buf),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return match mode {
+                        WalReplayMode::Strict => Err(e.into()),
+                        WalReplayMode::BestEffortTail => Ok(None),
+                    };
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => return Err(e.into()),
         };
 
-        let checksum = match reader.read_u32::<LittleEndian>() {
-            Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return match mode {
-                    WalReplayMode::Strict => Err(e.into()),
-                    WalReplayMode::BestEffortTail => Ok(None),
-                };
+        let checksum = {
+            let mut buf = [0u8; 4];
+            match reader.read_exact(&mut buf) {
+                Ok(()) => u32::from_le_bytes(buf),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return match mode {
+                        WalReplayMode::Strict => Err(e.into()),
+                        WalReplayMode::BestEffortTail => Ok(None),
+                    };
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => return Err(e.into()),
         };
 
         // Frame overhead: 4 (len) + 8 (entry_id) + 4 (crc) = 16 bytes
