@@ -1,3 +1,4 @@
+#![warn(missing_docs)]
 //! `durability`: crash-consistent persistence primitives.
 //!
 //! Scope:

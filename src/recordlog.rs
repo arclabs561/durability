@@ -55,6 +55,23 @@ pub struct Record {
 /// not use an advisory lockfile. Two writers on the same path will interleave
 /// writes and corrupt the log. Callers are responsible for ensuring at most one
 /// active writer per path.
+///
+/// # Example
+///
+/// ```
+/// use durability::recordlog::{RecordLogWriter, RecordLogReader, RecordLogReadMode};
+/// use durability::storage::MemoryDirectory;
+///
+/// let dir = MemoryDirectory::arc();
+/// let mut w = RecordLogWriter::new(dir.clone(), "log.bin");
+/// w.append_postcard(&"hello").unwrap();
+/// w.append_postcard(&"world").unwrap();
+/// w.flush().unwrap();
+///
+/// let r = RecordLogReader::new(dir, "log.bin");
+/// let msgs: Vec<String> = r.read_all_postcard(RecordLogReadMode::Strict).unwrap();
+/// assert_eq!(msgs, vec!["hello", "world"]);
+/// ```
 pub struct RecordLogWriter {
     dir: Arc<dyn Directory>,
     path: String,

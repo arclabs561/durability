@@ -31,18 +31,9 @@ pub const MAX_CHECKPOINT_PAYLOAD_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
 pub struct CheckpointHeader {
-    /// Magic bytes (should equal `CHECKPOINT_MAGIC`).
-    pub magic: [u8; 4],
-    /// Format version (should equal `FORMAT_VERSION`).
-    pub version: u32,
+    magic: [u8; 4],
+    version: u32,
     /// The last applied log entry id included in this checkpoint.
-    ///
-    /// Invariants:
-    /// - **Monotone** for successive checkpoints of the same logical stream.
-    /// - Used to decide which log entries must be replayed after loading a
-    ///   checkpoint (replay entries with id > last_applied_id).
-    ///
-    /// For callers that do not have a log, use `0`.
     pub last_applied_id: u64,
     /// Payload length in bytes.
     pub payload_len: u64,
@@ -53,6 +44,17 @@ pub struct CheckpointHeader {
 impl CheckpointHeader {
     /// Number of bytes in the serialized header.
     pub const SIZE: usize = 4 + 4 + 8 + 8 + 4;
+
+    /// Create a header with correct magic and version.
+    pub(crate) fn new(last_applied_id: u64, payload_len: u64, checksum: u32) -> Self {
+        Self {
+            magic: CHECKPOINT_MAGIC,
+            version: FORMAT_VERSION,
+            last_applied_id,
+            payload_len,
+            checksum,
+        }
+    }
 
     /// Write the header to a stream.
     pub fn write<W: Write>(&self, w: &mut W) -> PersistenceResult<()> {
@@ -97,6 +99,24 @@ impl CheckpointHeader {
 }
 
 /// Read/write checkpoint files in a `Directory`.
+///
+/// # Example
+///
+/// ```
+/// use durability::checkpoint::CheckpointFile;
+/// use durability::storage::MemoryDirectory;
+///
+/// #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+/// struct Snapshot { count: u64 }
+///
+/// let dir = MemoryDirectory::arc();
+/// let ckpt = CheckpointFile::new(dir.clone());
+/// ckpt.write_postcard("snap.bin", 42, &Snapshot { count: 7 }).unwrap();
+///
+/// let (last_id, snap): (u64, Snapshot) = ckpt.read_postcard("snap.bin").unwrap();
+/// assert_eq!(last_id, 42);
+/// assert_eq!(snap, Snapshot { count: 7 });
+/// ```
 pub struct CheckpointFile {
     dir: Arc<dyn Directory>,
 }
@@ -127,13 +147,7 @@ impl CheckpointFile {
             )));
         }
         let checksum = crc32fast::hash(&payload);
-        let h = CheckpointHeader {
-            magic: CHECKPOINT_MAGIC,
-            version: FORMAT_VERSION,
-            last_applied_id,
-            payload_len: payload.len() as u64,
-            checksum,
-        };
+        let h = CheckpointHeader::new(last_applied_id, payload.len() as u64, checksum);
         let mut buf = Vec::with_capacity(CheckpointHeader::SIZE + payload.len());
         h.write(&mut buf)?;
         buf.extend_from_slice(&payload);

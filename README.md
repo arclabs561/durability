@@ -56,6 +56,44 @@ reader.replay_each(|record| {
 })?;
 ```
 
+## Generic recovery
+
+`recover_with_wal` coordinates checkpoint loading and WAL replay for any
+entry type and checkpoint schema:
+
+```rust
+use durability::recover::{recover_with_wal, RecoveryOptions};
+use durability::walog::WalWriter;
+use durability::storage::MemoryDirectory;
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Snap { counter: u64 }
+
+#[derive(serde::Serialize, serde::Deserialize)]
+enum Op { Inc, Dec }
+
+let dir = MemoryDirectory::arc();
+let mut w = WalWriter::<Op>::new(dir.clone());
+w.append(&Op::Inc).unwrap();
+w.append(&Op::Inc).unwrap();
+w.append(&Op::Dec).unwrap();
+w.flush().unwrap();
+drop(w);
+
+let result = recover_with_wal::<Snap, Op, _>(
+    &dir, None, RecoveryOptions::strict(),
+    |ckpt| ckpt.unwrap_or_default().counter,
+    |counter, _id, entry| match entry {
+        Op::Inc => *counter += 1,
+        Op::Dec => *counter = counter.saturating_sub(1),
+    },
+).unwrap();
+assert_eq!(result.state, 1); // 0 + 1 + 1 - 1
+```
+
+See `examples/kv_store.rs` for a complete checkpoint + WAL + point-in-time
+recovery example.
+
 ## Not provided (and why)
 
 - **Multi-process locking**: This crate does not manage `flock` or IPC locks.
@@ -132,3 +170,4 @@ Property tests cover semantic invariants; fuzzing covers "never panic on weird b
   - `cargo fuzz run fuzz_wal_dir_replay`
   - `cargo fuzz run fuzz_checkpoint_read`
   - `cargo fuzz run fuzz_recordlog_read`
+  - `cargo fuzz run fuzz_generic_recovery`

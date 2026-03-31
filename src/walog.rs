@@ -386,6 +386,27 @@ fn enumerate_wal_segments(dir: &dyn Directory) -> PersistenceResult<Vec<(u64, St
 /// double-instantiation (two `WalWriter` instances against the same directory)
 /// but does not guarantee cross-process exclusion -- for that, use OS-level
 /// file locking.
+///
+/// # Example
+///
+/// ```
+/// use durability::storage::MemoryDirectory;
+/// use durability::walog::{WalWriter, WalReader};
+/// use std::sync::Arc;
+///
+/// #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+/// enum Op { Set(String, String), Del(String) }
+///
+/// let dir = MemoryDirectory::arc();
+/// let mut w = WalWriter::<Op>::new(dir.clone());
+/// w.append(&Op::Set("k".into(), "v".into())).unwrap();
+/// w.flush().unwrap();
+/// drop(w);
+///
+/// let records = WalReader::<Op>::new(dir).replay().unwrap();
+/// assert_eq!(records.len(), 1);
+/// assert_eq!(records[0].payload, Op::Set("k".into(), "v".into()));
+/// ```
 pub struct WalWriter<E> {
     directory: Arc<dyn Directory>,
     current_segment_id: u64,

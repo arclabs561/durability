@@ -89,30 +89,42 @@ pub struct Recovery<S> {
 ///
 /// # Example
 ///
-/// ```rust,no_run
+/// ```
 /// use durability::recover::{recover_with_wal, RecoveryOptions};
+/// use durability::walog::WalWriter;
 /// use durability::storage::MemoryDirectory;
-/// use std::sync::Arc;
 ///
 /// #[derive(Default, serde::Serialize, serde::Deserialize)]
-/// struct MyCheckpoint { counter: u64 }
+/// struct Snap { counter: u64 }
 ///
 /// #[derive(serde::Serialize, serde::Deserialize)]
-/// enum MyEntry { Increment, Decrement }
+/// enum Op { Inc, Dec }
 ///
 /// let dir = MemoryDirectory::arc();
-/// let result = recover_with_wal::<MyCheckpoint, MyEntry, _>(
+///
+/// // Write some entries.
+/// let mut w = WalWriter::<Op>::new(dir.clone());
+/// w.append(&Op::Inc).unwrap();
+/// w.append(&Op::Inc).unwrap();
+/// w.append(&Op::Dec).unwrap();
+/// w.flush().unwrap();
+/// drop(w);
+///
+/// // Recover state by replaying the WAL.
+/// let result = recover_with_wal::<Snap, Op, _>(
 ///     &dir,
 ///     None,
 ///     RecoveryOptions::strict(),
 ///     |ckpt| ckpt.unwrap_or_default().counter,
 ///     |counter, _entry_id, entry| {
 ///         match entry {
-///             MyEntry::Increment => *counter += 1,
-///             MyEntry::Decrement => *counter = counter.saturating_sub(1),
+///             Op::Inc => *counter += 1,
+///             Op::Dec => *counter = counter.saturating_sub(1),
 ///         }
 ///     },
 /// ).unwrap();
+/// assert_eq!(result.state, 1); // 0 + 1 + 1 - 1
+/// assert_eq!(result.last_entry_id, 3);
 /// ```
 pub fn recover_with_wal<C, E, W>(
     dir: &Arc<dyn Directory>,
