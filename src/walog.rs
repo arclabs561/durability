@@ -224,7 +224,16 @@ impl WalEntryOnDisk {
         }
 
         let bytes = [first[0], rest[0], rest[1], rest[2]];
-        Ok(Some(u32::from_le_bytes(bytes)))
+        let len = u32::from_le_bytes(bytes);
+
+        // A length of 0 can appear as trailing zero-padding from preallocation.
+        // In BestEffortTail mode, treat it as EOF. A valid frame always has
+        // length >= 16 (4 len + 8 entry_id + 4 crc), so 0 is never legitimate.
+        if len == 0 && mode == WalReplayMode::BestEffortTail {
+            return Ok(None);
+        }
+
+        Ok(Some(len))
     }
 
     /// Encode a WAL entry into bytes suitable for appending.
@@ -392,6 +401,7 @@ pub struct WalWriter<E> {
     write_buffer_limit: usize,
     holds_lock: bool,
     preallocate_bytes: u64,
+    poisoned: bool,
     _marker: PhantomData<E>,
 }
 
@@ -434,6 +444,7 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
             write_buffer_limit: write_buffer_limit_bytes,
             holds_lock: false,
             preallocate_bytes: 0,
+            poisoned: false,
             _marker: PhantomData,
         }
     }
@@ -489,6 +500,11 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
     /// Returns the entry IDs assigned to each entry (in order).
     /// If any entry fails to encode, no entries are written.
     pub fn append_batch(&mut self, entries: &[E]) -> PersistenceResult<Vec<u64>> {
+        if self.poisoned {
+            return Err(PersistenceError::InvalidState(
+                "WAL writer is poisoned after a prior write error".into(),
+            ));
+        }
         if entries.is_empty() {
             return Ok(Vec::new());
         }
@@ -692,7 +708,14 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
             .current_file
             .as_mut()
             .expect("segment file must be open");
-        f.write_all(&self.write_buffer)?;
+        if let Err(e) = f.write_all(&self.write_buffer) {
+            // After a partial write_all failure, the file and buffer are in an
+            // indeterminate state (some bytes may have been written). Poison the
+            // writer to prevent further use, which would duplicate bytes.
+            self.poisoned = true;
+            self.write_buffer.clear();
+            return Err(e.into());
+        }
         self.current_offset += self.write_buffer.len() as u64;
         self.write_buffer.clear();
         Ok(())
@@ -785,6 +808,11 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
 
     /// Append an entry, returning its assigned entry id.
     pub fn append(&mut self, entry: &E) -> PersistenceResult<u64> {
+        if self.poisoned {
+            return Err(PersistenceError::InvalidState(
+                "WAL writer is poisoned after a prior write error".into(),
+            ));
+        }
         let entry_id = self.current_entry_id;
         let _wal_path = self.ensure_segment_open(entry_id)?;
         let encoded = WalEntryOnDisk::encode(entry_id, entry)?;

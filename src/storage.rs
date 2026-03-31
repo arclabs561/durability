@@ -308,12 +308,21 @@ impl Directory for FsDirectory {
             std::fs::create_dir_all(parent)?;
         }
 
-        let mut temp_file = std::fs::File::create(&full_temp_path)?;
-        temp_file.write_all(data)?;
-        temp_file.sync_all()?;
+        if let Err(e) = (|| -> PersistenceResult<()> {
+            let mut temp_file = std::fs::File::create(&full_temp_path)?;
+            temp_file.write_all(data)?;
+            temp_file.sync_all()?;
+            Ok(())
+        })() {
+            let _ = std::fs::remove_file(&full_temp_path);
+            return Err(e);
+        }
 
         let full_path = self.resolve_path(path)?;
-        std::fs::rename(&full_temp_path, &full_path)?;
+        if let Err(e) = std::fs::rename(&full_temp_path, &full_path) {
+            let _ = std::fs::remove_file(&full_temp_path);
+            return Err(e.into());
+        }
 
         if let Some(parent) = full_path.parent() {
             let parent_file = std::fs::File::open(parent)?;
