@@ -92,7 +92,7 @@ If you need "survives power loss after success", add explicit barriers:
 - `WalWriter::flush_and_sync()` / `RecordLogWriter::flush_and_sync()`
 - `durability::storage::sync_file(dir, path)` -- fsync the file
 - `durability::storage::sync_parent_dir(dir, path)` -- sync the parent directory (needed for durable create/rename)
-- `DurableDirectory` trait provides `atomic_write_durable` / `atomic_rename_durable`
+- `Directory` trait provides `atomic_write_durable` / `atomic_rename_durable`
 
 If the backend cannot map paths to the OS filesystem (`Directory::file_path()` returns `None`), these operations return `NotSupported`.
 

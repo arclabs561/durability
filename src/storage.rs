@@ -98,33 +98,33 @@ pub trait Directory: Send + Sync {
     fn atomic_write(&self, path: &str, data: &[u8]) -> PersistenceResult<()>;
     /// Optional filesystem path for backends that support it.
     fn file_path(&self, path: &str) -> Option<PathBuf>;
-}
 
-/// Opt-in stable-storage durability operations for a `Directory`.
-///
-/// Why this exists:
-/// - `Directory` is intentionally minimal and backend-agnostic.
-/// - Stable-storage durability requires explicit barriers (`sync_all`/`fsync`) and (often)
-///   syncing parent directories for durable creates/renames.
-///
-/// Design:
-/// - This trait is intentionally *small* and *composable*.
-/// - Default implementations use [`sync_file`] / [`sync_parent_dir`], which require
-///   `Directory::file_path()`. For non-filesystem backends, these return `NotSupported`.
-pub trait DurableDirectory: Directory {
+    // -- Stable-storage durability helpers (default: delegate to free functions) --
+    //
+    // These require `file_path()` to return `Some`. Non-filesystem backends
+    // get `NotSupported` from the defaults, which is correct -- stable-storage
+    // durability is meaningless without a real filesystem.
+
     /// Attempt to make the file at `path` durable on stable storage.
-    fn sync_file(&self, path: &str) -> PersistenceResult<()> {
+    ///
+    /// Default: delegates to [`sync_file`].
+    /// Returns `NotSupported` if `file_path()` returns `None`.
+    fn durable_sync_file(&self, path: &str) -> PersistenceResult<()> {
         sync_file(self, path)
     }
 
     /// Attempt to make the *name* of `path` durable (sync the parent directory).
-    fn sync_parent_dir(&self, path: &str) -> PersistenceResult<()> {
+    ///
+    /// Default: delegates to [`sync_parent_dir`].
+    /// Returns `NotSupported` if `file_path()` returns `None`.
+    fn durable_sync_parent_dir(&self, path: &str) -> PersistenceResult<()> {
         sync_parent_dir(self, path)
     }
 
     /// Atomically rename and then sync the destination parent directory.
+    ///
+    /// Returns `NotSupported` if `file_path()` returns `None`.
     fn atomic_rename_durable(&self, from: &str, to: &str) -> PersistenceResult<()> {
-        // Fail fast on backends that can't provide stable-storage semantics.
         let from_path = match self.file_path(from) {
             Some(p) => p,
             None => {
@@ -143,28 +143,22 @@ pub trait DurableDirectory: Directory {
         };
 
         self.atomic_rename(from, to)?;
-        // Durable rename requires syncing the destination directory. If the rename crosses
-        // directory boundaries, also sync the source directory to persist removal of the old name.
         let from_parent = from_path.parent();
         let to_parent = to_path.parent();
         if from_parent != to_parent {
-            self.sync_parent_dir(from)?;
+            self.durable_sync_parent_dir(from)?;
         }
-        self.sync_parent_dir(to)?;
+        self.durable_sync_parent_dir(to)?;
         Ok(())
     }
 
     /// Atomically write bytes to `path` with explicit durability barriers.
     ///
-    /// Implementation strategy:
-    /// - write temp file
-    /// - `sync_file(temp)`
-    /// - atomic rename temp → final
-    /// - `sync_parent_dir(final)`
+    /// Stronger than [`Directory::atomic_write`]: writes temp, syncs temp,
+    /// renames, syncs parent directory.
     ///
-    /// This is a stronger, more explicit version of `Directory::atomic_write`.
+    /// Returns `NotSupported` if `file_path()` returns `None`.
     fn atomic_write_durable(&self, path: &str, data: &[u8]) -> PersistenceResult<()> {
-        // Fail fast on backends that can't provide stable-storage semantics.
         if self.file_path(path).is_none() {
             return Err(PersistenceError::NotSupported(
                 "atomic_write_durable requires Directory::file_path()".into(),
@@ -172,7 +166,6 @@ pub trait DurableDirectory: Directory {
         }
 
         let tmp = format!("{path}.tmp");
-        // Step 1: write temp
         if let Err(e) = (|| -> PersistenceResult<()> {
             let mut w = self.create_file(&tmp)?;
             w.write_all(data)?;
@@ -183,13 +176,11 @@ pub trait DurableDirectory: Directory {
             return Err(e);
         }
 
-        // Step 2: fsync temp
-        if let Err(e) = self.sync_file(&tmp) {
+        if let Err(e) = self.durable_sync_file(&tmp) {
             let _ = self.delete(&tmp);
             return Err(e);
         }
 
-        // Step 3: rename + dir barriers
         if let Err(e) = self.atomic_rename_durable(&tmp, path) {
             let _ = self.delete(&tmp);
             return Err(e);
@@ -198,8 +189,6 @@ pub trait DurableDirectory: Directory {
         Ok(())
     }
 }
-
-impl<T: Directory + ?Sized> DurableDirectory for T {}
 
 /// Filesystem-backed `Directory` rooted at a local path.
 pub struct FsDirectory {

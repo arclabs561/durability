@@ -42,7 +42,7 @@ pub mod storage;
 pub mod walog;
 
 pub use error::{PersistenceError, PersistenceResult};
-pub use storage::{Directory, DurableDirectory, FsDirectory, MemoryDirectory};
+pub use storage::{Directory, FsDirectory, MemoryDirectory};
 
 #[cfg(test)]
 mod tests {

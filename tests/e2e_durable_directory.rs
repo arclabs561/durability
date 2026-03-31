@@ -1,7 +1,6 @@
-//! End-to-end tests for `DurableDirectory` operations.
+//! End-to-end tests for durable `Directory` operations.
 
 use durability::storage::{Directory, FsDirectory, MemoryDirectory};
-use durability::DurableDirectory;
 use std::sync::Arc;
 
 #[test]
@@ -59,13 +58,9 @@ fn atomic_rename_durable_across_directories() {
 
 #[test]
 fn durable_ops_work_through_dyn_directory_when_fs_backed() {
-    // Ensure the trait stays usable even when a higher-level system holds `Arc<dyn Directory>`.
     let tmp = tempfile::tempdir().unwrap();
     let dir: Arc<dyn Directory> = Arc::new(FsDirectory::new(tmp.path()).unwrap());
 
-    // We can still call the free helpers via the `storage` module, and
-    // (if the caller knows it is fs-backed) they can use `DurableDirectory`
-    // by operating on a concrete fs directory. This test just ensures the
-    // free helper route works.
+    // Free helpers work through &dyn Directory.
     let _ = durability::storage::sync_parent_dir(&*dir, "wal/wal_1.log").err();
 }
