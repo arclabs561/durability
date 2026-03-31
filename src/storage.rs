@@ -79,9 +79,9 @@ pub enum FlushPolicy {
 /// Trait for directory-like storage backends.
 pub trait Directory: Send + Sync {
     /// Create a new file for writing (overwriting if it exists).
-    fn create_file(&self, path: &str) -> PersistenceResult<Box<dyn Write>>;
+    fn create_file(&self, path: &str) -> PersistenceResult<Box<dyn Write + Send>>;
     /// Open an existing file for reading.
-    fn open_file(&self, path: &str) -> PersistenceResult<Box<dyn Read>>;
+    fn open_file(&self, path: &str) -> PersistenceResult<Box<dyn Read + Send>>;
     /// Return whether a path exists.
     fn exists(&self, path: &str) -> bool;
     /// Delete a file or directory (directories recursively).
@@ -93,7 +93,7 @@ pub trait Directory: Send + Sync {
     /// List entries in a directory.
     fn list_dir(&self, path: &str) -> PersistenceResult<Vec<String>>;
     /// Open a file for appending (creating it if missing).
-    fn append_file(&self, path: &str) -> PersistenceResult<Box<dyn Write>>;
+    fn append_file(&self, path: &str) -> PersistenceResult<Box<dyn Write + Send>>;
     /// Atomically write bytes to a path.
     fn atomic_write(&self, path: &str, data: &[u8]) -> PersistenceResult<()>;
     /// Optional filesystem path for backends that support it.
@@ -229,7 +229,7 @@ impl FsDirectory {
 }
 
 impl Directory for FsDirectory {
-    fn create_file(&self, path: &str) -> PersistenceResult<Box<dyn Write>> {
+    fn create_file(&self, path: &str) -> PersistenceResult<Box<dyn Write + Send>> {
         let full_path = self.resolve_path(path)?;
         if let Some(parent) = full_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -237,7 +237,7 @@ impl Directory for FsDirectory {
         Ok(Box::new(std::fs::File::create(full_path)?))
     }
 
-    fn open_file(&self, path: &str) -> PersistenceResult<Box<dyn Read>> {
+    fn open_file(&self, path: &str) -> PersistenceResult<Box<dyn Read + Send>> {
         let full_path = self.resolve_path(path)?;
         if !full_path.exists() {
             return Err(PersistenceError::NotFound(full_path.display().to_string()));
@@ -289,7 +289,7 @@ impl Directory for FsDirectory {
         Ok(out)
     }
 
-    fn append_file(&self, path: &str) -> PersistenceResult<Box<dyn Write>> {
+    fn append_file(&self, path: &str) -> PersistenceResult<Box<dyn Write + Send>> {
         let full_path = self.resolve_path(path)?;
         if let Some(parent) = full_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -355,7 +355,7 @@ impl MemoryDirectory {
 }
 
 impl Directory for MemoryDirectory {
-    fn create_file(&self, path: &str) -> PersistenceResult<Box<dyn Write>> {
+    fn create_file(&self, path: &str) -> PersistenceResult<Box<dyn Write + Send>> {
         // Overwrite semantics: clear the file eagerly, then append in-place.
         self.files
             .write()
@@ -371,7 +371,7 @@ impl Directory for MemoryDirectory {
         }))
     }
 
-    fn open_file(&self, path: &str) -> PersistenceResult<Box<dyn Read>> {
+    fn open_file(&self, path: &str) -> PersistenceResult<Box<dyn Read + Send>> {
         let files = self
             .files
             .read()
@@ -456,7 +456,7 @@ impl Directory for MemoryDirectory {
         Ok(result.into_iter().collect())
     }
 
-    fn append_file(&self, path: &str) -> PersistenceResult<Box<dyn Write>> {
+    fn append_file(&self, path: &str) -> PersistenceResult<Box<dyn Write + Send>> {
         // Ensure the file exists, then append in-place.
         {
             let mut files = self

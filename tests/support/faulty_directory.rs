@@ -47,11 +47,11 @@ impl FaultyDirectory {
 }
 
 impl Directory for FaultyDirectory {
-    fn create_file(&self, path: &str) -> durability::PersistenceResult<Box<dyn io::Write>> {
+    fn create_file(&self, path: &str) -> durability::PersistenceResult<Box<dyn io::Write + Send>> {
         self.inner.create_file(path)
     }
 
-    fn open_file(&self, path: &str) -> durability::PersistenceResult<Box<dyn io::Read>> {
+    fn open_file(&self, path: &str) -> durability::PersistenceResult<Box<dyn io::Read + Send>> {
         self.inner.open_file(path)
     }
 
@@ -83,7 +83,7 @@ impl Directory for FaultyDirectory {
         self.inner.list_dir(path)
     }
 
-    fn append_file(&self, path: &str) -> durability::PersistenceResult<Box<dyn io::Write>> {
+    fn append_file(&self, path: &str) -> durability::PersistenceResult<Box<dyn io::Write + Send>> {
         let cfg = self.cfg.lock().unwrap();
         if cfg.fail_wal_append_file && Self::is_wal_path(path) {
             return Err(io::Error::other("injected append failure").into());
@@ -173,12 +173,12 @@ impl CountdownDirectory {
 }
 
 impl Directory for CountdownDirectory {
-    fn create_file(&self, path: &str) -> durability::PersistenceResult<Box<dyn io::Write>> {
+    fn create_file(&self, path: &str) -> durability::PersistenceResult<Box<dyn io::Write + Send>> {
         self.check_write()?;
         self.inner.create_file(path)
     }
 
-    fn open_file(&self, path: &str) -> durability::PersistenceResult<Box<dyn io::Read>> {
+    fn open_file(&self, path: &str) -> durability::PersistenceResult<Box<dyn io::Read + Send>> {
         self.inner.open_file(path)
     }
 
@@ -203,7 +203,7 @@ impl Directory for CountdownDirectory {
         self.inner.list_dir(path)
     }
 
-    fn append_file(&self, path: &str) -> durability::PersistenceResult<Box<dyn io::Write>> {
+    fn append_file(&self, path: &str) -> durability::PersistenceResult<Box<dyn io::Write + Send>> {
         self.check_write()?;
         self.inner.append_file(path)
     }

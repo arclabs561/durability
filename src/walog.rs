@@ -394,7 +394,7 @@ pub struct WalWriter<E> {
     segment_size_limit: u64,
     wal_dir_ready: bool,
     current_path: Option<String>,
-    current_file: Option<Box<dyn Write>>,
+    current_file: Option<Box<dyn Write + Send>>,
     flush_policy: FlushPolicy,
     since_flush: usize,
     write_buffer: Vec<u8>,
@@ -1146,6 +1146,16 @@ impl WalMaintenance {
         Ok(deleted)
     }
 }
+
+// Compile-time assertions: WalWriter and WalReader are Send when E: Send.
+#[allow(dead_code)]
+const _: () = {
+    fn assert_send<T: Send>() {}
+    fn check() {
+        assert_send::<WalWriter<String>>();
+        assert_send::<WalReader<String>>();
+    }
+};
 
 #[cfg(test)]
 mod tests {

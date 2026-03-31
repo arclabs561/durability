@@ -54,7 +54,7 @@ pub struct RecordLogWriter {
     dir: Arc<dyn Directory>,
     path: String,
     header_checked: bool,
-    w: Option<Box<dyn Write>>,
+    w: Option<Box<dyn Write + Send>>,
     flush_policy: FlushPolicy,
     since_flush: usize,
     write_buffer: Vec<u8>,
@@ -247,7 +247,7 @@ impl RecordLogReader {
         }
     }
 
-    pub(crate) fn open_stream(&self) -> PersistenceResult<Box<dyn Read>> {
+    pub(crate) fn open_stream(&self) -> PersistenceResult<Box<dyn Read + Send>> {
         let mut f = self.dir.open_file(&self.path)?;
 
         let mut magic = [0u8; 4];
