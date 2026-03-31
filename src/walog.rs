@@ -50,7 +50,7 @@ use std::sync::Arc;
 const MAX_WAL_ENTRY_PAYLOAD_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
 // ---------------------------------------------------------------------------
-// Domain-specific entry type (kept for backward compatibility with vicinity)
+// Domain-specific entry type (reference implementation for segment-index WALs)
 // ---------------------------------------------------------------------------
 
 /// Segment-index WAL operations.
@@ -887,6 +887,15 @@ fn scan_last_segment_prefix(
 
 impl<E> Drop for WalWriter<E> {
     fn drop(&mut self) {
+        // Warn in debug builds if the write buffer has unflushed data.
+        // This catches the common mistake of dropping without calling flush().
+        #[cfg(debug_assertions)]
+        if !self.write_buffer.is_empty() {
+            eprintln!(
+                "durability: WalWriter dropped with {} unflushed bytes in write buffer",
+                self.write_buffer.len()
+            );
+        }
         // Truncate preallocated segment to actual written size.
         if self.preallocate_bytes > 0 {
             if let Some(path) = self.current_path.as_deref() {

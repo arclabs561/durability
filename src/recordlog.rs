@@ -50,6 +50,11 @@ pub struct Record {
 }
 
 /// Append-only record log writer.
+///
+/// Single-writer assumption: unlike [`crate::walog::WalWriter`], this type does
+/// not use an advisory lockfile. Two writers on the same path will interleave
+/// writes and corrupt the log. Callers are responsible for ensuring at most one
+/// active writer per path.
 pub struct RecordLogWriter {
     dir: Arc<dyn Directory>,
     path: String,
