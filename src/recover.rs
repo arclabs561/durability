@@ -159,27 +159,20 @@ where
     let since = last_entry_id;
     let ceiling = options.up_to_entry_id;
 
-    // Use a sentinel error to break out of replay_each when past the ceiling.
-    // This avoids decoding entries we'll never apply.
-    let result = wal.replay_each_with_mode(options.wal_mode, |record| {
+    wal.replay_each_with_mode(options.wal_mode, |record| {
         if record.entry_id > since {
             if let Some(max) = ceiling {
                 if record.entry_id > max {
-                    return Err(crate::error::PersistenceError::InvalidState(
-                        "@@early_stop@@".into(),
-                    ));
+                    // Past ceiling: skip without applying. Entries are still
+                    // decoded (can't stop replay_each early) but not folded.
+                    return Ok(());
                 }
             }
             last_entry_id = record.entry_id;
             apply(&mut state, record.entry_id, record.payload);
         }
         Ok(())
-    });
-    match result {
-        Ok(_) => {}
-        Err(crate::error::PersistenceError::InvalidState(ref msg)) if msg == "@@early_stop@@" => {}
-        Err(e) => return Err(e),
-    }
+    })?;
 
     Ok(Recovery {
         state,

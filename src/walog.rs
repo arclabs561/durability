@@ -233,6 +233,13 @@ impl WalEntryOnDisk {
             return Ok(None);
         }
 
+        // Validate minimum frame size before the caller reads entry_id + checksum.
+        // Without this check, a corrupt length in [1, 15] would cause the caller to
+        // consume bytes past the declared frame boundary, desyncing the stream.
+        if len < 16 {
+            return Err(PersistenceError::Format("WAL entry length < header".into()));
+        }
+
         Ok(Some(len))
     }
 
@@ -294,11 +301,7 @@ impl WalEntryOnDisk {
             }
         };
 
-        // Frame overhead: 4 (len) + 8 (entry_id) + 4 (crc) = 16 bytes
-        if length < 16 {
-            return Err(PersistenceError::Format("WAL entry length < header".into()));
-        }
-
+        // length >= 16 is guaranteed by read_u32_len.
         let payload_len = length as usize - 16;
         if payload_len > MAX_WAL_ENTRY_PAYLOAD_BYTES {
             return Err(PersistenceError::Format(format!(
@@ -795,7 +798,12 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
             self.current_path = None;
             self.current_file = None;
             self.since_flush = 0;
-            let _ = self.ensure_segment_open(entry_id)?;
+            if let Err(e) = self.ensure_segment_open(entry_id) {
+                // Poison: segment_id was advanced but the new segment file could
+                // not be created. The writer state is inconsistent.
+                self.poisoned = true;
+                return Err(e);
+            }
         }
         Ok(())
     }
