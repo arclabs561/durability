@@ -14,6 +14,8 @@ readme = "README.md"
 keywords = ["persistence", "wal", "checkpoint", "write-ahead-log", "recovery"]
 categories = ["filesystem", "database-implementations"]
 
+[workspace]
+
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2"
