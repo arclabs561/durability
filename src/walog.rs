@@ -49,6 +49,22 @@ use std::sync::Arc;
 
 const MAX_WAL_ENTRY_PAYLOAD_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
+/// Observer for WAL writer lifecycle events.
+///
+/// All methods have default no-op implementations. Implement only the events
+/// you care about.
+///
+/// The observer is called synchronously on the write path, so implementations
+/// should be lightweight (e.g. increment an atomic counter, push to a channel).
+pub trait WalObserver: Send + Sync {
+    /// An entry was appended to the WAL.
+    fn on_append(&self, _entry_id: u64, _encoded_bytes: usize) {}
+    /// The write buffer was flushed to disk.
+    fn on_flush(&self, _bytes_flushed: usize) {}
+    /// A segment rotation occurred.
+    fn on_segment_rotate(&self, _old_segment_id: u64, _new_segment_id: u64) {}
+}
+
 // ---------------------------------------------------------------------------
 // Domain-specific entry type (reference implementation for segment-index WALs)
 // ---------------------------------------------------------------------------
@@ -426,6 +442,7 @@ pub struct WalWriter<E> {
     holds_lock: bool,
     preallocate_bytes: u64,
     poisoned: bool,
+    observer: Option<Arc<dyn WalObserver>>,
     _marker: PhantomData<E>,
 }
 
@@ -469,8 +486,14 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
             holds_lock: false,
             preallocate_bytes: 0,
             poisoned: false,
+            observer: None,
             _marker: PhantomData,
         }
+    }
+
+    /// Attach an observer that receives WAL lifecycle events.
+    pub fn set_observer(&mut self, observer: Arc<dyn WalObserver>) {
+        self.observer = Some(observer);
     }
 
     /// Set the target maximum size of a WAL segment file (in bytes).
@@ -545,9 +568,13 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
         // Write all entries.
         let mut ids = Vec::with_capacity(entries.len());
         for (entry_id, encoded) in encoded_pairs {
+            let encoded_len = encoded.len();
             let _wal_path = self.ensure_segment_open(entry_id)?;
-            self.rotate_if_needed(entry_id, encoded.len() as u64)?;
+            self.rotate_if_needed(entry_id, encoded_len as u64)?;
             self.buffer_encoded(&encoded)?;
+            if let Some(obs) = &self.observer {
+                obs.on_append(entry_id, encoded_len);
+            }
             self.current_entry_id = entry_id + 1;
             ids.push(entry_id);
         }
@@ -555,6 +582,20 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
         // Single flush for the entire batch.
         self.flush()?;
         Ok(ids)
+    }
+
+    /// Open a WAL directory, creating it if empty or resuming if it exists.
+    ///
+    /// This is the recommended entry point: it calls [`WalWriter::resume`] if
+    /// WAL segments already exist, or [`WalWriter::new`] if the directory is empty.
+    pub fn open(directory: impl Into<Arc<dyn Directory>>) -> PersistenceResult<Self> {
+        let directory: Arc<dyn Directory> = directory.into();
+        let segments = enumerate_wal_segments(&*directory)?;
+        if segments.is_empty() {
+            Ok(Self::new(directory))
+        } else {
+            Self::resume(directory)
+        }
     }
 
     /// Resume appending to an existing WAL (if present).
@@ -728,6 +769,7 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
         if self.write_buffer.is_empty() {
             return Ok(());
         }
+        let flushed_bytes = self.write_buffer.len();
         let f = self
             .current_file
             .as_mut()
@@ -740,8 +782,11 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
             self.write_buffer.clear();
             return Err(e.into());
         }
-        self.current_offset += self.write_buffer.len() as u64;
+        self.current_offset += flushed_bytes as u64;
         self.write_buffer.clear();
+        if let Some(obs) = &self.observer {
+            obs.on_flush(flushed_bytes);
+        }
         Ok(())
     }
 
@@ -793,11 +838,15 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
         {
             self.flush()?;
             self.truncate_current_segment();
+            let old_segment_id = self.current_segment_id;
             self.current_segment_id += 1;
             self.current_offset = 0;
             self.current_path = None;
             self.current_file = None;
             self.since_flush = 0;
+            if let Some(obs) = &self.observer {
+                obs.on_segment_rotate(old_segment_id, self.current_segment_id);
+            }
             if let Err(e) = self.ensure_segment_open(entry_id) {
                 // Poison: segment_id was advanced but the new segment file could
                 // not be created. The writer state is inconsistent.
@@ -845,10 +894,15 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
         let entry_id = self.current_entry_id;
         let _wal_path = self.ensure_segment_open(entry_id)?;
         let encoded = WalEntryOnDisk::encode(entry_id, entry)?;
+        let encoded_len = encoded.len();
 
-        self.rotate_if_needed(entry_id, encoded.len() as u64)?;
+        self.rotate_if_needed(entry_id, encoded_len as u64)?;
         self.buffer_encoded(&encoded)?;
         self.apply_flush_policy()?;
+
+        if let Some(obs) = &self.observer {
+            obs.on_append(entry_id, encoded_len);
+        }
 
         self.current_entry_id += 1;
         Ok(entry_id)
@@ -1760,6 +1814,144 @@ mod tests {
 
         // After writing, segment bytes should be > header size
         assert!(w.current_segment_bytes() > WalSegmentHeader::SIZE as u64);
+    }
+
+    #[test]
+    fn wal_observer_receives_events() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct TestObserver {
+            appends: AtomicUsize,
+            bytes_appended: AtomicUsize,
+            flushes: AtomicUsize,
+            bytes_flushed: AtomicUsize,
+            rotations: AtomicUsize,
+        }
+
+        impl TestObserver {
+            fn new() -> Self {
+                Self {
+                    appends: AtomicUsize::new(0),
+                    bytes_appended: AtomicUsize::new(0),
+                    flushes: AtomicUsize::new(0),
+                    bytes_flushed: AtomicUsize::new(0),
+                    rotations: AtomicUsize::new(0),
+                }
+            }
+        }
+
+        impl super::WalObserver for TestObserver {
+            fn on_append(&self, _entry_id: u64, encoded_bytes: usize) {
+                self.appends.fetch_add(1, Ordering::Relaxed);
+                self.bytes_appended
+                    .fetch_add(encoded_bytes, Ordering::Relaxed);
+            }
+            fn on_flush(&self, bytes_flushed: usize) {
+                self.flushes.fetch_add(1, Ordering::Relaxed);
+                self.bytes_flushed
+                    .fetch_add(bytes_flushed, Ordering::Relaxed);
+            }
+            fn on_segment_rotate(&self, _old: u64, _new: u64) {
+                self.rotations.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let obs = Arc::new(TestObserver::new());
+        let mut w = WalWriter::<WalEntry>::with_flush_policy(
+            dir.clone(),
+            crate::storage::FlushPolicy::Manual,
+        );
+        w.set_observer(obs.clone() as Arc<dyn super::WalObserver>);
+
+        w.append(&WalEntry::AddSegment {
+            segment_id: 1,
+            doc_count: 1,
+        })
+        .unwrap();
+        w.append(&WalEntry::AddSegment {
+            segment_id: 2,
+            doc_count: 2,
+        })
+        .unwrap();
+        w.flush().unwrap();
+
+        assert_eq!(obs.appends.load(Ordering::Relaxed), 2);
+        assert!(obs.bytes_appended.load(Ordering::Relaxed) > 0);
+        assert!(obs.flushes.load(Ordering::Relaxed) >= 1);
+        assert!(obs.bytes_flushed.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn wal_observer_rotation_event() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct RotationCounter(AtomicUsize);
+        impl super::WalObserver for RotationCounter {
+            fn on_segment_rotate(&self, _old: u64, _new: u64) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let obs = Arc::new(RotationCounter(AtomicUsize::new(0)));
+
+        let mut w = WalWriter::<WalEntry>::with_options(
+            dir.clone(),
+            crate::storage::FlushPolicy::PerAppend,
+            0,
+        );
+        w.set_segment_size_limit_bytes(100); // very small, forces rotation
+        w.set_observer(obs.clone() as Arc<dyn super::WalObserver>);
+
+        for i in 0..10u64 {
+            w.append(&WalEntry::AddSegment {
+                segment_id: i + 1,
+                doc_count: i as u32,
+            })
+            .unwrap();
+        }
+        w.flush().unwrap();
+
+        assert!(
+            obs.0.load(Ordering::Relaxed) >= 1,
+            "expected at least one rotation"
+        );
+    }
+
+    #[test]
+    fn wal_open_creates_fresh_then_resumes() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+
+        // First open: creates fresh WAL.
+        let mut w = WalWriter::<WalEntry>::open(dir.clone()).unwrap();
+        let id1 = w
+            .append(&WalEntry::AddSegment {
+                segment_id: 1,
+                doc_count: 3,
+            })
+            .unwrap();
+        assert_eq!(id1, 1);
+        w.flush().unwrap();
+        drop(w);
+
+        // Second open: resumes from existing WAL.
+        let mut w = WalWriter::<WalEntry>::open(dir.clone()).unwrap();
+        let id2 = w
+            .append(&WalEntry::AddSegment {
+                segment_id: 2,
+                doc_count: 7,
+            })
+            .unwrap();
+        assert_eq!(id2, 2);
+        w.flush().unwrap();
+        drop(w);
+
+        let r = WalReader::<WalEntry>::new(dir);
+        let records = r.replay().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].entry_id, 1);
+        assert_eq!(records[1].entry_id, 2);
     }
 
     #[test]

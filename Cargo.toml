@@ -23,8 +23,11 @@ thiserror = "2"
 crc32fast = "1.4"
 postcard = { version = "1.0", features = ["alloc", "use-std"] }
 
+tokio = { version = "1", features = ["rt", "fs"], optional = true }
+
 [features]
 default = []
+async = ["dep:tokio"]
 
 [dev-dependencies]
 tempfile = "3.24.0"

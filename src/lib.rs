@@ -42,6 +42,9 @@ pub mod recover;
 pub mod storage;
 pub mod walog;
 
+#[cfg(feature = "async")]
+pub mod async_dir;
+
 pub use error::{PersistenceError, PersistenceResult};
 pub use storage::{Directory, FsDirectory, MemoryDirectory};
 
