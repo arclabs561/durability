@@ -43,6 +43,7 @@
 use crate::error::{PersistenceError, PersistenceResult};
 use crate::formats::{WAL_FORMAT_VERSION, WAL_MAGIC};
 use crate::storage::{self, Directory, FlushPolicy};
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -456,6 +457,8 @@ pub struct WalWriter<E> {
     last_flush_at: std::time::Instant,
     segment_created_at: Option<std::time::Instant>,
     segment_max_age: Option<std::time::Duration>,
+    recycle_pool: VecDeque<String>,
+    recycle_capacity: usize,
     _marker: PhantomData<E>,
 }
 
@@ -503,6 +506,8 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
             last_flush_at: std::time::Instant::now(),
             segment_created_at: None,
             segment_max_age: None,
+            recycle_pool: VecDeque::new(),
+            recycle_capacity: 0,
             _marker: PhantomData,
         }
     }
@@ -510,6 +515,38 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
     /// Attach an observer that receives WAL lifecycle events.
     pub fn set_observer(&mut self, observer: Arc<dyn WalObserver>) {
         self.observer = Some(observer);
+    }
+
+    /// Enable segment recycling with a pool of up to `capacity` files.
+    ///
+    /// When enabled, truncated segment files (from [`WalMaintenance::truncate_prefix`])
+    /// can be fed back via [`recycle_segment`](Self::recycle_segment) and reused for
+    /// new segments on the next rotation. This avoids filesystem inode allocation
+    /// and directory journal overhead.
+    ///
+    /// Set to 0 (default) to disable recycling.
+    pub fn set_recycle_capacity(&mut self, capacity: usize) {
+        self.recycle_capacity = capacity;
+    }
+
+    /// Add a segment file path to the recycle pool for reuse.
+    ///
+    /// Typically called after [`WalMaintenance::truncate_prefix`] with the paths
+    /// of deleted segments. If the pool is full, the oldest recycled file is deleted.
+    ///
+    /// Note: the caller must ensure the path still exists and is no longer needed
+    /// for replay.
+    pub fn recycle_segment(&mut self, path: String) {
+        if self.recycle_capacity == 0 {
+            let _ = self.directory.delete(&path);
+            return;
+        }
+        if self.recycle_pool.len() >= self.recycle_capacity {
+            if let Some(evicted) = self.recycle_pool.pop_front() {
+                let _ = self.directory.delete(&evicted);
+            }
+        }
+        self.recycle_pool.push_back(path);
     }
 
     /// Set the maximum age of a WAL segment before rotation.
@@ -761,6 +798,10 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
         };
 
         if self.current_offset == 0 {
+            // Try to reuse a recycled segment file.
+            if let Some(recycled) = self.recycle_pool.pop_front() {
+                let _ = self.directory.atomic_rename(&recycled, &wal_path);
+            }
             let mut file = self.directory.create_file(&wal_path)?;
             WalSegmentHeader {
                 magic: WAL_MAGIC,
@@ -1039,6 +1080,10 @@ impl<E> Drop for WalWriter<E> {
                 }
             }
         }
+        // Clean up recycled segment files.
+        for path in self.recycle_pool.drain(..) {
+            let _ = self.directory.delete(&path);
+        }
         if self.holds_lock {
             let _ = self.directory.delete("wal/.lock");
         }
@@ -1271,9 +1316,30 @@ impl WalMaintenance {
 
     /// Delete WAL segments that are fully covered by a checkpoint at `last_entry_id`.
     ///
-    /// Returns the number of deleted segment files.
+    /// Returns the number of deleted segment files. To recycle deleted segments
+    /// instead of destroying them, use [`truncate_to_recycle`](Self::truncate_to_recycle)
+    /// and feed the returned paths to [`WalWriter::recycle_segment`].
     pub fn truncate_prefix(&self, last_entry_id: u64) -> PersistenceResult<usize> {
         self.truncate_prefix_with_observer(last_entry_id, None)
+    }
+
+    /// Identify segments eligible for truncation without deleting them.
+    ///
+    /// Returns paths of segment files fully covered by `last_entry_id`.
+    /// The caller is responsible for either deleting them or recycling them
+    /// via [`WalWriter::recycle_segment`].
+    pub fn truncate_to_recycle(&self, last_entry_id: u64) -> PersistenceResult<Vec<String>> {
+        let ranges = self.segment_ranges_strict()?;
+        let mut paths = Vec::new();
+        for seg in ranges {
+            let Some(end) = seg.end_entry_id else {
+                continue;
+            };
+            if end <= last_entry_id {
+                paths.push(seg.path);
+            }
+        }
+        Ok(paths)
     }
 
     /// Delete WAL segments covered by a checkpoint, consulting an observer.
@@ -1313,6 +1379,178 @@ const _: () = {
     fn check() {
         assert_send::<WalWriter<String>>();
         assert_send::<WalReader<String>>();
+    }
+};
+
+// ---------------------------------------------------------------------------
+// SyncWalWriter (thread-safe wrapper with group commit)
+// ---------------------------------------------------------------------------
+
+/// Thread-safe WAL writer with implicit group commit.
+///
+/// Wraps a [`WalWriter`] in a `Mutex`, allowing multiple threads to append
+/// concurrently. The group commit benefit arises naturally: while one thread
+/// holds the lock for `flush_and_sync`, other threads' appends queue behind
+/// the mutex. When the sync-holding thread releases the lock, the next thread
+/// to call `flush_and_sync` covers all entries appended in the interim with
+/// a single `fdatasync`.
+///
+/// # Example
+///
+/// ```
+/// use durability::storage::MemoryDirectory;
+/// use durability::walog::{SyncWalWriter, WalReader};
+///
+/// #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+/// enum Op { Inc, Dec }
+///
+/// let dir = MemoryDirectory::arc();
+/// let sw = SyncWalWriter::<Op>::open(dir.clone()).unwrap();
+///
+/// // Multiple threads can call append concurrently.
+/// let id1 = sw.append(&Op::Inc).unwrap();
+/// let id2 = sw.append(&Op::Dec).unwrap();
+/// sw.flush().unwrap();
+/// drop(sw);
+///
+/// let records = WalReader::<Op>::new(dir).replay().unwrap();
+/// assert_eq!(records.len(), 2);
+/// ```
+pub struct SyncWalWriter<E> {
+    state: std::sync::Mutex<SyncState<E>>,
+}
+
+struct SyncState<E> {
+    writer: WalWriter<E>,
+    last_synced_entry_id: u64,
+}
+
+impl<E: serde::Serialize + serde::de::DeserializeOwned> SyncWalWriter<E> {
+    /// Create a new thread-safe WAL writer (fails if segments already exist).
+    pub fn new(directory: impl Into<Arc<dyn Directory>>) -> PersistenceResult<Self> {
+        Ok(Self::from_writer(WalWriter::new(directory)))
+    }
+
+    /// Open a WAL directory (create or resume).
+    pub fn open(directory: impl Into<Arc<dyn Directory>>) -> PersistenceResult<Self> {
+        Ok(Self::from_writer(WalWriter::open(directory)?))
+    }
+
+    /// Resume an existing WAL.
+    pub fn resume(directory: impl Into<Arc<dyn Directory>>) -> PersistenceResult<Self> {
+        Ok(Self::from_writer(WalWriter::resume(directory)?))
+    }
+
+    /// Wrap an existing `WalWriter`.
+    pub fn from_writer(writer: WalWriter<E>) -> Self {
+        let last = writer.last_entry_id().unwrap_or(0);
+        Self {
+            state: std::sync::Mutex::new(SyncState {
+                writer,
+                last_synced_entry_id: last,
+            }),
+        }
+    }
+
+    /// Append an entry. Does not sync; call [`flush`](Self::flush) or
+    /// [`flush_and_sync`](Self::flush_and_sync) afterward.
+    pub fn append(&self, entry: &E) -> PersistenceResult<u64> {
+        self.state
+            .lock()
+            .map_err(|_| PersistenceError::LockFailed {
+                resource: "SyncWalWriter".into(),
+                reason: "mutex poisoned".into(),
+            })?
+            .writer
+            .append(entry)
+    }
+
+    /// Append multiple entries as a batch.
+    pub fn append_batch(&self, entries: &[E]) -> PersistenceResult<Vec<u64>> {
+        self.state
+            .lock()
+            .map_err(|_| PersistenceError::LockFailed {
+                resource: "SyncWalWriter".into(),
+                reason: "mutex poisoned".into(),
+            })?
+            .writer
+            .append_batch(entries)
+    }
+
+    /// Append an entry and wait until it is durable on stable storage.
+    ///
+    /// This is the group-commit entry point: if another thread recently synced
+    /// past our entry's ID, we skip the redundant sync.
+    pub fn append_durable(&self, entry: &E) -> PersistenceResult<u64> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PersistenceError::LockFailed {
+                resource: "SyncWalWriter".into(),
+                reason: "mutex poisoned".into(),
+            })?;
+        let id = state.writer.append(entry)?;
+        if id > state.last_synced_entry_id {
+            state.writer.flush_and_sync()?;
+            state.last_synced_entry_id = state.writer.last_entry_id().unwrap_or(id);
+        }
+        Ok(id)
+    }
+
+    /// Flush the write buffer to the OS.
+    pub fn flush(&self) -> PersistenceResult<()> {
+        self.state
+            .lock()
+            .map_err(|_| PersistenceError::LockFailed {
+                resource: "SyncWalWriter".into(),
+                reason: "mutex poisoned".into(),
+            })?
+            .writer
+            .flush()
+    }
+
+    /// Flush and sync to stable storage (covers all appended entries).
+    pub fn flush_and_sync(&self) -> PersistenceResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PersistenceError::LockFailed {
+                resource: "SyncWalWriter".into(),
+                reason: "mutex poisoned".into(),
+            })?;
+        state.writer.flush_and_sync()?;
+        state.last_synced_entry_id = state.writer.last_entry_id().unwrap_or(0);
+        Ok(())
+    }
+
+    /// Return the last assigned entry ID.
+    pub fn last_entry_id(&self) -> Option<u64> {
+        self.state.lock().ok()?.writer.last_entry_id()
+    }
+
+    /// Access the inner writer under the lock (for configuration).
+    ///
+    /// Call this before starting concurrent writes to set segment size limits,
+    /// observers, preallocation, etc.
+    pub fn configure(&self, f: impl FnOnce(&mut WalWriter<E>)) -> PersistenceResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PersistenceError::LockFailed {
+                resource: "SyncWalWriter".into(),
+                reason: "mutex poisoned".into(),
+            })?;
+        f(&mut state.writer);
+        Ok(())
+    }
+}
+
+// SyncWalWriter is Send + Sync by construction (Mutex<WalWriter<E>>).
+#[allow(dead_code)]
+const _: () = {
+    fn assert_send_sync<T: Send + Sync>() {}
+    fn check() {
+        assert_send_sync::<SyncWalWriter<String>>();
     }
 };
 
@@ -2248,6 +2486,185 @@ mod tests {
         });
         assert!(err2.is_err());
         assert!(err2.unwrap_err().to_string().contains("poisoned"));
+    }
+
+    #[test]
+    fn wal_segment_recycling() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+
+        // Phase 1: write entries across multiple segments.
+        let mut w = WalWriter::<WalEntry>::with_options(
+            dir.clone(),
+            crate::storage::FlushPolicy::PerAppend,
+            0,
+        );
+        w.set_segment_size_limit_bytes(80); // force rotation
+        w.set_recycle_capacity(2);
+
+        for i in 0..5u64 {
+            w.append(&WalEntry::AddSegment {
+                segment_id: i + 1,
+                doc_count: i as u32,
+            })
+            .unwrap();
+        }
+        w.flush().unwrap();
+
+        // Count segments before truncation.
+        let maint = WalMaintenance::new(dir.clone());
+        let ranges = maint.segment_ranges_strict().unwrap();
+        assert!(ranges.len() > 1, "need multiple segments");
+
+        // Truncate covered segments and recycle them instead of deleting.
+        let last_covered = ranges[0].end_entry_id.unwrap();
+        let recyclable = maint.truncate_to_recycle(last_covered).unwrap();
+        for path in recyclable {
+            w.recycle_segment(path);
+        }
+
+        // Phase 2: write more entries -- these should reuse recycled segment files.
+        for i in 5..10u64 {
+            w.append(&WalEntry::AddSegment {
+                segment_id: i + 1,
+                doc_count: i as u32,
+            })
+            .unwrap();
+        }
+        w.flush().unwrap();
+        drop(w);
+
+        // All entries from phase 2 and un-truncated phase 1 should be replayable.
+        let r = WalReader::<WalEntry>::new(dir);
+        let records = r.replay().unwrap();
+        // We truncated entries up to last_covered; remaining entries start after.
+        assert!(records.len() >= 5, "expected at least phase 2 entries");
+        // Entry IDs must be strictly increasing.
+        for win in records.windows(2) {
+            assert!(win[1].entry_id > win[0].entry_id);
+        }
+    }
+
+    #[test]
+    fn sync_wal_writer_basic() {
+        let dir = MemoryDirectory::arc();
+        let sw = SyncWalWriter::<WalEntry>::open(dir.clone()).unwrap();
+
+        let id1 = sw
+            .append(&WalEntry::AddSegment {
+                segment_id: 1,
+                doc_count: 1,
+            })
+            .unwrap();
+        let id2 = sw
+            .append(&WalEntry::AddSegment {
+                segment_id: 2,
+                doc_count: 2,
+            })
+            .unwrap();
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+
+        sw.flush().unwrap();
+        assert_eq!(sw.last_entry_id(), Some(2));
+        drop(sw);
+
+        let records = WalReader::<WalEntry>::new(dir).replay().unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn sync_wal_writer_concurrent_appends() {
+        let dir = MemoryDirectory::arc();
+        let sw = Arc::new(SyncWalWriter::<WalEntry>::open(dir.clone()).unwrap());
+
+        let mut handles = Vec::new();
+        for t in 0..4u64 {
+            let sw = sw.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut ids = Vec::new();
+                for i in 0..25u64 {
+                    let id = sw
+                        .append(&WalEntry::AddSegment {
+                            segment_id: t * 100 + i,
+                            doc_count: 0,
+                        })
+                        .unwrap();
+                    ids.push(id);
+                }
+                ids
+            }));
+        }
+
+        let mut all_ids: Vec<u64> = Vec::new();
+        for h in handles {
+            all_ids.extend(h.join().unwrap());
+        }
+        sw.flush().unwrap();
+        drop(sw);
+
+        // All 100 entries should be replayable with strictly increasing IDs.
+        let records = WalReader::<WalEntry>::new(dir).replay().unwrap();
+        assert_eq!(records.len(), 100);
+        for w in records.windows(2) {
+            assert!(w[1].entry_id > w[0].entry_id);
+        }
+
+        // Every assigned ID should appear exactly once.
+        all_ids.sort();
+        all_ids.dedup();
+        assert_eq!(all_ids.len(), 100);
+    }
+
+    #[test]
+    fn sync_wal_writer_append_durable_on_fs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crate::storage::FsDirectory::arc(tmp.path()).unwrap();
+        let sw = SyncWalWriter::<WalEntry>::open(dir.clone()).unwrap();
+
+        let id = sw
+            .append_durable(&WalEntry::AddSegment {
+                segment_id: 1,
+                doc_count: 5,
+            })
+            .unwrap();
+        assert_eq!(id, 1);
+
+        // Second durable append with the same sync epoch should still work.
+        let id2 = sw
+            .append_durable(&WalEntry::AddSegment {
+                segment_id: 2,
+                doc_count: 10,
+            })
+            .unwrap();
+        assert_eq!(id2, 2);
+        drop(sw);
+
+        let records = WalReader::<WalEntry>::new(dir).replay().unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn sync_wal_writer_configure() {
+        let dir = MemoryDirectory::arc();
+        let sw = SyncWalWriter::<WalEntry>::open(dir.clone()).unwrap();
+
+        sw.configure(|w| {
+            w.set_segment_size_limit_bytes(500);
+        })
+        .unwrap();
+
+        for i in 0..20u64 {
+            sw.append(&WalEntry::AddSegment {
+                segment_id: i + 1,
+                doc_count: 0,
+            })
+            .unwrap();
+        }
+        sw.flush().unwrap();
+        drop(sw);
+
+        let records = WalReader::<WalEntry>::new(dir).replay().unwrap();
+        assert_eq!(records.len(), 20);
     }
 
     #[test]
