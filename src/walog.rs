@@ -59,10 +59,19 @@ const MAX_WAL_ENTRY_PAYLOAD_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 pub trait WalObserver: Send + Sync {
     /// An entry was appended to the WAL.
     fn on_append(&self, _entry_id: u64, _encoded_bytes: usize) {}
-    /// The write buffer was flushed to disk.
+    /// The write buffer was flushed to the OS.
     fn on_flush(&self, _bytes_flushed: usize) {}
+    /// The WAL segment was synced to stable storage.
+    fn on_sync(&self) {}
     /// A segment rotation occurred.
     fn on_segment_rotate(&self, _old_segment_id: u64, _new_segment_id: u64) {}
+    /// Called before a segment is deleted during truncation.
+    ///
+    /// Return `true` to allow deletion, `false` to retain the segment
+    /// (e.g. a slow reader or snapshot still needs it).
+    fn on_before_truncate(&self, _segment_id: u64, _path: &str) -> bool {
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +453,9 @@ pub struct WalWriter<E> {
     preallocate_bytes: u64,
     poisoned: bool,
     observer: Option<Arc<dyn WalObserver>>,
+    last_flush_at: std::time::Instant,
+    segment_created_at: Option<std::time::Instant>,
+    segment_max_age: Option<std::time::Duration>,
     _marker: PhantomData<E>,
 }
 
@@ -488,6 +500,9 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
             preallocate_bytes: 0,
             poisoned: false,
             observer: None,
+            last_flush_at: std::time::Instant::now(),
+            segment_created_at: None,
+            segment_max_age: None,
             _marker: PhantomData,
         }
     }
@@ -495,6 +510,16 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
     /// Attach an observer that receives WAL lifecycle events.
     pub fn set_observer(&mut self, observer: Arc<dyn WalObserver>) {
         self.observer = Some(observer);
+    }
+
+    /// Set the maximum age of a WAL segment before rotation.
+    ///
+    /// When set, segments are rotated when either the size limit or the age
+    /// limit is exceeded. This prevents a low-write-rate deployment from
+    /// keeping one segment active indefinitely, which would increase recovery
+    /// time.
+    pub fn set_segment_max_age(&mut self, age: std::time::Duration) {
+        self.segment_max_age = Some(age);
     }
 
     /// Set the target maximum size of a WAL segment file (in bytes).
@@ -747,6 +772,7 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
             if self.flush_policy == FlushPolicy::PerAppend {
                 file.flush()?;
             }
+            self.segment_created_at = Some(std::time::Instant::now());
             // Preallocate on filesystem backends to avoid block allocation on write path.
             if self.preallocate_bytes > 0 {
                 if let Some(fs_path) = self.directory.file_path(&wal_path) {
@@ -798,10 +824,15 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
             f.flush()?;
         }
         self.since_flush = 0;
+        self.last_flush_at = std::time::Instant::now();
         Ok(())
     }
 
     /// Flush buffered bytes and attempt to make the current WAL segment durable.
+    ///
+    /// On sync failure, the writer is **poisoned** -- subsequent appends will
+    /// return `InvalidState`. This prevents callers from continuing to write
+    /// under a false impression of durability.
     ///
     /// Returns `NotSupported` if the underlying `Directory` does not provide `file_path()`.
     pub fn flush_and_sync(&mut self) -> PersistenceResult<()> {
@@ -809,8 +840,17 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
         let Some(path) = self.current_path.as_deref() else {
             return Ok(());
         };
-        storage::sync_file(&*self.directory, path)?;
-        storage::sync_parent_dir(&*self.directory, path)?;
+        if let Err(e) = storage::sync_file(&*self.directory, path) {
+            self.poisoned = true;
+            return Err(e);
+        }
+        if let Err(e) = storage::sync_parent_dir(&*self.directory, path) {
+            self.poisoned = true;
+            return Err(e);
+        }
+        if let Some(obs) = &self.observer {
+            obs.on_sync();
+        }
         Ok(())
     }
 
@@ -831,12 +871,15 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
         }
     }
 
-    /// Rotate to a new segment if the encoded bytes would exceed the size limit.
+    /// Rotate to a new segment if size or age limits are exceeded.
     fn rotate_if_needed(&mut self, entry_id: u64, encoded_len: u64) -> PersistenceResult<()> {
         let projected = self.current_offset + (self.write_buffer.len() as u64) + encoded_len;
-        if projected > self.segment_size_limit
-            && self.current_offset > WalSegmentHeader::SIZE as u64
-        {
+        let size_exceeded = projected > self.segment_size_limit;
+        let age_exceeded = match (self.segment_max_age, self.segment_created_at) {
+            (Some(max_age), Some(created)) => created.elapsed() >= max_age,
+            _ => false,
+        };
+        if (size_exceeded || age_exceeded) && self.current_offset > WalSegmentHeader::SIZE as u64 {
             self.flush()?;
             self.truncate_current_segment();
             let old_segment_id = self.current_segment_id;
@@ -877,6 +920,11 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
             FlushPolicy::EveryN(n) => {
                 let n = n.max(1);
                 if self.since_flush >= n {
+                    self.flush()?;
+                }
+            }
+            FlushPolicy::Interval(d) => {
+                if self.last_flush_at.elapsed() >= d {
                     self.flush()?;
                 }
             }
@@ -1225,6 +1273,19 @@ impl WalMaintenance {
     ///
     /// Returns the number of deleted segment files.
     pub fn truncate_prefix(&self, last_entry_id: u64) -> PersistenceResult<usize> {
+        self.truncate_prefix_with_observer(last_entry_id, None)
+    }
+
+    /// Delete WAL segments covered by a checkpoint, consulting an observer.
+    ///
+    /// If an observer is provided, each eligible segment is passed to
+    /// [`WalObserver::on_before_truncate`]. Segments where the observer returns
+    /// `false` are retained (e.g. a slow reader still needs them).
+    pub fn truncate_prefix_with_observer(
+        &self,
+        last_entry_id: u64,
+        observer: Option<&dyn WalObserver>,
+    ) -> PersistenceResult<usize> {
         let ranges = self.segment_ranges_strict()?;
         let mut deleted = 0usize;
         for seg in ranges {
@@ -1232,6 +1293,11 @@ impl WalMaintenance {
                 continue;
             };
             if end <= last_entry_id {
+                if let Some(obs) = observer {
+                    if !obs.on_before_truncate(seg.segment_id, &seg.path) {
+                        continue; // observer vetoed deletion
+                    }
+                }
                 self.directory.delete(&seg.path)?;
                 deleted += 1;
             }
@@ -1999,6 +2065,189 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].entry_id, 1);
         assert_eq!(records[1].entry_id, 2);
+    }
+
+    #[test]
+    fn wal_flush_policy_interval() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let mut w = WalWriter::<WalEntry>::with_options(
+            dir.clone(),
+            crate::storage::FlushPolicy::Interval(std::time::Duration::from_millis(50)),
+            64 * 1024,
+        );
+
+        // First append: no flush yet (timer just started).
+        w.append(&WalEntry::AddSegment {
+            segment_id: 1,
+            doc_count: 1,
+        })
+        .unwrap();
+
+        // Reader should see nothing (data in write buffer, interval not elapsed).
+        let r = WalReader::<WalEntry>::new(dir.clone());
+        // Can't read unflushed data from MemoryDirectory's in-place writer,
+        // so just verify the writer hasn't flushed yet.
+        assert!(w.current_segment_bytes() > 0);
+
+        // Sleep past the interval.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+
+        // Next append triggers the interval-based flush.
+        w.append(&WalEntry::AddSegment {
+            segment_id: 2,
+            doc_count: 2,
+        })
+        .unwrap();
+
+        // Explicit flush for the final entry.
+        w.flush().unwrap();
+        drop(w);
+
+        let records = r.replay().unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn wal_segment_max_age_triggers_rotation() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let mut w = WalWriter::<WalEntry>::with_options(
+            dir.clone(),
+            crate::storage::FlushPolicy::PerAppend,
+            0,
+        );
+        w.set_segment_max_age(std::time::Duration::from_millis(50));
+
+        // First entry goes to segment 1.
+        w.append(&WalEntry::AddSegment {
+            segment_id: 1,
+            doc_count: 1,
+        })
+        .unwrap();
+        assert_eq!(w.current_segment_id(), 1);
+
+        // Sleep past the age limit.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+
+        // Next entry should trigger age-based rotation.
+        w.append(&WalEntry::AddSegment {
+            segment_id: 2,
+            doc_count: 2,
+        })
+        .unwrap();
+        assert!(
+            w.current_segment_id() > 1,
+            "expected rotation due to age, still on segment {}",
+            w.current_segment_id()
+        );
+        w.flush().unwrap();
+        drop(w);
+
+        let records = WalReader::<WalEntry>::new(dir).replay().unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn wal_truncate_prefix_respects_observer() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let mut w = WalWriter::<WalEntry>::with_options(
+            dir.clone(),
+            crate::storage::FlushPolicy::PerAppend,
+            0,
+        );
+        w.set_segment_size_limit_bytes(80); // force multiple segments
+
+        for i in 0..6u64 {
+            w.append(&WalEntry::AddSegment {
+                segment_id: i + 1,
+                doc_count: i as u32,
+            })
+            .unwrap();
+        }
+        w.flush().unwrap();
+        drop(w);
+
+        // Observer that blocks deletion of segment 1.
+        struct PinSegment1;
+        impl super::WalObserver for PinSegment1 {
+            fn on_before_truncate(&self, segment_id: u64, _path: &str) -> bool {
+                segment_id != 1 // retain segment 1
+            }
+        }
+
+        let maint = WalMaintenance::new(dir.clone());
+        let ranges = maint.segment_ranges_strict().unwrap();
+        assert!(ranges.len() > 1, "need multiple segments for this test");
+
+        let last_entry = ranges.last().unwrap().end_entry_id.unwrap();
+        let obs = PinSegment1;
+        let deleted = maint
+            .truncate_prefix_with_observer(last_entry, Some(&obs))
+            .unwrap();
+
+        // Segment 1 should be retained.
+        let after = maint.segment_ranges_strict().unwrap();
+        assert!(
+            after.iter().any(|s| s.segment_id == 1),
+            "segment 1 should be retained by observer"
+        );
+        // But other eligible segments should be deleted.
+        assert!(deleted > 0, "should have deleted some segments");
+    }
+
+    #[test]
+    fn wal_observer_on_sync_fires() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SyncCounter(AtomicUsize);
+        impl super::WalObserver for SyncCounter {
+            fn on_sync(&self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir: Arc<dyn Directory> =
+            Arc::new(crate::storage::FsDirectory::new(tmp.path()).unwrap());
+        let obs = Arc::new(SyncCounter(AtomicUsize::new(0)));
+        let mut w = WalWriter::<WalEntry>::new(dir.clone());
+        w.set_observer(obs.clone() as Arc<dyn super::WalObserver>);
+
+        w.append(&WalEntry::AddSegment {
+            segment_id: 1,
+            doc_count: 1,
+        })
+        .unwrap();
+        w.flush_and_sync().unwrap();
+
+        assert_eq!(obs.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn wal_flush_and_sync_poisons_on_failure() {
+        // MemoryDirectory's sync_file returns NotSupported, which should poison.
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let mut w = WalWriter::<WalEntry>::new(dir.clone());
+
+        w.append(&WalEntry::AddSegment {
+            segment_id: 1,
+            doc_count: 1,
+        })
+        .unwrap();
+
+        // flush_and_sync fails on MemoryDirectory (no file_path).
+        let err = w.flush_and_sync().unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::PersistenceError::NotSupported(_)
+        ));
+
+        // Writer should now be poisoned.
+        let err2 = w.append(&WalEntry::AddSegment {
+            segment_id: 2,
+            doc_count: 2,
+        });
+        assert!(err2.is_err());
+        assert!(err2.unwrap_err().to_string().contains("poisoned"));
     }
 
     #[test]

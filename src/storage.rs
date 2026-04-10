@@ -64,7 +64,7 @@ pub fn sync_parent_dir<D: Directory + ?Sized>(dir: &D, path: &str) -> Persistenc
 ///   treated as an IO boundary (push to OS / underlying writer).
 /// - Stable-storage durability requires explicit `sync_all`/`fsync` barriers, which are not
 ///   expressible via the `Directory` trait today.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FlushPolicy {
     /// Call `flush()` after each logical append operation.
     PerAppend,
@@ -72,6 +72,12 @@ pub enum FlushPolicy {
     ///
     /// `n=1` is equivalent to `PerAppend`. `n=0` is treated as `PerAppend`.
     EveryN(usize),
+    /// Call `flush()` when the specified duration has elapsed since the last flush.
+    ///
+    /// Checked lazily on each `append()` call. If no appends arrive, no flush occurs.
+    /// For background flushing independent of write activity, use an external timer
+    /// calling [`WalWriter::flush`](crate::walog::WalWriter::flush) directly.
+    Interval(std::time::Duration),
     /// Do not call `flush()` implicitly; callers may flush explicitly (if supported by the backend).
     Manual,
 }

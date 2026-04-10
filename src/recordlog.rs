@@ -81,6 +81,7 @@ pub struct RecordLogWriter {
     since_flush: usize,
     write_buffer: Vec<u8>,
     write_buffer_limit: usize,
+    last_flush_at: std::time::Instant,
 }
 
 impl RecordLogWriter {
@@ -122,6 +123,7 @@ impl RecordLogWriter {
             since_flush: 0,
             write_buffer: Vec::new(),
             write_buffer_limit: write_buffer_limit_bytes,
+            last_flush_at: std::time::Instant::now(),
         }
     }
 
@@ -183,6 +185,7 @@ impl RecordLogWriter {
             w.flush()?;
         }
         self.since_flush = 0;
+        self.last_flush_at = std::time::Instant::now();
         Ok(())
     }
 
@@ -238,6 +241,11 @@ impl RecordLogWriter {
                 // Note: guards don't participate in exhaustiveness checking; handle `n` here.
                 let n = n.max(1);
                 if self.since_flush >= n {
+                    self.flush()?;
+                }
+            }
+            FlushPolicy::Interval(d) => {
+                if self.last_flush_at.elapsed() >= d {
                     self.flush()?;
                 }
             }
