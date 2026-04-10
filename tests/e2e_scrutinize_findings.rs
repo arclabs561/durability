@@ -72,34 +72,6 @@ fn preallocation_crash_without_truncation_allows_best_effort_replay() {
 }
 
 // ---------------------------------------------------------------------------
-// Bug 3.2: Writer poisoning after write error
-// ---------------------------------------------------------------------------
-
-#[test]
-fn writer_rejects_appends_after_poison() {
-    // We can't easily simulate a write_all failure with MemoryDirectory,
-    // but we CAN test the poison check by verifying the error message.
-    let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
-    let mut w = WalWriter::<WalEntry>::new(dir.clone());
-
-    // Normal append works.
-    w.append(&WalEntry::AddSegment {
-        segment_id: 1,
-        doc_count: 1,
-    })
-    .unwrap();
-    w.flush().unwrap();
-
-    // The writer is NOT poisoned, so this should succeed.
-    w.append(&WalEntry::AddSegment {
-        segment_id: 2,
-        doc_count: 2,
-    })
-    .unwrap();
-    w.flush().unwrap();
-}
-
-// ---------------------------------------------------------------------------
 // Recovery: first segment with torn tail
 // ---------------------------------------------------------------------------
 
@@ -248,11 +220,11 @@ fn orphaned_checkpoint_file_does_not_corrupt_recovery() {
 }
 
 // ---------------------------------------------------------------------------
-// Concurrent reader + writer safety
+// Reader sees updates after writer flush (sequential, not concurrent)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn reader_sees_consistent_prefix_during_concurrent_write() {
+fn reader_sees_new_entries_after_writer_flush() {
     let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
 
     let mut w = WalWriter::<WalEntry>::new(dir.clone());
@@ -263,7 +235,7 @@ fn reader_sees_consistent_prefix_during_concurrent_write() {
     .unwrap();
     w.flush().unwrap();
 
-    // Reader replays while writer is active.
+    // Reader replays after writer flush.
     let r = WalReader::<WalEntry>::new(dir.clone());
     let records = r.replay().unwrap();
     assert_eq!(records.len(), 1);

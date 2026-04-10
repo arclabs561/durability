@@ -94,16 +94,21 @@ proptest! {
             prop_assert_eq!(*id, (i + 1) as u64);
         }
 
-        // Verify segment files are truncated to actual size (no trailing zeros).
+        // Verify segment files are truncated to actual size (not left at prealloc size).
         let segments = dir.list_dir("wal").unwrap();
         for seg in segments.iter().filter(|s| s.ends_with(".log")) {
             let path = format!("wal/{seg}");
             let fs_path = dir.file_path(&path).unwrap();
             let metadata = std::fs::metadata(&fs_path).unwrap();
-            // File should not be 4096 bytes (the prealloc size) unless it happens to
-            // contain exactly that many bytes of real data. At minimum it should have
-            // the header (24 bytes).
             prop_assert!(metadata.len() >= 24, "Segment {} too small: {} bytes", seg, metadata.len());
+            // Segments must be smaller than the prealloc size (4096 bytes).
+            // The writer truncates on rotation and drop.
+            prop_assert!(
+                metadata.len() < 4096,
+                "Segment {} not truncated: {} bytes (prealloc was 4096)",
+                seg,
+                metadata.len()
+            );
         }
     }
 }

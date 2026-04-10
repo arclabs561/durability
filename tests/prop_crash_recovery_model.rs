@@ -75,10 +75,10 @@ proptest! {
                     let reader = WalReader::<WalEntry>::new(dir.clone());
                     let recovered = reader.replay_best_effort().unwrap();
 
-                    // Recovered entries must be a prefix of model_flushed
-                    // (in MemoryDirectory, writes are immediately visible, so
-                    // we may actually recover more than "flushed" -- but we must
-                    // never see entries that weren't at least appended).
+                    // Recovered entries must contain at least the flushed
+                    // entries (MemoryDirectory writes are immediately visible,
+                    // so we may recover unflushed entries too -- but never fewer
+                    // than what was durably flushed).
                     prop_assert!(
                         recovered.len() >= model_flushed.len(),
                         "recovered {} entries but expected at least {} flushed",
@@ -86,10 +86,12 @@ proptest! {
                         model_flushed.len()
                     );
 
-                    // The first N entries must match the model.
+                    // The first N entries must match the flushed model exactly.
                     for (idx, flushed_id) in model_flushed.iter().enumerate() {
                         prop_assert_eq!(
-                            recovered[idx].entry_id, *flushed_id
+                            recovered[idx].entry_id, *flushed_id,
+                            "mismatch at index {}: recovered {} != flushed {}",
+                            idx, recovered[idx].entry_id, *flushed_id
                         );
                     }
 
@@ -103,9 +105,9 @@ proptest! {
                         );
                     }
 
-                    // Update model to include any extra recovered entries
-                    // (MemoryDirectory makes unflushed writes visible).
-                    model_flushed = recovered.iter().map(|r| r.entry_id).collect();
+                    // DO NOT update model_flushed to match recovered output.
+                    // The model tracks only genuinely flushed entries; updating
+                    // it here would make subsequent assertions tautological.
 
                     // Resume the writer.
                     writer = Some(WalWriter::resume(dir.clone()).unwrap());

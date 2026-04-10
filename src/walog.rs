@@ -411,13 +411,14 @@ fn enumerate_wal_segments(dir: &dyn Directory) -> PersistenceResult<Vec<(u64, St
 /// ```
 /// use durability::storage::MemoryDirectory;
 /// use durability::walog::{WalWriter, WalReader};
-/// use std::sync::Arc;
 ///
 /// #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
 /// enum Op { Set(String, String), Del(String) }
 ///
 /// let dir = MemoryDirectory::arc();
-/// let mut w = WalWriter::<Op>::new(dir.clone());
+///
+/// // open() creates a fresh WAL or resumes an existing one.
+/// let mut w = WalWriter::<Op>::open(dir.clone()).unwrap();
 /// w.append(&Op::Set("k".into(), "v".into())).unwrap();
 /// w.flush().unwrap();
 /// drop(w);
@@ -1917,6 +1918,52 @@ mod tests {
             obs.0.load(Ordering::Relaxed) >= 1,
             "expected at least one rotation"
         );
+    }
+
+    #[test]
+    fn wal_observer_append_batch_events() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct BatchObserver {
+            appends: AtomicUsize,
+            flushes: AtomicUsize,
+        }
+
+        impl super::WalObserver for BatchObserver {
+            fn on_append(&self, _entry_id: u64, _encoded_bytes: usize) {
+                self.appends.fetch_add(1, Ordering::Relaxed);
+            }
+            fn on_flush(&self, _bytes_flushed: usize) {
+                self.flushes.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let obs = Arc::new(BatchObserver {
+            appends: AtomicUsize::new(0),
+            flushes: AtomicUsize::new(0),
+        });
+        let mut w = WalWriter::<WalEntry>::new(dir.clone());
+        w.set_observer(obs.clone() as Arc<dyn super::WalObserver>);
+
+        let entries = vec![
+            WalEntry::AddSegment {
+                segment_id: 1,
+                doc_count: 1,
+            },
+            WalEntry::AddSegment {
+                segment_id: 2,
+                doc_count: 2,
+            },
+            WalEntry::AddSegment {
+                segment_id: 3,
+                doc_count: 3,
+            },
+        ];
+        w.append_batch(&entries).unwrap();
+
+        assert_eq!(obs.appends.load(Ordering::Relaxed), 3);
+        assert!(obs.flushes.load(Ordering::Relaxed) >= 1);
     }
 
     #[test]

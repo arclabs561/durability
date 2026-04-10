@@ -62,6 +62,7 @@ proptest! {
         prop_assert_eq!(count, batch.len() as u64);
         for (b, s) in batch.iter().zip(streaming.iter()) {
             prop_assert_eq!(b.entry_id, s.entry_id);
+            prop_assert_eq!(&b.payload, &s.payload);
         }
     }
 
@@ -92,6 +93,7 @@ proptest! {
         prop_assert_eq!(count, batch.len() as u64);
         for (b, s) in batch.iter().zip(streaming.iter()) {
             prop_assert_eq!(b.entry_id, s.entry_id);
+            prop_assert_eq!(&b.payload, &s.payload);
         }
     }
 }

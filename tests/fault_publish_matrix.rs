@@ -79,7 +79,13 @@ fn run_case(fp: FailPoint) {
     );
 
     match fp {
-        FailPoint::None => assert!(res.is_ok()),
+        FailPoint::None => {
+            let pubr = res.unwrap();
+            assert_eq!(pubr.checkpoint_path, "checkpoints/m.chk");
+            assert_eq!(pubr.checkpoint_last_entry_id, last);
+            assert!(pubr.wal_checkpoint_entry_id > last);
+            assert!(pubr.deleted_wal_segments >= 1);
+        }
         _ => assert!(res.is_err()),
     }
 

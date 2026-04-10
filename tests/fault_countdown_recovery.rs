@@ -10,9 +10,8 @@ use durability::walog::{WalEntry, WalReader, WalWriter};
 use std::sync::Arc;
 use support::faulty_directory::CountdownDirectory;
 
-/// Write `count` entries, arming the countdown at `fail_after` write ops.
-/// Returns the entry IDs that were successfully flushed before the countdown triggered.
-fn write_with_countdown(fail_after: u64) -> Vec<u64> {
+/// Write entries with countdown fault injection, returning (dir, flushed_ids).
+fn write_with_countdown(fail_after: u64) -> (Arc<dyn Directory>, Vec<u64>) {
     let mem = MemoryDirectory::arc();
     let countdown = Arc::new(CountdownDirectory::new(mem));
     let dir: Arc<dyn Directory> = countdown.clone();
@@ -20,57 +19,67 @@ fn write_with_countdown(fail_after: u64) -> Vec<u64> {
     let mut w = WalWriter::<WalEntry>::new(dir.clone());
     let mut flushed_ids = Vec::new();
 
-    // Write entries one at a time with per-append flush to ensure
-    // each entry is individually committed before the next.
     for i in 0..20u64 {
         let entry = WalEntry::AddSegment {
             segment_id: i + 1,
             doc_count: (i as u32) * 10,
         };
 
-        // Arm the countdown before the target operation
         if i == 0 {
             countdown.arm(fail_after);
         }
 
         match w.append(&entry) {
-            Ok(id) => {
-                // Try to flush immediately
-                match w.flush() {
-                    Ok(()) => flushed_ids.push(id),
-                    Err(_) => break,
-                }
-            }
+            Ok(id) => match w.flush() {
+                Ok(()) => flushed_ids.push(id),
+                Err(_) => break,
+            },
             Err(_) => break,
         }
     }
 
-    flushed_ids
+    drop(w);
+    countdown.disarm();
+    (dir, flushed_ids)
 }
 
 #[test]
 fn countdown_recovery_produces_valid_prefix() {
-    // Test with various countdown values to exercise different failure points.
-    // Each write+flush cycle uses ~3-5 write operations (create_dir, create_file/append_file,
-    // write header, write entry, flush).
     for fail_after in 1..30u64 {
-        let flushed_ids = write_with_countdown(fail_after);
+        let (dir, flushed_ids) = write_with_countdown(fail_after);
 
-        // Now create a fresh reader on the same in-memory directory.
-        // We can't easily share the MemoryDirectory across the write/read boundary
-        // in this test structure, so instead test the prefix property differently:
-        // verify that flushed_ids is a valid prefix (monotonically increasing from 1).
-        if !flushed_ids.is_empty() {
-            assert_eq!(flushed_ids[0], 1, "first entry_id should be 1");
-            for w in flushed_ids.windows(2) {
-                assert_eq!(
-                    w[1],
-                    w[0] + 1,
-                    "entry_ids should be consecutive, got {} after {}",
-                    w[1],
-                    w[0]
-                );
-            }
+        // Read back from the WAL and verify recovery matches flushed entries.
+        let reader = WalReader::<WalEntry>::new(dir);
+        let recovered = reader.replay_best_effort().unwrap();
+
+        // Recovered entries must be a superset of flushed entries
+        // (MemoryDirectory writes are visible even without fsync).
+        assert!(
+            recovered.len() >= flushed_ids.len(),
+            "fail_after={}: recovered {} but flushed {}",
+            fail_after,
+            recovered.len(),
+            flushed_ids.len()
+        );
+
+        // The flushed IDs must appear at the start of recovery.
+        for (idx, &flushed_id) in flushed_ids.iter().enumerate() {
+            assert_eq!(
+                recovered[idx].entry_id, flushed_id,
+                "fail_after={}: mismatch at index {}",
+                fail_after, idx
+            );
+        }
+
+        // All recovered entry IDs must be strictly increasing from 1.
+        for (i, r) in recovered.iter().enumerate() {
+            assert_eq!(
+                r.entry_id,
+                (i as u64) + 1,
+                "fail_after={}: entry_id gap at index {}",
+                fail_after,
+                i
+            );
         }
     }
 }
@@ -150,10 +159,11 @@ fn countdown_recovery_on_fs_produces_prefix() {
     assert_eq!(streaming_count, 10);
 }
 
+/// Write entries with fault injection during multi-segment rotation.
+/// Arms the countdown after writing some entries, forcing failure during
+/// segment rotation. Recovery must return a valid prefix.
 #[test]
-fn countdown_mid_segment_recovery() {
-    // Write with small segment size to force multiple segments,
-    // then fail during a middle segment write.
+fn countdown_mid_segment_rotation_recovery() {
     let tmp = tempfile::tempdir().unwrap();
     let fs = FsDirectory::new(tmp.path()).unwrap();
     let countdown = Arc::new(CountdownDirectory::new(Arc::new(fs) as Arc<dyn Directory>));
@@ -166,27 +176,50 @@ fn countdown_mid_segment_recovery() {
     // Small segments to force rotation
     w.set_segment_size_limit_bytes(100);
 
-    let mut committed = 0u64;
-    for i in 0..50u64 {
+    // Write a few entries successfully first.
+    for i in 0..5u64 {
+        w.append(&WalEntry::AddSegment {
+            segment_id: i + 1,
+            doc_count: i as u32,
+        })
+        .unwrap();
+    }
+
+    // Arm countdown: fail after 3 more write ops (mid-rotation).
+    countdown.arm(3);
+
+    let mut extra = 0u64;
+    for i in 5..50u64 {
         match w.append(&WalEntry::AddSegment {
             segment_id: i + 1,
             doc_count: i as u32,
         }) {
-            Ok(_) => committed += 1,
+            Ok(_) => extra += 1,
             Err(_) => break,
         }
     }
-
-    // All 50 should succeed (no countdown armed yet)
-    assert_eq!(committed, 50);
     drop(w);
 
-    // Verify replay matches
+    // Disarm and verify recovery returns a valid prefix.
+    countdown.disarm();
     let reader = WalReader::<WalEntry>::new(dir.clone());
-    let replayed = reader.replay().unwrap();
-    assert_eq!(replayed.len(), 50);
+    let replayed = reader.replay_best_effort().unwrap();
 
-    // Verify streaming replay agrees
-    let count = reader.replay_each(|_| Ok(())).unwrap();
-    assert_eq!(count, 50);
+    // Must have at least the 5 pre-fault entries.
+    assert!(
+        replayed.len() >= 5,
+        "expected at least 5 entries, got {}",
+        replayed.len()
+    );
+    // Must not have more than 5 + extra (everything that succeeded).
+    assert!(
+        replayed.len() <= 5 + extra as usize,
+        "recovered {} but only {} succeeded",
+        replayed.len(),
+        5 + extra
+    );
+    // Entry IDs must be strictly increasing from 1.
+    for (i, r) in replayed.iter().enumerate() {
+        assert_eq!(r.entry_id, (i as u64) + 1);
+    }
 }
