@@ -2699,6 +2699,151 @@ mod tests {
     }
 
     #[test]
+    fn sync_wal_writer_resume() {
+        let dir = MemoryDirectory::arc();
+
+        // Write some entries, then drop.
+        {
+            let sw = SyncWalWriter::<WalEntry>::open(dir.clone()).unwrap();
+            sw.append(&WalEntry::AddSegment {
+                segment_id: 1,
+                doc_count: 1,
+            })
+            .unwrap();
+            sw.flush().unwrap();
+        }
+
+        // Resume picks up the last entry ID.
+        let sw = SyncWalWriter::<WalEntry>::resume(dir.clone()).unwrap();
+        let id = sw
+            .append(&WalEntry::AddSegment {
+                segment_id: 2,
+                doc_count: 2,
+            })
+            .unwrap();
+        assert_eq!(id, 2);
+        sw.flush().unwrap();
+        drop(sw);
+
+        let records = WalReader::<WalEntry>::new(dir).replay().unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn sync_wal_writer_append_batch() {
+        let dir = MemoryDirectory::arc();
+        let sw = SyncWalWriter::<WalEntry>::open(dir.clone()).unwrap();
+
+        let entries = vec![
+            WalEntry::AddSegment {
+                segment_id: 1,
+                doc_count: 1,
+            },
+            WalEntry::AddSegment {
+                segment_id: 2,
+                doc_count: 2,
+            },
+        ];
+        let ids = sw.append_batch(&entries).unwrap();
+        assert_eq!(ids, vec![1, 2]);
+        sw.flush().unwrap();
+        drop(sw);
+
+        let records = WalReader::<WalEntry>::new(dir).replay().unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn sync_wal_writer_concurrent_mixed_durable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crate::storage::FsDirectory::arc(tmp.path()).unwrap();
+        let sw = Arc::new(SyncWalWriter::<WalEntry>::open(dir.clone()).unwrap());
+
+        let mut handles = Vec::new();
+        // Thread 1: append without sync
+        let sw1 = sw.clone();
+        handles.push(std::thread::spawn(move || {
+            for i in 0..10u64 {
+                sw1.append(&WalEntry::AddSegment {
+                    segment_id: 100 + i,
+                    doc_count: 0,
+                })
+                .unwrap();
+            }
+        }));
+        // Thread 2: append_durable (syncs for everyone)
+        let sw2 = sw.clone();
+        handles.push(std::thread::spawn(move || {
+            for i in 0..10u64 {
+                sw2.append_durable(&WalEntry::AddSegment {
+                    segment_id: 200 + i,
+                    doc_count: 0,
+                })
+                .unwrap();
+            }
+        }));
+
+        for h in handles {
+            h.join().unwrap();
+        }
+        sw.flush().unwrap();
+        drop(sw);
+
+        let records = WalReader::<WalEntry>::new(dir).replay().unwrap();
+        assert_eq!(records.len(), 20);
+        for w in records.windows(2) {
+            assert!(w[1].entry_id > w[0].entry_id);
+        }
+    }
+
+    #[test]
+    fn wal_recycle_capacity_zero_deletes() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let mut w = WalWriter::<WalEntry>::with_options(
+            dir.clone(),
+            crate::storage::FlushPolicy::PerAppend,
+            0,
+        );
+        w.set_recycle_capacity(0); // disabled
+
+        w.append(&WalEntry::AddSegment {
+            segment_id: 1,
+            doc_count: 1,
+        })
+        .unwrap();
+        w.flush().unwrap();
+
+        // Manually call recycle_segment with capacity 0 -- should delete.
+        dir.atomic_write("wal/old.log", b"dummy").unwrap();
+        assert!(dir.exists("wal/old.log"));
+        w.recycle_segment("wal/old.log".to_string());
+        assert!(!dir.exists("wal/old.log"));
+    }
+
+    #[test]
+    fn wal_recycle_pool_eviction() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let mut w = WalWriter::<WalEntry>::with_options(
+            dir.clone(),
+            crate::storage::FlushPolicy::PerAppend,
+            0,
+        );
+        w.set_recycle_capacity(2);
+
+        // Create 3 dummy files and recycle all 3.
+        for i in 0..3u64 {
+            let path = format!("wal/old_{i}.log");
+            dir.atomic_write(&path, b"dummy").unwrap();
+            w.recycle_segment(path);
+        }
+
+        // Pool capacity is 2, so old_0 should have been evicted (deleted).
+        assert!(!dir.exists("wal/old_0.log"), "oldest should be evicted");
+        assert!(dir.exists("wal/old_1.log"), "second should be retained");
+        assert!(dir.exists("wal/old_2.log"), "newest should be retained");
+    }
+
+    #[test]
     fn wal_lockfile_prevents_double_writer() {
         let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
 
