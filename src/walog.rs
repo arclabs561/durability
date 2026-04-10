@@ -32,6 +32,28 @@
 //!
 //! All integers are little-endian.
 //!
+//! ## Writer variants
+//!
+//! - [`WalWriter`]: single-owner writer. Use [`WalWriter::open`] as the recommended
+//!   entry point (creates or resumes).
+//! - [`SyncWalWriter`]: thread-safe wrapper with group commit semantics. Multiple
+//!   threads can call [`SyncWalWriter::append`] concurrently; fsync is batched via
+//!   [`SyncWalWriter::append_durable`].
+//!
+//! ## Tuning
+//!
+//! - **Flush policy**: [`FlushPolicy::PerAppend`], [`FlushPolicy::EveryN`],
+//!   [`FlushPolicy::Interval`], or [`FlushPolicy::Manual`]. Controls when the write
+//!   buffer is pushed to the OS (not stable-storage sync -- use `flush_and_sync` for that).
+//! - **Segment rotation**: by size ([`WalWriter::set_segment_size_limit_bytes`]) and/or
+//!   age ([`WalWriter::set_segment_max_age`]).
+//! - **Preallocation**: [`WalWriter::set_preallocate_bytes`] avoids block allocation on
+//!   the write path.
+//! - **Segment recycling**: [`WalWriter::set_recycle_capacity`] + [`WalWriter::recycle_segment`]
+//!   reuses truncated segment files on the next rotation.
+//! - **Observer**: [`WalObserver`] receives lifecycle events (append, flush, sync, rotate,
+//!   truncation veto).
+//!
 //! ## Recovery posture
 //!
 //! `WalReader::replay_best_effort()` matches the common WAL recovery stance used by
@@ -39,6 +61,15 @@
 //! the first *truncated* tail record (torn write) in the **final** segment.
 //!
 //! Corruption in non-final segments is always an error.
+//!
+//! ## Error policy
+//!
+//! The writer **poisons** itself after:
+//! - A `write_all` failure during buffer drain (indeterminate file state).
+//! - A segment creation failure during rotation (inconsistent segment ID).
+//! - A `flush_and_sync` failure (false durability).
+//!
+//! A poisoned writer rejects all subsequent appends with `InvalidState`.
 
 use crate::error::{PersistenceError, PersistenceResult};
 use crate::formats::{WAL_FORMAT_VERSION, WAL_MAGIC};
