@@ -4,56 +4,60 @@
 [![Documentation](https://docs.rs/durability/badge.svg)](https://docs.rs/durability)
 [![CI](https://github.com/arclabs561/durability/actions/workflows/ci.yml/badge.svg)](https://github.com/arclabs561/durability/actions/workflows/ci.yml)
 
-Durability primitives for local persistence.
+Crash-consistent persistence primitives: directory abstraction, generic WAL, checkpoints, and recovery.
 
 ## Quick start
+
+```toml
+[dependencies]
+durability = "0.6"
+```
 
 ```rust
 use durability::storage::MemoryDirectory;
 use durability::walog::{WalWriter, WalReader, WalEntry};
 
-// MemoryDirectory::arc() returns Arc<dyn Directory> directly
 let dir = MemoryDirectory::arc();
 
-// Write
-let mut w = WalWriter::<WalEntry>::new(dir.clone());
+// open() creates a fresh WAL or resumes an existing one.
+let mut w = WalWriter::<WalEntry>::open(dir.clone()).unwrap();
 w.append(&WalEntry::AddSegment { segment_id: 1, doc_count: 100 }).unwrap();
 w.append(&WalEntry::DeleteDocuments { deletes: vec![(1, 42)] }).unwrap();
 w.flush().unwrap();
 
 assert_eq!(w.last_entry_id(), Some(2));
+drop(w);
 
 // Recover
 let records = WalReader::<WalEntry>::new(dir).replay().unwrap();
 assert_eq!(records.len(), 2);
-assert_eq!(records[0].entry_id, 1); // entry_id assigned by writer
+assert_eq!(records[0].entry_id, 1);
 ```
 
 `WalWriter<E>` and `WalReader<E>` are generic -- define your own entry type with
-`#[derive(Serialize, Deserialize)]` and use `WalWriter::<YourType>::new(dir)`.
-Entry IDs are assigned by the writer and stored in the frame header, not in your payload.
+`#[derive(Serialize, Deserialize)]` and use `WalWriter::<YourType>::open(dir)`.
 
-**Important**: `WalWriter::new()` creates a fresh WAL and errors if segments already
-exist. Use `WalWriter::resume()` to continue an existing WAL (it handles both empty
-and non-empty directories).
+## Thread-safe writer
 
-For batch writes (amortize flush cost across multiple entries):
-
-```rust
-let ids = w.append_batch(&[
-    WalEntry::AddSegment { segment_id: 3, doc_count: 50 },
-    WalEntry::DeleteDocuments { deletes: vec![(1, 10)] },
-]).unwrap();
-// Single flush for both entries
-```
-
-For large WALs, use streaming replay to avoid collecting into a `Vec`:
+`SyncWalWriter` wraps a `WalWriter` in a `Mutex` for concurrent access.
+`append_durable` provides group commit semantics -- concurrent callers share
+a single fsync:
 
 ```rust
-reader.replay_each(|record| {
-    println!("entry {}: {:?}", record.entry_id, record.payload);
-    Ok(())
-})?;
+use durability::storage::FsDirectory;
+use durability::walog::SyncWalWriter;
+use std::sync::Arc;
+
+# #[derive(serde::Serialize, serde::Deserialize)] enum Op { Set(String) }
+let dir = FsDirectory::arc("/tmp/wal-demo").unwrap();
+let sw = Arc::new(SyncWalWriter::<Op>::open(dir).unwrap());
+
+// Each thread calls append_durable; fsync is batched across callers.
+let sw2 = sw.clone();
+std::thread::spawn(move || {
+    sw2.append_durable(&Op::Set("hello".into())).unwrap();
+});
+sw.append_durable(&Op::Set("world".into())).unwrap();
 ```
 
 ## Generic recovery
@@ -91,83 +95,70 @@ let result = recover_with_wal::<Snap, Op, _>(
 assert_eq!(result.state, 1); // 0 + 1 + 1 - 1
 ```
 
-See `examples/kv_store.rs` for a complete checkpoint + WAL + point-in-time
-recovery example.
+## Tuning
 
-## Not provided (and why)
+```rust
+use durability::storage::{FsDirectory, FlushPolicy};
+use durability::walog::WalWriter;
+# #[derive(serde::Serialize, serde::Deserialize)] enum Op { X }
 
-- **Multi-process locking**: This crate does not manage `flock` or IPC locks.
-  Single-writer-per-directory is assumed. Multiple writers silently corrupt data.
-  `WalWriter` creates an advisory lockfile (`wal/.lock`) to catch accidental
-  double-instantiation within a process, but this does not guarantee cross-process
-  exclusion.
-- **Strong consistency by default**: `write` calls are buffered.
-  Use `flush_and_sync()` when you need a durability barrier.
-- **fsync failure recovery**: A failed `fsync` on Linux clears dirty pages; retrying
-  reports false success. This crate propagates IO errors as fatal. Callers should
-  treat fsync failure as unrecoverable and restart from WAL.
+let dir = FsDirectory::arc("/tmp/wal-tuning").unwrap();
+let mut w = WalWriter::<Op>::with_options(
+    dir, FlushPolicy::Interval(std::time::Duration::from_millis(10)), 64 * 1024,
+);
+w.set_segment_size_limit_bytes(64 * 1024 * 1024); // 64 MiB segments
+w.set_segment_max_age(std::time::Duration::from_secs(300)); // rotate after 5 min
+w.set_preallocate_bytes(4 * 1024 * 1024); // 4 MiB preallocation
+w.set_recycle_capacity(4); // reuse up to 4 truncated segments
+```
 
-## What really matters (failure model)
+## Async support
 
-- **Crash / torn writes**: partial writes at the tail (e.g. process crash mid-record).
-- **Corruption detection**: CRC/magic/version/type mismatches are treated as errors (even in "best-effort" modes).
-- **Stable storage vs "reported success"**: unless you add explicit barriers, a successful write may still be only in OS caches.
+The `async` feature provides `AsyncDirectory` and `BlockingBridge` for tokio:
 
-## Contract surface (what you get)
+```toml
+[dependencies]
+durability = { version = "0.6", features = ["async"] }
+```
 
-- **Prefix property**:
-  Best-effort replay returns a prefix of the valid operation stream. No garbage, no reordering.
-- **Narrow best-effort scope**:
-  Tolerance applies only to the **final** WAL segment's **torn tail records**, and also tolerates a **torn header** in the final segment (crash during segment creation).
-  Corruption in non-final segments is an error.
-- **Deterministic checkpoints**:
-  Checkpoint payloads are written deterministically (stable ordering).
+```rust,no_run
+use durability::async_dir::{AsyncDirectory, BlockingBridge};
+use durability::storage::FsDirectory;
 
-## Stable-storage durability (opt-in)
+# async fn example() {
+let bridge = BlockingBridge::new(FsDirectory::new("/tmp/async-demo").unwrap());
+bridge.atomic_write("data.bin", b"hello".to_vec()).await.unwrap();
+let data = bridge.read_file("data.bin").await.unwrap();
+# }
+```
 
-If you need "survives power loss after success", add explicit barriers:
+## Modules
 
-- `WalWriter::flush_and_sync()` / `RecordLogWriter::flush_and_sync()`
-- `durability::storage::sync_file(dir, path)` -- fsync the file
-- `durability::storage::sync_parent_dir(dir, path)` -- sync the parent directory (needed for durable create/rename)
-- `Directory` trait provides `atomic_write_durable` / `atomic_rename_durable`
+| Module | Purpose |
+|--------|---------|
+| `storage` | `Directory` trait, `FsDirectory`, `MemoryDirectory`, sync helpers |
+| `walog` | Generic WAL: `WalWriter<E>`, `WalReader<E>`, `SyncWalWriter<E>`, `WalObserver` |
+| `recordlog` | Append-only single-file log with CRC framing |
+| `checkpoint` | CRC-validated snapshot files (postcard payloads) |
+| `recover` | Generic `recover_with_wal()` + segment-specific `RecoveryManager` |
+| `publish` | Crash-safe checkpoint publish + WAL truncation |
+| `async_dir` | `AsyncDirectory` trait + `BlockingBridge` (feature `async`) |
 
-If the backend cannot map paths to the OS filesystem (`Directory::file_path()` returns `None`), these operations return `NotSupported`.
+## Not provided
 
-## Checkpoint publishing + WAL truncation
+- **Multi-process locking**: single-writer-per-directory assumed. Advisory lockfile catches in-process double-instantiation only.
+- **Strong consistency by default**: writes are buffered. Use `flush_and_sync()` for a durability barrier.
+- **fsync failure recovery**: a failed fsync poisons the writer. Callers should treat this as unrecoverable and restart from WAL.
 
-To truncate old WAL segments safely:
+## Contract
 
-1. Write a durable checkpoint
-2. Append `WalEntry::Checkpoint` to the WAL and make it durable
-3. Only then delete WAL segments covered by the checkpoint
-
-Use `CheckpointPublisher` for this pattern. After truncation, recovery should
-start from the latest checkpoint marker (see `RecoveryManager::recover_latest`).
-
-## Modules at a glance
-
-- `storage`: `Directory` abstraction + `FsDirectory`/`MemoryDirectory` + sync helpers.
-- `recordlog`: append-only log with CRC framing + strict/best-effort replay.
-- `walog`: generic multi-segment WAL (`WalWriter<E>` / `WalReader<E>`) with strict/best-effort replay and `resume` repair. Includes `WalEntry` for segment-index use cases.
-- `checkpoint`: CRC-validated snapshot files (postcard payloads).
-- `recover`: generic `recover_with_wal()` for any checkpoint + WAL entry types, plus segment-specific `RecoveryManager`.
-- `publish`: crash-safe checkpoint publish + WAL truncation.
+- **Prefix property**: best-effort replay returns a prefix of the valid stream.
+- **Narrow best-effort**: tolerance applies only to the final segment's torn tail. Corruption in non-final segments is an error.
+- **Deterministic checkpoints**: payloads are written with stable ordering.
 
 ## Running
 
 - Tests: `cargo test`
-- Heavier property runs: `PROPTEST_CASES=512 cargo test --test prop_wal_resume`
+- Property tests: `PROPTEST_CASES=512 cargo test --test prop_wal_resume`
 - Benches: `cargo bench`
-
-## Fuzzing (opt-in)
-
-Property tests cover semantic invariants; fuzzing covers "never panic on weird bytes".
-
-- Install: `cargo install cargo-fuzz`
-- Run (see `fuzz/`):
-  - `cargo fuzz run fuzz_wal_entry_decode`
-  - `cargo fuzz run fuzz_wal_dir_replay`
-  - `cargo fuzz run fuzz_checkpoint_read`
-  - `cargo fuzz run fuzz_recordlog_read`
-  - `cargo fuzz run fuzz_generic_recovery`
+- Fuzzing: `cargo fuzz run fuzz_wal_entry_decode` (see `fuzz/`)
