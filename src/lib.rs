@@ -45,6 +45,9 @@ pub mod walog;
 #[cfg(feature = "async")]
 pub mod async_dir;
 
+#[cfg(feature = "mmap")]
+pub mod mmap;
+
 pub use error::{PersistenceError, PersistenceResult};
 pub use storage::{Directory, FsDirectory, MemoryDirectory};
 
