@@ -10,7 +10,7 @@ Crash-consistent persistence primitives: directory abstraction, generic WAL, che
 
 ```toml
 [dependencies]
-durability = "0.6"
+durability = "1.2"
 ```
 
 ```rust
@@ -118,7 +118,7 @@ The `async` feature provides `AsyncDirectory` and `BlockingBridge` for tokio:
 
 ```toml
 [dependencies]
-durability = { version = "0.6", features = ["async"] }
+durability = { version = "1.2", features = ["async"] }
 ```
 
 ```rust,no_run
