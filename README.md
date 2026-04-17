@@ -10,7 +10,7 @@ Crash-consistent persistence primitives: directory abstraction, generic WAL, che
 
 ```toml
 [dependencies]
-durability = "1.2"
+durability = "0.6"
 ```
 
 ```rust
