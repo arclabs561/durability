@@ -652,11 +652,9 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
 
         // Pre-encode all entries to detect errors before writing any.
         let mut encoded_pairs: Vec<(u64, Vec<u8>)> = Vec::with_capacity(entries.len());
-        let mut next_id = self.current_entry_id;
-        for entry in entries {
+        for (next_id, entry) in (self.current_entry_id..).zip(entries.iter()) {
             let encoded = WalEntryOnDisk::encode(next_id, entry)?;
             encoded_pairs.push((next_id, encoded));
-            next_id += 1;
         }
 
         // Write all entries.
