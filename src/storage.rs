@@ -560,8 +560,15 @@ mod tests {
     fn sync_parent_of_path_missing_parent_errors() {
         let dir = tempfile::tempdir().expect("tempdir");
         let nonexistent = dir.path().join("definitely-not-a-real-subdir/file.txt");
-        // Parent does not exist; File::open(parent) fails -> error returned.
-        assert!(sync_parent_of_path(&nonexistent).is_err());
+        // Parent does not exist; File::open(parent) fails with NotFound,
+        // propagated as PersistenceError::Io via `?`. Assert the specific
+        // variant so a future change that started returning a different
+        // error class (e.g., InvalidConfig for the non-existent parent)
+        // would surface here instead of silently passing.
+        match sync_parent_of_path(&nonexistent) {
+            Err(PersistenceError::Io(_)) => {}
+            other => panic!("expected PersistenceError::Io for missing parent, got {other:?}"),
+        }
     }
 
     #[test]
