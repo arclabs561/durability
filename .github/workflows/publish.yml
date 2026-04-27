@@ -13,7 +13,7 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -34,7 +34,11 @@ jobs:
         run: cargo publish --dry-run
 
       - name: Authenticate (OIDC trusted publishing)
-        uses: rust-lang/crates-io-auth-action@v1
+        # Pin to a specific tag: rust-lang/crates-io-auth-action does not
+        # publish a sliding `v1` major tag, so `@v1` resolves to v1.0.0
+        # (Node 20). v1.0.4 uses Node 24 and avoids the deprecation
+        # warning enforced June 2026.
+        uses: rust-lang/crates-io-auth-action@v1.0.4
         id: auth
 
       - name: Publish
