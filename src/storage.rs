@@ -45,14 +45,31 @@ pub fn sync_parent_dir<D: Directory + ?Sized>(dir: &D, path: &str) -> Persistenc
             "sync_parent_dir requires Directory::file_path()".into(),
         ));
     };
-    let Some(parent) = p.parent() else {
+    sync_parent_of_path(&p)
+}
+
+/// Attempt to `fsync`/`sync_all` the parent directory of a raw filesystem path.
+///
+/// Same semantics as [`sync_parent_dir`], but does not require a [`Directory`]
+/// instance. Useful for callers that operate on raw `&Path` values and don't
+/// otherwise need the `Directory` abstraction (e.g. a JSON or postcard
+/// serializer that takes a path argument and inlines its own temp+rename).
+///
+/// Notes:
+/// - On some platforms/filesystems, syncing the directory is required for the
+///   rename/create to survive power loss even after syncing the file itself
+///   (XFS, some ext4 configurations, overlayfs).
+/// - Some platforms (notably Windows) don't allow opening a directory as a
+///   `File` and will return an `io::Error`; the caller decides whether to
+///   surface that or treat it as best-effort. ext4 with `auto_da_alloc` syncs
+///   implicitly.
+pub fn sync_parent_of_path(path: &std::path::Path) -> PersistenceResult<()> {
+    let Some(parent) = path.parent() else {
         return Err(PersistenceError::InvalidConfig(format!(
-            "path has no parent directory: {p:?}"
+            "path has no parent directory: {path:?}"
         )));
     };
     let f = std::fs::File::open(parent)?;
-    // Best-effort: if this fails due to platform-specific directory open semantics,
-    // surface the error to the caller; stable storage requires an explicit decision.
     f.sync_all()?;
     Ok(())
 }
@@ -515,5 +532,46 @@ impl Write for MemoryInPlaceWriter {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `sync_parent_of_path` succeeds for an existing parent dir and surfaces
+    /// the io::Error when the parent does not exist. The successful sync is
+    /// the load-bearing case for atomic-rename callers; the failure case
+    /// pins the error-surfacing contract so a caller-side `?` does the
+    /// right thing.
+    #[cfg(unix)]
+    #[test]
+    fn sync_parent_of_path_existing_parent_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("some_file.txt");
+        std::fs::write(&path, b"hi").expect("write");
+
+        // Parent (the tempdir) exists; sync should succeed.
+        sync_parent_of_path(&path).expect("sync_parent_of_path on existing parent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_parent_of_path_missing_parent_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nonexistent = dir.path().join("definitely-not-a-real-subdir/file.txt");
+        // Parent does not exist; File::open(parent) fails -> error returned.
+        assert!(sync_parent_of_path(&nonexistent).is_err());
+    }
+
+    #[test]
+    fn sync_parent_of_path_root_errors_with_invalid_config() {
+        // A bare path with no parent (e.g. just "/") returns InvalidConfig,
+        // not a wrapped io::Error. Pins the parent.is_none() branch.
+        let root = std::path::Path::new("/");
+        match sync_parent_of_path(root) {
+            Err(PersistenceError::InvalidConfig(_)) => {}
+            other => panic!("expected InvalidConfig for root path, got {other:?}"),
+        }
     }
 }
