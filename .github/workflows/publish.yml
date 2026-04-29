@@ -38,6 +38,9 @@ jobs:
         # publish a sliding `v1` major tag, so `@v1` resolves to v1.0.0
         # (Node 20). v1.0.4 uses Node 24 and avoids the deprecation
         # warning enforced June 2026.
+      - name: cargo-semver-checks
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+
         uses: rust-lang/crates-io-auth-action@v1.0.4
         id: auth
 
