@@ -19,16 +19,16 @@ jobs:
         run: cargo fmt --all --check
 
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: doc
         run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
       - name: examples
-        run: cargo build --examples
+        run: cargo build --examples --all-features
 
       - name: test
-        run: cargo test
+        run: cargo test --all-features
 
       - name: Semver check
         if: github.event_name == 'pull_request'
