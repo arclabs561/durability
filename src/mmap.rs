@@ -165,7 +165,10 @@ fn raw_madvise(ptr: *const u8, len: usize, advice: libc::c_int) -> Result<(), Ma
     // SAFETY: ptr is the base of a live Mmap and len is the mapping length.
     let ret = unsafe { libc::madvise(ptr as *mut libc::c_void, len, advice) };
     if ret != 0 {
-        Err(MappedFileError::Madvise(unsafe { *libc::__error() }))
+        // std reads errno portably; libc's accessor is platform-named
+        // (__error on macOS, __errno_location on Linux).
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        Err(MappedFileError::Madvise(errno))
     } else {
         Ok(())
     }
