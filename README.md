@@ -118,7 +118,7 @@ The `async` feature provides `AsyncDirectory` and `BlockingBridge` for tokio:
 
 ```toml
 [dependencies]
-durability = { version = "1.2", features = ["async"] }
+durability = { version = "0.6", features = ["async"] }
 ```
 
 ```rust,no_run
