@@ -86,7 +86,12 @@ impl MappedFile {
                 AccessPattern::Normal => Some(Normal),
                 AccessPattern::WillNeed(range) => {
                     let len = self.map.len();
-                    let start = range.start.min(len);
+                    // Linux requires the madvise address to be page-aligned
+                    // (EINVAL otherwise); macOS tolerates unaligned starts.
+                    // Round the start down to its page so partial ranges work
+                    // on both.
+                    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as usize;
+                    let start = (range.start.min(len) / page) * page;
                     let end = range.end.min(len);
                     if start < end {
                         let ptr = unsafe { self.map.as_ptr().add(start) };
