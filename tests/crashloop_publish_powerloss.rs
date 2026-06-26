@@ -183,11 +183,8 @@ fn run_seed(seed: u64) {
                 let ckpt_state = RecoveryManager::to_checkpoint_state(&before);
                 let last = before.last_entry_id;
 
-                let mut publisher_wal = WalWriter::<WalEntry>::resume(dir.clone()).unwrap();
-                publisher_wal.set_segment_size_limit_bytes(512);
-
                 let res = CheckpointPublisher::new(dir.clone()).publish_checkpoint(
-                    &mut publisher_wal,
+                    &mut wal,
                     &ckpt_state,
                     last,
                     "checkpoints/latest.chk",
@@ -203,8 +200,6 @@ fn run_seed(seed: u64) {
                 // Update expected durable state.
                 expected = after;
 
-                // Continue with a fresh WAL writer (simulate app restarting after maintenance).
-                wal = WalWriter::<WalEntry>::resume(dir.clone()).unwrap();
                 wal.set_segment_size_limit_bytes(512);
             }
             // Crash + power loss restore
@@ -225,7 +220,7 @@ fn run_seed(seed: u64) {
 
                 // Continue appending to WAL after restart.
                 dir = mk_dir();
-                wal = WalWriter::<WalEntry>::resume(dir.clone()).unwrap();
+                wal = WalWriter::<WalEntry>::resume_after_crash(dir.clone()).unwrap();
                 wal.set_segment_size_limit_bytes(512);
             }
         }

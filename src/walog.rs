@@ -36,9 +36,9 @@
 //!
 //! - [`WalWriter`]: single-owner writer. Use [`WalWriter::open`] as the recommended
 //!   entry point (creates or resumes).
-//! - [`SyncWalWriter`]: thread-safe wrapper with group commit semantics. Multiple
-//!   threads can call [`SyncWalWriter::append`] concurrently; fsync is batched via
-//!   [`SyncWalWriter::append_durable`].
+//! - [`SyncWalWriter`]: thread-safe wrapper around a single [`WalWriter`]. Multiple
+//!   threads can call [`SyncWalWriter::append`] concurrently; durable appends are
+//!   serialized through [`SyncWalWriter::append_durable`].
 //!
 //! ## Tuning
 //!
@@ -432,7 +432,60 @@ fn enumerate_wal_segments(dir: &dyn Directory) -> PersistenceResult<Vec<(u64, St
         })
         .collect();
     segments.sort_by_key(|(id, _)| *id);
+    validate_wal_segment_sequence(&segments)?;
     Ok(segments)
+}
+
+fn validate_wal_segment_sequence(segments: &[(u64, String)]) -> PersistenceResult<()> {
+    let mut prev: Option<u64> = None;
+    for &(id, _) in segments {
+        if id == 0 {
+            return Err(PersistenceError::Format(
+                "WAL segment id must be greater than zero".into(),
+            ));
+        }
+        if let Some(prev_id) = prev {
+            if id == prev_id {
+                return Err(PersistenceError::Format(format!(
+                    "duplicate WAL segment id {id}"
+                )));
+            }
+            let expected = prev_id.checked_add(1).ok_or_else(|| {
+                PersistenceError::Format(format!("WAL segment id overflow after {prev_id}"))
+            })?;
+            if id != expected {
+                return Err(PersistenceError::Format(format!(
+                    "WAL segment id gap (prev={prev_id}, expected={expected}, got={id})"
+                )));
+            }
+        }
+        prev = Some(id);
+    }
+    Ok(())
+}
+
+fn validate_header_segment_id(header: WalSegmentHeader, segment_id: u64) -> PersistenceResult<()> {
+    if header.segment_id != segment_id {
+        return Err(PersistenceError::Format(format!(
+            "WAL segment_id mismatch (filename={segment_id}, header={})",
+            header.segment_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_next_entry_id(prev: Option<u64>, entry_id: u64) -> PersistenceResult<()> {
+    if let Some(prev) = prev {
+        let expected = prev.checked_add(1).ok_or_else(|| {
+            PersistenceError::Format(format!("WAL entry_id overflow after {prev}"))
+        })?;
+        if entry_id != expected {
+            return Err(PersistenceError::Format(format!(
+                "WAL entry_id gap or reorder (prev={prev}, expected={expected}, got={entry_id})"
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -635,8 +688,8 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
     /// Append multiple entries atomically (single flush).
     ///
     /// All entries are buffered and written together, then flushed once.
-    /// This amortizes the cost of `flush()` across multiple entries --
-    /// the same benefit as group commit, without thread coordination.
+    /// This amortizes the cost of `flush()` across multiple entries without
+    /// thread coordination.
     ///
     /// Returns the entry IDs assigned to each entry (in order).
     /// If any entry fails to encode, no entries are written.
@@ -695,14 +748,40 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
     /// If no `wal/` files exist, this is equivalent to `WalWriter::new`.
     /// If the last segment has a **torn tail record**, this function repairs it by
     /// truncating the file back to the last valid record boundary, then continues.
+    ///
+    /// This respects the active-writer lock. If a prior process crashed while
+    /// holding `wal/.lock`, remove the stale lock yourself or use
+    /// [`WalWriter::resume_after_crash`].
     pub fn resume(directory: impl Into<Arc<dyn Directory>>) -> PersistenceResult<Self> {
         let directory: Arc<dyn Directory> = directory.into();
+        Self::resume_inner(directory, false)
+    }
+
+    /// Resume after a known writer crash by removing `wal/.lock` first.
+    ///
+    /// Only call this when the process that held the writer is known to be gone.
+    /// Calling it against a live writer defeats the advisory single-writer guard.
+    pub fn resume_after_crash(directory: impl Into<Arc<dyn Directory>>) -> PersistenceResult<Self> {
+        let directory: Arc<dyn Directory> = directory.into();
+        Self::resume_inner(directory, true)
+    }
+
+    fn resume_inner(
+        directory: Arc<dyn Directory>,
+        remove_stale_lock: bool,
+    ) -> PersistenceResult<Self> {
+        if remove_stale_lock {
+            let _ = directory.delete("wal/.lock");
+        }
 
         let wal_segments = enumerate_wal_segments(&*directory)?;
 
         if wal_segments.is_empty() {
             return Ok(Self::new(directory));
         }
+
+        let mut w = Self::with_options(directory.clone(), FlushPolicy::EveryN(64), 64 * 1024);
+        w.acquire_wal_lock()?;
 
         let mut last_entry_id: u64 = 0;
         let mut last_seen_entry_id: Option<u64> = None;
@@ -717,7 +796,7 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
                 f.read_to_end(&mut bytes)?;
 
                 let (valid_len, last_in_file) =
-                    scan_last_segment_prefix(&bytes, last_seen_entry_id)?;
+                    scan_last_segment_prefix(&bytes, last_seen_entry_id, *segment_id)?;
 
                 if valid_len < bytes.len() {
                     directory.atomic_write(&wal_path, &bytes[..valid_len])?;
@@ -728,13 +807,6 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
                     last_entry_id = id;
                 }
 
-                let mut w =
-                    Self::with_options(directory.clone(), FlushPolicy::EveryN(64), 64 * 1024);
-                // resume() is the crash-recovery path -- clean up any stale lockfile
-                // from a prior crash, then acquire a fresh one.
-                let _ = directory.delete("wal/.lock");
-                let _ = directory.atomic_write("wal/.lock", b"locked");
-                w.holds_lock = true;
                 w.wal_dir_ready = true;
                 w.current_segment_id = *segment_id;
                 w.current_entry_id = last_entry_id.saturating_add(1).max(1);
@@ -747,17 +819,12 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
             }
 
             // Non-last segment: decode strictly and track monotone entry_id.
-            let _h = WalSegmentHeader::read(&mut f)?;
+            let header = WalSegmentHeader::read(&mut f)?;
+            validate_header_segment_id(header, *segment_id)?;
             while let Some((entry_id, _payload)) =
                 WalEntryOnDisk::decode_raw(&mut f, WalReplayMode::Strict)?
             {
-                if let Some(prev) = last_seen_entry_id {
-                    if entry_id <= prev {
-                        return Err(PersistenceError::Format(format!(
-                            "WAL entry_id is not strictly increasing (prev={prev}, got={entry_id})"
-                        )));
-                    }
-                }
+                validate_next_entry_id(last_seen_entry_id, entry_id)?;
                 last_seen_entry_id = Some(entry_id);
                 last_entry_id = entry_id;
             }
@@ -768,43 +835,48 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
         ))
     }
 
-    fn ensure_wal_dir(&mut self) -> PersistenceResult<()> {
-        if !self.wal_dir_ready {
-            self.directory.create_dir_all("wal")?;
-            // Advisory lockfile: catch accidental double-instantiation.
-            // Use O_CREAT|O_EXCL (create_new) on real filesystems for atomic acquire.
-            // Falls back to exists()+write() for non-filesystem backends (e.g. MemoryDirectory).
-            if let Some(lock_fs_path) = self.directory.file_path("wal/.lock") {
-                if let Some(parent) = lock_fs_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                match std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&lock_fs_path)
-                {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        return Err(PersistenceError::InvalidState(
-                            "WAL lockfile wal/.lock exists; another WalWriter may be active. \
-                             Remove the lockfile manually if this is a stale lock from a crash."
-                                .into(),
-                        ));
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            } else {
-                // Non-filesystem backend: best-effort TOCTOU check.
-                if self.directory.exists("wal/.lock") {
+    fn acquire_wal_lock(&mut self) -> PersistenceResult<()> {
+        self.directory.create_dir_all("wal")?;
+        // Advisory lockfile: catch accidental double-instantiation.
+        // Use O_CREAT|O_EXCL (create_new) on real filesystems for atomic acquire.
+        // Falls back to exists()+write() for non-filesystem backends (e.g. MemoryDirectory).
+        if let Some(lock_fs_path) = self.directory.file_path("wal/.lock") {
+            if let Some(parent) = lock_fs_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_fs_path)
+            {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     return Err(PersistenceError::InvalidState(
                         "WAL lockfile wal/.lock exists; another WalWriter may be active. \
                          Remove the lockfile manually if this is a stale lock from a crash."
                             .into(),
                     ));
                 }
-                let _ = self.directory.atomic_write("wal/.lock", b"locked");
+                Err(e) => return Err(e.into()),
             }
-            self.holds_lock = true;
+        } else {
+            // Non-filesystem backend: best-effort TOCTOU check.
+            if self.directory.exists("wal/.lock") {
+                return Err(PersistenceError::InvalidState(
+                    "WAL lockfile wal/.lock exists; another WalWriter may be active. \
+                     Remove the lockfile manually if this is a stale lock from a crash."
+                        .into(),
+                ));
+            }
+            self.directory.atomic_write("wal/.lock", b"locked")?;
+        }
+        self.holds_lock = true;
+        Ok(())
+    }
+
+    fn ensure_wal_dir(&mut self) -> PersistenceResult<()> {
+        if !self.wal_dir_ready {
+            self.acquire_wal_lock()?;
             // Safety: prevent silent entry-id collision when called via new() on existing WAL
             if self.current_entry_id == 1 && self.current_segment_id == 1 {
                 let existing = enumerate_wal_segments(&*self.directory)?;
@@ -829,7 +901,7 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
         if self.current_offset == 0 {
             // Try to reuse a recycled segment file.
             if let Some(recycled) = self.recycle_pool.pop_front() {
-                let _ = self.directory.atomic_rename(&recycled, &wal_path);
+                self.directory.atomic_rename(&recycled, &wal_path)?;
             }
             let mut file = self.directory.create_file(&wal_path)?;
             WalSegmentHeader {
@@ -1038,6 +1110,7 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
 fn scan_last_segment_prefix(
     bytes: &[u8],
     last_seen_entry_id: Option<u64>,
+    segment_id: u64,
 ) -> PersistenceResult<(usize, Option<u64>)> {
     if bytes.len() < WalSegmentHeader::SIZE {
         return Ok((0, None));
@@ -1051,6 +1124,7 @@ fn scan_last_segment_prefix(
         }
         Err(e) => return Err(e),
     };
+    validate_header_segment_id(header, segment_id)?;
 
     let mut first_entry_id_in_segment: Option<u64> = None;
     let mut last_id = last_seen_entry_id;
@@ -1062,13 +1136,7 @@ fn scan_last_segment_prefix(
                 if first_entry_id_in_segment.is_none() {
                     first_entry_id_in_segment = Some(entry_id);
                 }
-                if let Some(prev) = last_id {
-                    if entry_id <= prev {
-                        return Err(PersistenceError::Format(format!(
-                            "WAL entry_id is not strictly increasing (prev={prev}, got={entry_id})"
-                        )));
-                    }
-                }
+                validate_next_entry_id(last_id, entry_id)?;
                 last_id = Some(entry_id);
             }
             None => {
@@ -1230,6 +1298,7 @@ impl<E: serde::de::DeserializeOwned> WalReader<E> {
                 }
                 Err(e) => return Err(e),
             };
+            validate_header_segment_id(header, segment_id)?;
 
             let mut first_entry_id_in_segment: Option<u64> = None;
 
@@ -1248,14 +1317,7 @@ impl<E: serde::de::DeserializeOwned> WalReader<E> {
                 if first_entry_id_in_segment.is_none() {
                     first_entry_id_in_segment = Some(record.entry_id);
                 }
-                if let Some(prev) = last_seen_entry_id {
-                    if record.entry_id <= prev {
-                        return Err(PersistenceError::Format(format!(
-                            "WAL entry_id is not strictly increasing (prev={prev}, got={})",
-                            record.entry_id
-                        )));
-                    }
-                }
+                validate_next_entry_id(last_seen_entry_id, record.entry_id)?;
                 last_seen_entry_id = Some(record.entry_id);
                 apply(record)?;
                 count += 1;
@@ -1310,18 +1372,22 @@ impl WalMaintenance {
         let wal_segments = enumerate_wal_segments(&*self.directory)?;
 
         let mut out = Vec::new();
+        let mut last_seen_entry_id: Option<u64> = None;
         for (segment_id, wal_file) in wal_segments {
             let path = format!("wal/{wal_file}");
             let mut f = self.directory.open_file(&path)?;
             let header = WalSegmentHeader::read(&mut f)?;
+            validate_header_segment_id(header, segment_id)?;
             let mut end: Option<u64> = None;
             let mut first: Option<u64> = None;
             while let Some((entry_id, _payload)) =
                 WalEntryOnDisk::decode_raw(&mut f, WalReplayMode::Strict)?
             {
+                validate_next_entry_id(last_seen_entry_id, entry_id)?;
                 if first.is_none() {
                     first = Some(entry_id);
                 }
+                last_seen_entry_id = Some(entry_id);
                 end = Some(entry_id);
             }
             if let Some(first_id) = first {
@@ -1390,7 +1456,9 @@ impl WalMaintenance {
             if end <= last_entry_id {
                 if let Some(obs) = observer {
                     if !obs.on_before_truncate(seg.segment_id, &seg.path) {
-                        continue; // observer vetoed deletion
+                        // Preserve the WAL as a contiguous suffix. If an earlier
+                        // segment is retained, later segments must remain too.
+                        break;
                     }
                 }
                 self.directory.delete(&seg.path)?;
@@ -1412,17 +1480,15 @@ const _: () = {
 };
 
 // ---------------------------------------------------------------------------
-// SyncWalWriter (thread-safe wrapper with group commit)
+// SyncWalWriter (thread-safe wrapper)
 // ---------------------------------------------------------------------------
 
-/// Thread-safe WAL writer with implicit group commit.
+/// Thread-safe WAL writer.
 ///
 /// Wraps a [`WalWriter`] in a `Mutex`, allowing multiple threads to append
-/// concurrently. The group commit benefit arises naturally: while one thread
-/// holds the lock for `flush_and_sync`, other threads' appends queue behind
-/// the mutex. When the sync-holding thread releases the lock, the next thread
-/// to call `flush_and_sync` covers all entries appended in the interim with
-/// a single `fdatasync`.
+/// concurrently. Durable operations are serialized through the same mutex:
+/// [`append_durable`](Self::append_durable) appends one entry, then syncs the
+/// writer if that entry is newer than the last synced entry.
 ///
 /// # Example
 ///
@@ -1470,6 +1536,13 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> SyncWalWriter<E> {
         Ok(Self::from_writer(WalWriter::resume(directory)?))
     }
 
+    /// Resume after a known writer crash by removing `wal/.lock` first.
+    ///
+    /// Only call this when the process that held the writer is known to be gone.
+    pub fn resume_after_crash(directory: impl Into<Arc<dyn Directory>>) -> PersistenceResult<Self> {
+        Ok(Self::from_writer(WalWriter::resume_after_crash(directory)?))
+    }
+
     /// Wrap an existing `WalWriter`.
     pub fn from_writer(writer: WalWriter<E>) -> Self {
         let last = writer.last_entry_id().unwrap_or(0);
@@ -1508,8 +1581,9 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> SyncWalWriter<E> {
 
     /// Append an entry and wait until it is durable on stable storage.
     ///
-    /// This is the group-commit entry point: if another thread recently synced
-    /// past our entry's ID, we skip the redundant sync.
+    /// If another thread previously synced past this entry's ID, skip the
+    /// redundant sync. With the current mutex-based writer this mainly covers
+    /// entries appended before this call, not a concurrent write barrier.
     pub fn append_durable(&self, entry: &E) -> PersistenceResult<u64> {
         let mut state = self
             .state
@@ -1777,7 +1851,44 @@ mod tests {
         );
         write_wal_segment(
             &dir,
-            2,
+            9,
+            9,
+            &[(
+                9,
+                WalEntry::AddSegment {
+                    segment_id: 9,
+                    doc_count: 1,
+                },
+            )],
+        );
+
+        let r = WalReader::<WalEntry>::new(dir);
+        let records = r.replay().unwrap();
+        assert_eq!(records.len(), 2);
+
+        let ids: Vec<u64> = records.iter().map(|r| r.entry_id).collect();
+        assert_eq!(ids, vec![9, 10]);
+    }
+
+    #[test]
+    fn wal_reader_rejects_internal_segment_gap() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+
+        write_wal_segment(
+            &dir,
+            1,
+            1,
+            &[(
+                1,
+                WalEntry::AddSegment {
+                    segment_id: 1,
+                    doc_count: 1,
+                },
+            )],
+        );
+        write_wal_segment(
+            &dir,
+            3,
             2,
             &[(
                 2,
@@ -1789,11 +1900,109 @@ mod tests {
         );
 
         let r = WalReader::<WalEntry>::new(dir);
-        let records = r.replay().unwrap();
-        assert_eq!(records.len(), 2);
+        let err = r.replay().unwrap_err();
+        assert!(err.to_string().contains("segment id gap"));
+    }
 
-        let ids: Vec<u64> = records.iter().map(|r| r.entry_id).collect();
-        assert_eq!(ids, vec![2, 10]);
+    #[test]
+    fn wal_segment_sequence_rejects_duplicate_max_without_panic() {
+        let err = validate_wal_segment_sequence(&[
+            (u64::MAX, "wal_18446744073709551615.log".to_string()),
+            (u64::MAX, "wal_18446744073709551615-copy.log".to_string()),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("duplicate WAL segment id"));
+    }
+
+    #[test]
+    fn wal_reader_rejects_filename_header_segment_mismatch() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+
+        write_wal_segment(
+            &dir,
+            2,
+            1,
+            &[(
+                1,
+                WalEntry::AddSegment {
+                    segment_id: 1,
+                    doc_count: 1,
+                },
+            )],
+        );
+        dir.atomic_rename("wal/wal_2.log", "wal/wal_1.log").unwrap();
+
+        let r = WalReader::<WalEntry>::new(dir);
+        let err = r.replay().unwrap_err();
+        assert!(err.to_string().contains("segment_id mismatch"));
+    }
+
+    #[test]
+    fn wal_reader_rejects_entry_id_gap_across_segments() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+
+        write_wal_segment(
+            &dir,
+            1,
+            1,
+            &[(
+                1,
+                WalEntry::AddSegment {
+                    segment_id: 1,
+                    doc_count: 1,
+                },
+            )],
+        );
+        write_wal_segment(
+            &dir,
+            2,
+            3,
+            &[(
+                3,
+                WalEntry::AddSegment {
+                    segment_id: 3,
+                    doc_count: 1,
+                },
+            )],
+        );
+
+        let r = WalReader::<WalEntry>::new(dir);
+        let err = r.replay().unwrap_err();
+        assert!(err.to_string().contains("entry_id gap"));
+    }
+
+    #[test]
+    fn wal_reader_rejects_entry_id_overflow_without_panic() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+
+        write_wal_segment(
+            &dir,
+            1,
+            u64::MAX,
+            &[(
+                u64::MAX,
+                WalEntry::AddSegment {
+                    segment_id: u64::MAX,
+                    doc_count: 1,
+                },
+            )],
+        );
+        write_wal_segment(
+            &dir,
+            2,
+            0,
+            &[(
+                0,
+                WalEntry::AddSegment {
+                    segment_id: 0,
+                    doc_count: 1,
+                },
+            )],
+        );
+
+        let r = WalReader::<WalEntry>::new(dir);
+        let err = r.replay().unwrap_err();
+        assert!(err.to_string().contains("entry_id overflow"));
     }
 
     #[test]
@@ -2457,8 +2666,10 @@ mod tests {
             after.iter().any(|s| s.segment_id == 1),
             "segment 1 should be retained by observer"
         );
-        // But other eligible segments should be deleted.
-        assert!(deleted > 0, "should have deleted some segments");
+        // Later segments stay too; deleting around a retained segment would
+        // create an internal WAL hole.
+        assert_eq!(deleted, 0);
+        assert_eq!(after.len(), ranges.len());
     }
 
     #[test]
@@ -2658,7 +2869,7 @@ mod tests {
             .unwrap();
         assert_eq!(id, 1);
 
-        // Second durable append with the same sync epoch should still work.
+        // A second durable append should sync its own entry and still replay.
         let id2 = sw
             .append_durable(&WalEntry::AddSegment {
                 segment_id: 2,
@@ -2728,6 +2939,36 @@ mod tests {
     }
 
     #[test]
+    fn sync_wal_writer_resume_after_crash() {
+        let dir = MemoryDirectory::arc();
+
+        {
+            let sw = SyncWalWriter::<WalEntry>::open(dir.clone()).unwrap();
+            sw.append(&WalEntry::AddSegment {
+                segment_id: 1,
+                doc_count: 1,
+            })
+            .unwrap();
+            sw.flush().unwrap();
+        }
+
+        dir.atomic_write("wal/.lock", b"stale").unwrap();
+        let sw = SyncWalWriter::<WalEntry>::resume_after_crash(dir.clone()).unwrap();
+        let id = sw
+            .append(&WalEntry::AddSegment {
+                segment_id: 2,
+                doc_count: 2,
+            })
+            .unwrap();
+        assert_eq!(id, 2);
+        sw.flush().unwrap();
+        drop(sw);
+
+        let records = WalReader::<WalEntry>::new(dir).replay().unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
     fn sync_wal_writer_append_batch() {
         let dir = MemoryDirectory::arc();
         let sw = SyncWalWriter::<WalEntry>::open(dir.clone()).unwrap();
@@ -2769,7 +3010,7 @@ mod tests {
                 .unwrap();
             }
         }));
-        // Thread 2: append_durable (syncs for everyone)
+        // Thread 2: durable appends interleaved with non-durable appends.
         let sw2 = sw.clone();
         handles.push(std::thread::spawn(move || {
             for i in 0..10u64 {
@@ -2842,6 +3083,23 @@ mod tests {
     }
 
     #[test]
+    fn wal_recycled_missing_path_errors_instead_of_silent_fallback() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let mut w =
+            WalWriter::<WalEntry>::with_options(dir, crate::storage::FlushPolicy::PerAppend, 0);
+        w.set_recycle_capacity(1);
+        w.recycle_segment("wal/missing.log".to_string());
+
+        let err = w
+            .append(&WalEntry::AddSegment {
+                segment_id: 1,
+                doc_count: 1,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
     fn wal_lockfile_prevents_double_writer() {
         let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
 
@@ -2865,9 +3123,16 @@ mod tests {
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("lockfile"));
 
-        // Drop first writer, then second should work via resume
+        let err = match WalWriter::<WalEntry>::resume(dir.clone()) {
+            Ok(_) => panic!("resume should reject a live lockfile"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("lockfile"));
+
+        // Drop first writer, leave a stale lock, then explicit crash resume works.
         drop(w1);
-        let mut w3 = WalWriter::<WalEntry>::resume(dir.clone()).unwrap();
+        dir.atomic_write("wal/.lock", b"stale").unwrap();
+        let mut w3 = WalWriter::<WalEntry>::resume_after_crash(dir.clone()).unwrap();
         let id = w3
             .append(&WalEntry::AddSegment {
                 segment_id: 2,

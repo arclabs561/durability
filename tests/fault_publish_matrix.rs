@@ -46,7 +46,8 @@ fn run_case(fp: FailPoint) {
         .unwrap();
     wal.flush_and_sync().unwrap();
 
-    // Resume so marker append uses append_file path.
+    // Restart so marker append uses append_file path.
+    drop(wal);
     let mut wal = WalWriter::<WalEntry>::resume(dir.clone()).unwrap();
     // Force the checkpoint marker into a *new* segment so truncation has a prefix
     // segment it can delete (segment 1 end_entry_id == checkpoint_last_entry_id).

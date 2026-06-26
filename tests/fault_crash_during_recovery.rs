@@ -40,9 +40,8 @@ fn crash_during_resume_repair_is_recoverable() {
     let _ = fs.delete("wal/.lock");
 
     // Step 3: resume() with failures during the repair phase.
-    // resume() reads the segment, scans for valid prefix, then calls
-    // atomic_write() to truncate the file, plus lockfile ops (delete + atomic_write).
-    // These are the only write ops in resume().
+    // resume() acquires the lock, reads the segment, scans for a valid prefix,
+    // then calls atomic_write() to truncate the file.
     //
     // First, do a counting run to find how many write ops resume uses.
     {

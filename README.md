@@ -40,8 +40,8 @@ assert_eq!(records[0].entry_id, 1);
 ## Thread-safe writer
 
 `SyncWalWriter` wraps a `WalWriter` in a `Mutex` for concurrent access.
-`append_durable` provides group commit semantics -- concurrent callers share
-a single fsync:
+`append_durable` appends one entry and syncs it to stable storage while holding
+that mutex:
 
 ```rust
 use durability::storage::FsDirectory;
@@ -52,7 +52,6 @@ use std::sync::Arc;
 let dir = FsDirectory::arc("/tmp/wal-demo").unwrap();
 let sw = Arc::new(SyncWalWriter::<Op>::open(dir).unwrap());
 
-// Each thread calls append_durable; fsync is batched across callers.
 let sw2 = sw.clone();
 std::thread::spawn(move || {
     sw2.append_durable(&Op::Set("hello".into())).unwrap();

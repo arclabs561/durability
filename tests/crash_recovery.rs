@@ -49,9 +49,15 @@ fn truncation_at_every_offset_recovers_clean_prefix() {
         };
 
         max_recovered = max_recovered.max(recovered.len());
-        assert!(recovered.len() <= committed.len(), "recovered more than committed at len {len}");
+        assert!(
+            recovered.len() <= committed.len(),
+            "recovered more than committed at len {len}"
+        );
         for (i, r) in recovered.iter().enumerate() {
-            assert_eq!(r, &committed[i], "record {i} corrupted at truncation len {len}");
+            assert_eq!(
+                r, &committed[i],
+                "record {i} corrupted at truncation len {len}"
+            );
         }
     }
 
