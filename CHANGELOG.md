@@ -5,6 +5,17 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.7] - 2026-06-26
+
+### Fixed
+- Stopped point-in-time generic recovery before the requested entry ceiling, so
+  corrupt or oversized WAL payloads after the cutoff are ignored.
+
+### Changed
+- Hardened WAL recovery tests for checkpoint replay boundaries, payload-size
+  limits, non-WAL directory entries, and bounded recovery fuzzing.
+- Added a tracked WAL/recovery hardening roadmap for the remaining release gates.
+
 ## [0.6.6] - 2026-06-26
 
 ### Added
