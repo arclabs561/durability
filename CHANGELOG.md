@@ -5,6 +5,20 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.6] - 2026-06-26
+
+### Added
+- `WalWriter::resume_after_crash` and `SyncWalWriter::resume_after_crash` for explicit stale-lock recovery.
+
+### Changed
+- `WalWriter::resume` now respects an existing `wal/.lock` instead of silently removing it.
+
+### Fixed
+- Reject WAL segment holes, segment header mismatches, and entry ID gaps during replay, resume, and maintenance.
+- Preserve a contiguous WAL suffix when a truncation observer vetoes deletion.
+- Report missing recycled segment files instead of silently allocating a fresh segment.
+- Corrected `SyncWalWriter` documentation that described group-commit behavior it did not provide.
+
 ## [0.6.5] - 2026-06-12
 
 ### Added
