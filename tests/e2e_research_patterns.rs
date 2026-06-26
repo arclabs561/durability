@@ -3,7 +3,9 @@
 //! Patterns sourced from okaywal, growth-ring, and seglog.
 
 use durability::storage::{Directory, FlushPolicy, FsDirectory, MemoryDirectory};
-use durability::walog::{WalEntry, WalEntryOnDisk, WalReader, WalSegmentHeader, WalWriter};
+use durability::walog::{
+    WalEntry, WalEntryOnDisk, WalMaintenance, WalReader, WalSegmentHeader, WalWriter,
+};
 use std::io::Write;
 use std::sync::Arc;
 
@@ -107,6 +109,43 @@ fn all_zeros_payload_roundtrips_correctly() {
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].payload, ZeroPayload { a: 0, b: 0 });
     assert_eq!(records[1].payload, ZeroPayload { a: 0, b: 0 });
+}
+
+// ---------------------------------------------------------------------------
+// Pattern: Directory noise in recovery paths (from fjall macOS recovery tests)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wal_recovery_ignores_directory_noise() {
+    let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+
+    let mut w = WalWriter::<WalEntry>::new(dir.clone());
+    w.append(&WalEntry::AddSegment {
+        segment_id: 1,
+        doc_count: 1,
+    })
+    .unwrap();
+    w.flush().unwrap();
+    drop(w);
+
+    for path in [
+        "wal/.DS_Store",
+        "wal/._wal_2.log",
+        "wal/wal_foo.log",
+        "wal/wal_2.log.tmp",
+        "wal/wal_2.log.bak",
+        "wal/.lock",
+    ] {
+        dir.atomic_write(path, b"not a WAL segment").unwrap();
+    }
+
+    let records = WalReader::<WalEntry>::new(dir.clone()).replay().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].entry_id, 1);
+
+    let ranges = WalMaintenance::new(dir).segment_ranges_strict().unwrap();
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0].segment_id, 1);
 }
 
 // ---------------------------------------------------------------------------
