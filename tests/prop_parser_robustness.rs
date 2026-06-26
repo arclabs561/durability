@@ -13,6 +13,8 @@ use proptest::prelude::*;
 use std::io::Write;
 use std::sync::Arc;
 
+const MAX_WAL_ENTRY_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
 proptest! {
     #![proptest_config(ProptestConfig {
         failure_persistence: None,
@@ -51,4 +53,39 @@ fn recordlog_best_effort_never_panics_on_random_bytes_file() {
 
     let r = RecordLogReader::new(dir, "log.bin");
     let _ = r.read_all(RecordLogReadMode::BestEffort);
+}
+
+#[test]
+fn wal_entry_decode_rejects_payload_above_cap_before_reading_payload() {
+    let payload_len = MAX_WAL_ENTRY_PAYLOAD_BYTES + 1;
+    let length = 16u32 + payload_len as u32;
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&length.to_le_bytes());
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+
+    let mut cur = std::io::Cursor::new(bytes);
+    let err = WalEntryOnDisk::decode_raw(&mut cur, WalReplayMode::Strict).unwrap_err();
+    assert!(
+        err.to_string().contains("payload too large"),
+        "expected payload cap error, got: {err}"
+    );
+}
+
+#[test]
+fn wal_entry_decode_does_not_reject_cap_sized_payload_as_too_large() {
+    let length = 16u32 + MAX_WAL_ENTRY_PAYLOAD_BYTES as u32;
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&length.to_le_bytes());
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+
+    let mut cur = std::io::Cursor::new(bytes);
+    let err = WalEntryOnDisk::decode_raw(&mut cur, WalReplayMode::Strict).unwrap_err();
+    assert!(
+        !err.to_string().contains("payload too large"),
+        "exact cap-sized payload should not trip the oversize guard"
+    );
 }
