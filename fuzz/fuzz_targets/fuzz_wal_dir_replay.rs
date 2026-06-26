@@ -5,11 +5,11 @@ use durability::walog::{WalEntry, WalMaintenance, WalReader};
 use libfuzzer_sys::fuzz_target;
 use std::sync::Arc;
 
-/// Interpret input bytes as a bounded set of WAL segment blobs.
-///
-/// Layout (very simple, deterministic):
-/// - byte 0: n = number of segments (0..=15)
-/// - then n chunks: [len:u16 LE][len bytes of payload]
+// Interpret input bytes as a bounded set of WAL segment blobs.
+//
+// Layout (very simple, deterministic):
+// - byte 0: n = number of segments (0..=15)
+// - then n chunks: [len:u16 LE][len bytes of payload]
 fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
         return;
