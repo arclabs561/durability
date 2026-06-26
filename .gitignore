@@ -5,3 +5,4 @@ Cargo.lock
 /semver-checks/
 fuzz/artifacts/
 fuzz/corpus/
+mutants.out*/

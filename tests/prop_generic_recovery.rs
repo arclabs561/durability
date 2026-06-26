@@ -130,6 +130,32 @@ fn kv_op_strategy() -> impl Strategy<Value = KvOp> {
 
 // -- Property tests ----------------------------------------------------------
 
+#[test]
+fn recovery_from_checkpoint_skips_checkpointed_entry_id() {
+    let dir = MemoryDirectory::arc();
+    let mut w = WalWriter::<CounterOp>::new(dir.clone());
+    w.append(&CounterOp::Add(10)).unwrap();
+    w.append(&CounterOp::Add(1)).unwrap();
+    w.flush().unwrap();
+    drop(w);
+
+    let ckpt = CheckpointFile::new(dir.clone());
+    ckpt.write_postcard("counter.chk", 1, &CounterCheckpoint { value: 10 })
+        .unwrap();
+
+    let recovered = recover_with_wal::<CounterCheckpoint, CounterOp, _>(
+        &dir,
+        Some("counter.chk"),
+        RecoveryOptions::strict(),
+        counter_init,
+        counter_apply,
+    )
+    .unwrap();
+
+    assert_eq!(recovered.state, 11);
+    assert_eq!(recovered.last_entry_id, 2);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
