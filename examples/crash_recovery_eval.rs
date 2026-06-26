@@ -76,7 +76,10 @@ fn main() -> ExitCode {
         max_recovered = max_recovered.max(recovered.len());
         // Invariant: recovered is a clean prefix of the committed records.
         if recovered.len() > committed.len()
-            || recovered.iter().enumerate().any(|(i, r)| r != &committed[i])
+            || recovered
+                .iter()
+                .enumerate()
+                .any(|(i, r)| r != &committed[i])
         {
             violations += 1;
         }
