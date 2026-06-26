@@ -6,13 +6,24 @@
 
 mod support;
 
+use durability::checkpoint::CheckpointFile;
 use durability::publish::CheckpointPublisher;
-use durability::recover::RecoveryManager;
-use durability::storage::{Directory, FsDirectory};
+use durability::recover::{CheckpointSegment, CheckpointState, RecoveryManager};
+use durability::storage::{Directory, FlushPolicy, FsDirectory};
 use durability::walog::{WalEntry, WalReader, WalWriter};
 use std::sync::Arc;
 
 use support::FaultyDirectory;
+
+fn checkpoint_state(segment_id: u64, doc_count: u32, deleted_docs: Vec<u32>) -> CheckpointState {
+    CheckpointState {
+        segments: vec![CheckpointSegment {
+            segment_id,
+            doc_count,
+            deleted_docs,
+        }],
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailPoint {
@@ -132,4 +143,187 @@ fn publish_fault_matrix() {
     ] {
         run_case(fp);
     }
+}
+
+#[test]
+fn recover_latest_errors_when_committed_checkpoint_file_is_missing_after_truncate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir: Arc<dyn Directory> = Arc::new(FsDirectory::new(tmp.path()).unwrap());
+
+    let mut wal = WalWriter::<WalEntry>::new(dir.clone());
+    wal.append(&WalEntry::AddSegment {
+        segment_id: 1,
+        doc_count: 5,
+    })
+    .unwrap();
+    wal.append(&WalEntry::DeleteDocuments {
+        deletes: vec![(1, 4)],
+    })
+    .unwrap();
+    wal.flush_and_sync().unwrap();
+
+    drop(wal);
+    let mut wal = WalWriter::<WalEntry>::resume(dir.clone()).unwrap();
+    wal.set_segment_size_limit_bytes(1);
+
+    let mgr = RecoveryManager::new(dir.clone());
+    let before = mgr.recover(None).unwrap();
+    let ckpt_state = RecoveryManager::to_checkpoint_state(&before);
+    let last = before.last_entry_id;
+
+    let published = CheckpointPublisher::new(dir.clone())
+        .publish_checkpoint(&mut wal, &ckpt_state, last, "checkpoints/missing.chk")
+        .unwrap();
+    assert!(published.deleted_wal_segments >= 1);
+
+    dir.delete("checkpoints/missing.chk").unwrap();
+    assert!(!dir.exists("wal/wal_1.log"));
+
+    let err = mgr.recover_latest().unwrap_err();
+    assert!(err.to_string().contains("missing checkpoint"));
+}
+
+#[test]
+fn recover_latest_ignores_missing_checkpoint_marker_when_full_wal_remains() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir: Arc<dyn Directory> = Arc::new(FsDirectory::new(tmp.path()).unwrap());
+
+    let mut wal = WalWriter::<WalEntry>::new(dir.clone());
+    wal.append(&WalEntry::AddSegment {
+        segment_id: 1,
+        doc_count: 5,
+    })
+    .unwrap();
+    wal.append(&WalEntry::DeleteDocuments {
+        deletes: vec![(1, 4)],
+    })
+    .unwrap();
+    wal.append(&WalEntry::Checkpoint {
+        checkpoint_path: "checkpoints/missing.chk".to_string(),
+        last_entry_id: 2,
+    })
+    .unwrap();
+    wal.flush_and_sync().unwrap();
+    drop(wal);
+
+    let recovered = RecoveryManager::new(dir).recover_latest().unwrap();
+    assert_eq!(recovered.last_entry_id, 3);
+    let seg1 = recovered
+        .segments
+        .iter()
+        .find(|s| s.segment_id == 1)
+        .unwrap();
+    assert!(seg1.deleted_docs.contains(&4));
+}
+
+#[test]
+fn recover_latest_errors_when_wal_prefix_is_missing_without_usable_checkpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir: Arc<dyn Directory> = Arc::new(FsDirectory::new(tmp.path()).unwrap());
+
+    let mut wal = WalWriter::<WalEntry>::with_options(dir.clone(), FlushPolicy::PerAppend, 0);
+    wal.set_segment_size_limit_bytes(1);
+    for segment_id in 1..=3 {
+        wal.append(&WalEntry::AddSegment {
+            segment_id,
+            doc_count: 1,
+        })
+        .unwrap();
+    }
+    wal.flush_and_sync().unwrap();
+    drop(wal);
+
+    assert!(dir.exists("wal/wal_2.log"));
+    dir.delete("wal/wal_1.log").unwrap();
+
+    let err = RecoveryManager::new(dir).recover_latest().unwrap_err();
+    assert!(err.to_string().contains("WAL prefix is unavailable"));
+}
+
+#[test]
+fn recover_latest_uses_newest_existing_checkpoint_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir: Arc<dyn Directory> = Arc::new(FsDirectory::new(tmp.path()).unwrap());
+    let checkpoints = CheckpointFile::new(dir.clone());
+
+    let mut wal = WalWriter::<WalEntry>::new(dir.clone());
+    wal.append(&WalEntry::AddSegment {
+        segment_id: 1,
+        doc_count: 1,
+    })
+    .unwrap();
+    checkpoints
+        .write_postcard("checkpoints/older.chk", 1, &checkpoint_state(1, 10, vec![]))
+        .unwrap();
+    wal.append(&WalEntry::Checkpoint {
+        checkpoint_path: "checkpoints/older.chk".to_string(),
+        last_entry_id: 1,
+    })
+    .unwrap();
+    wal.append(&WalEntry::AddSegment {
+        segment_id: 1,
+        doc_count: 20,
+    })
+    .unwrap();
+    checkpoints
+        .write_postcard(
+            "checkpoints/newer.chk",
+            3,
+            &checkpoint_state(1, 30, vec![7]),
+        )
+        .unwrap();
+    wal.append(&WalEntry::Checkpoint {
+        checkpoint_path: "checkpoints/newer.chk".to_string(),
+        last_entry_id: 3,
+    })
+    .unwrap();
+    wal.flush_and_sync().unwrap();
+    drop(wal);
+
+    let recovered = RecoveryManager::new(dir).recover_latest().unwrap();
+    assert_eq!(recovered.last_entry_id, 4);
+    let seg1 = recovered
+        .segments
+        .iter()
+        .find(|s| s.segment_id == 1)
+        .unwrap();
+    assert_eq!(seg1.doc_count, 30);
+    assert!(seg1.deleted_docs.contains(&7));
+}
+
+#[test]
+fn recover_latest_reports_newest_missing_checkpoint_marker_after_truncate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir: Arc<dyn Directory> = Arc::new(FsDirectory::new(tmp.path()).unwrap());
+
+    let mut wal = WalWriter::<WalEntry>::with_options(dir.clone(), FlushPolicy::PerAppend, 0);
+    wal.set_segment_size_limit_bytes(1);
+    wal.append(&WalEntry::AddSegment {
+        segment_id: 1,
+        doc_count: 1,
+    })
+    .unwrap();
+    wal.append(&WalEntry::Checkpoint {
+        checkpoint_path: "checkpoints/older-missing.chk".to_string(),
+        last_entry_id: 1,
+    })
+    .unwrap();
+    wal.append(&WalEntry::AddSegment {
+        segment_id: 2,
+        doc_count: 1,
+    })
+    .unwrap();
+    wal.append(&WalEntry::Checkpoint {
+        checkpoint_path: "checkpoints/newer-missing.chk".to_string(),
+        last_entry_id: 3,
+    })
+    .unwrap();
+    wal.flush_and_sync().unwrap();
+    drop(wal);
+
+    assert!(dir.exists("wal/wal_2.log"));
+    dir.delete("wal/wal_1.log").unwrap();
+
+    let err = RecoveryManager::new(dir).recover_latest().unwrap_err();
+    assert!(err.to_string().contains("newer-missing.chk"));
 }

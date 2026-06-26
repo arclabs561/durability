@@ -11,7 +11,7 @@
 //!   segment-index WALs using [`WalEntry`].
 
 use crate::checkpoint::CheckpointFile;
-use crate::error::PersistenceResult;
+use crate::error::{PersistenceError, PersistenceResult};
 use crate::storage::Directory;
 use crate::walog::{WalEntry, WalReader, WalReplayMode};
 use std::collections::{HashMap, HashSet};
@@ -259,23 +259,53 @@ impl RecoveryManager {
         } else {
             wal.replay()?
         };
+        let wal_starts_at_entry_one = records.first().map(|r| r.entry_id == 1).unwrap_or(true);
         let mut best: Option<(u64, String)> = None;
+        let mut latest_missing: Option<(u64, String, u64)> = None;
         for r in records {
             if let WalEntry::Checkpoint {
-                checkpoint_path, ..
+                checkpoint_path,
+                last_entry_id,
             } = r.payload
             {
                 let entry_id = r.entry_id;
-                match &best {
-                    None => best = Some((entry_id, checkpoint_path)),
-                    Some((prev_id, _)) if entry_id > *prev_id => {
-                        best = Some((entry_id, checkpoint_path))
+                if self.directory.exists(&checkpoint_path) {
+                    match &best {
+                        None => best = Some((entry_id, checkpoint_path)),
+                        Some((prev_id, _)) if entry_id > *prev_id => {
+                            best = Some((entry_id, checkpoint_path))
+                        }
+                        _ => {}
                     }
-                    _ => {}
+                } else {
+                    match &latest_missing {
+                        None => latest_missing = Some((entry_id, checkpoint_path, last_entry_id)),
+                        Some((prev_id, _, _)) if entry_id > *prev_id => {
+                            latest_missing = Some((entry_id, checkpoint_path, last_entry_id))
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
-        Ok(best.map(|(_, p)| p))
+
+        if let Some((_, path)) = best {
+            return Ok(Some(path));
+        }
+
+        if let Some((marker_entry_id, path, checkpoint_last_entry_id)) = latest_missing {
+            if !wal_starts_at_entry_one {
+                return Err(PersistenceError::InvalidState(format!(
+                    "missing checkpoint {path} recorded by WAL entry {marker_entry_id}; WAL prefix through entry {checkpoint_last_entry_id} is unavailable"
+                )));
+            }
+        } else if !wal_starts_at_entry_one {
+            return Err(PersistenceError::InvalidState(
+                "WAL prefix is unavailable and no usable checkpoint marker was found".into(),
+            ));
+        }
+
+        Ok(None)
     }
 
     fn recover_with_options(
