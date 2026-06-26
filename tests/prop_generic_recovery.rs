@@ -6,10 +6,11 @@
 
 use durability::checkpoint::CheckpointFile;
 use durability::recover::{recover_with_wal, RecoveryOptions};
-use durability::storage::MemoryDirectory;
-use durability::walog::WalWriter;
+use durability::storage::{Directory, MemoryDirectory};
+use durability::walog::{WalReader, WalSegmentHeader, WalWriter};
 use proptest::prelude::*;
 use std::collections::BTreeMap;
+use std::io::Read;
 
 // -- Custom counter domain for property testing ------------------------------
 
@@ -72,6 +73,37 @@ fn kv_to_checkpoint(state: &BTreeMap<String, i64>) -> KvCheckpoint {
     KvCheckpoint {
         entries: state.iter().map(|(k, v)| (k.clone(), *v)).collect(),
     }
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
+    let b: [u8; 4] = bytes[offset..offset + 4].try_into().unwrap();
+    u32::from_le_bytes(b)
+}
+
+fn corrupt_payload_of_entry(
+    dir: &std::sync::Arc<dyn Directory>,
+    entry_index: usize,
+    flip_idx: usize,
+    flip_mask: u8,
+) {
+    let mut bytes = Vec::new();
+    dir.open_file("wal/wal_1.log")
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+
+    let mut frame = WalSegmentHeader::SIZE;
+    for _ in 1..entry_index {
+        let frame_len = read_u32_le(&bytes, frame) as usize;
+        frame += frame_len;
+    }
+
+    let frame_len = read_u32_le(&bytes, frame) as usize;
+    let payload_len = frame_len - 16;
+    let payload_idx = frame + 16 + (flip_idx % payload_len);
+    bytes[payload_idx] ^= flip_mask | 0x01;
+
+    dir.atomic_write("wal/wal_1.log", &bytes).unwrap();
 }
 
 // -- Strategies --------------------------------------------------------------
@@ -209,6 +241,43 @@ proptest! {
             "Point-in-time recovery at entry {} diverged from reference",
             cutoff);
         prop_assert_eq!(partial.last_entry_id, cutoff);
+    }
+
+    #[test]
+    fn point_in_time_ignores_corrupt_first_entry_after_cutoff(
+        ops in prop::collection::vec(kv_op_strategy(), 2..20),
+        cutoff_seed in any::<usize>(),
+        flip_idx in any::<usize>(),
+        flip_mask in any::<u8>(),
+    ) {
+        let cutoff = 1 + (cutoff_seed % (ops.len() - 1));
+
+        let dir = MemoryDirectory::arc();
+        let mut w = WalWriter::<KvOp>::new(dir.clone());
+        for op in &ops {
+            w.append(op).unwrap();
+        }
+        w.flush().unwrap();
+        drop(w);
+
+        corrupt_payload_of_entry(&dir, cutoff + 1, flip_idx, flip_mask);
+        prop_assert!(WalReader::<KvOp>::new(dir.clone()).replay().is_err());
+
+        let partial = recover_with_wal::<KvCheckpoint, KvOp, _>(
+            &dir,
+            None,
+            RecoveryOptions::up_to(cutoff as u64),
+            kv_init,
+            kv_apply,
+        ).unwrap();
+
+        let mut reference = BTreeMap::new();
+        for (i, op) in ops.iter().take(cutoff).enumerate() {
+            kv_apply(&mut reference, i as u64 + 1, op.clone());
+        }
+
+        prop_assert_eq!(partial.state, reference);
+        prop_assert_eq!(partial.last_entry_id, cutoff as u64);
     }
 
     /// Multiple checkpoints produce the same result as no checkpoints.

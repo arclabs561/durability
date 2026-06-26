@@ -5,14 +5,16 @@ use durability::storage::{Directory, MemoryDirectory};
 use libfuzzer_sys::fuzz_target;
 use std::sync::Arc;
 
-/// Feed random bytes as checkpoint file and WAL segments.
-/// Verify `recover_with_wal` never panics regardless of input.
-///
-/// Layout:
-/// - byte 0: flags (bit 0: has checkpoint, bit 1: best-effort mode)
-/// - if has checkpoint: [len:u16 LE][len bytes of checkpoint blob]
-/// - then n WAL segments: [len:u16 LE][len bytes of segment blob]
-///   (segments until input exhausted)
+// Feed random bytes as checkpoint file and WAL segments.
+// Verify `recover_with_wal` never panics regardless of input.
+//
+// Layout:
+// - byte 0: flags (bit 0: has checkpoint, bit 1: best-effort mode,
+//   bit 2: point-in-time ceiling)
+// - if point-in-time ceiling: byte cutoff (0..=31)
+// - if has checkpoint: [len:u16 LE][len bytes of checkpoint blob]
+// - then n WAL segments: [len:u16 LE][len bytes of segment blob]
+//   (segments until input exhausted)
 fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
         return;
@@ -21,9 +23,18 @@ fuzz_target!(|data: &[u8]| {
     let flags = data[0];
     let has_checkpoint = flags & 1 != 0;
     let best_effort = flags & 2 != 0;
+    let point_in_time = flags & 4 != 0;
     let mut i = 1usize;
 
     let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+
+    let cutoff = if point_in_time && i < data.len() {
+        let cutoff = (data[i] % 32) as u64;
+        i += 1;
+        Some(cutoff)
+    } else {
+        None
+    };
 
     // Write checkpoint blob if flagged.
     let ckpt_path = if has_checkpoint && i + 2 <= data.len() {
@@ -76,11 +87,12 @@ fuzz_target!(|data: &[u8]| {
         v: u64,
     }
 
-    let options = if best_effort {
+    let mut options = if best_effort {
         RecoveryOptions::best_effort()
     } else {
         RecoveryOptions::strict()
     };
+    options.up_to_entry_id = cutoff;
 
     // Must not panic.
     let _ = recover_with_wal::<FuzzCheckpoint, FuzzEntry, _>(
