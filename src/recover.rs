@@ -466,6 +466,41 @@ mod tests {
     }
 
     #[test]
+    fn recovery_end_merge_keeps_only_deletes_remapped_to_new_segment() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+
+        let mut wal = WalWriter::<WalEntry>::new(dir.clone());
+        wal.append(&WalEntry::AddSegment {
+            segment_id: 1,
+            doc_count: 10,
+        })
+        .unwrap();
+        wal.append(&WalEntry::AddSegment {
+            segment_id: 2,
+            doc_count: 20,
+        })
+        .unwrap();
+        wal.append(&WalEntry::EndMerge {
+            transaction_id: 7,
+            new_segment_id: 3,
+            old_segment_ids: vec![1, 2],
+            remapped_deletes: vec![(3, 4), (2, 99), (3, 8)],
+        })
+        .unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        let rec = RecoveryManager::new(dir).recover(None).unwrap();
+
+        assert_eq!(rec.segments.len(), 1);
+        assert_eq!(rec.segments[0].segment_id, 3);
+        assert_eq!(rec.segments[0].deleted_docs.len(), 2);
+        assert!(rec.segments[0].deleted_docs.contains(&4));
+        assert!(rec.segments[0].deleted_docs.contains(&8));
+        assert!(!rec.segments[0].deleted_docs.contains(&99));
+    }
+
+    #[test]
     fn recover_strict_errors_on_corrupt_checkpoint() {
         let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
 
