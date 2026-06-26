@@ -6,7 +6,8 @@
 use durability::checkpoint::CheckpointFile;
 use durability::recover::{recover_with_wal, RecoveryOptions};
 use durability::storage::{Directory, FsDirectory, MemoryDirectory};
-use durability::walog::WalWriter;
+use durability::walog::{WalReader, WalWriter};
+use std::io::Read;
 use std::sync::Arc;
 
 // -- Custom domain types (completely independent of WalEntry) ----------------
@@ -260,6 +261,55 @@ fn point_in_time_recovery_stops_at_entry() {
     assert_eq!(result.state.len(), 5);
     assert!(result.state.contains_key("k5"));
     assert!(!result.state.contains_key("k6"));
+}
+
+#[test]
+fn point_in_time_recovery_ignores_corruption_after_cutoff() {
+    let dir = MemoryDirectory::arc();
+
+    let mut w = WalWriter::<KvOp>::new(dir.clone());
+    for i in 1..=5u64 {
+        w.append(&KvOp::Put {
+            key: format!("k{i}"),
+            value: format!("v{i}"),
+        })
+        .unwrap();
+    }
+    w.flush().unwrap();
+    drop(w);
+
+    let mut bytes = Vec::new();
+    dir.open_file("wal/wal_1.log")
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    let mut fourth_frame = 24usize;
+    for _ in 0..3 {
+        let frame_len =
+            u32::from_le_bytes(bytes[fourth_frame..fourth_frame + 4].try_into().unwrap()) as usize;
+        fourth_frame += frame_len;
+    }
+    let frame_len =
+        u32::from_le_bytes(bytes[fourth_frame..fourth_frame + 4].try_into().unwrap()) as usize;
+    assert!(frame_len > 16);
+    bytes[fourth_frame + 16] ^= 0x55;
+    dir.atomic_write("wal/wal_1.log", &bytes).unwrap();
+
+    assert!(WalReader::<KvOp>::new(dir.clone()).replay().is_err());
+
+    let result = recover_with_wal::<KvCheckpoint, KvOp, _>(
+        &dir,
+        None,
+        RecoveryOptions::up_to(3),
+        kv_init,
+        kv_apply,
+    )
+    .unwrap();
+
+    assert_eq!(result.last_entry_id, 3);
+    assert_eq!(result.state.len(), 3);
+    assert!(result.state.contains_key("k3"));
+    assert!(!result.state.contains_key("k4"));
 }
 
 #[test]

@@ -257,6 +257,16 @@ impl WalSegmentHeader {
 #[doc(hidden)]
 pub struct WalEntryOnDisk;
 
+enum WalEntryDecode<E> {
+    Record(WalRecord<E>),
+    PastLimit { entry_id: u64 },
+}
+
+enum WalRawDecode {
+    Record { entry_id: u64, payload: Vec<u8> },
+    PastLimit { entry_id: u64 },
+}
+
 impl WalEntryOnDisk {
     fn read_u32_len<R: Read>(
         reader: &mut R,
@@ -326,6 +336,22 @@ impl WalEntryOnDisk {
         reader: &mut R,
         mode: WalReplayMode,
     ) -> PersistenceResult<Option<(u64, Vec<u8>)>> {
+        let Some(decoded) = Self::decode_raw_until(reader, mode, None)? else {
+            return Ok(None);
+        };
+        match decoded {
+            WalRawDecode::Record { entry_id, payload } => Ok(Some((entry_id, payload))),
+            WalRawDecode::PastLimit { .. } => {
+                unreachable!("decode_raw does not set an entry limit")
+            }
+        }
+    }
+
+    fn decode_raw_until<R: Read>(
+        reader: &mut R,
+        mode: WalReplayMode,
+        max_entry_id: Option<u64>,
+    ) -> PersistenceResult<Option<WalRawDecode>> {
         let Some(length) = Self::read_u32_len(reader, mode)? else {
             return Ok(None);
         };
@@ -343,6 +369,10 @@ impl WalEntryOnDisk {
                 Err(e) => return Err(e.into()),
             }
         };
+
+        if max_entry_id.is_some_and(|max| entry_id > max) {
+            return Ok(Some(WalRawDecode::PastLimit { entry_id }));
+        }
 
         let checksum = {
             let mut buf = [0u8; 4];
@@ -384,7 +414,7 @@ impl WalEntryOnDisk {
             });
         }
 
-        Ok(Some((entry_id, payload)))
+        Ok(Some(WalRawDecode::Record { entry_id, payload }))
     }
 
     /// Decode the next WAL entry and deserialize the payload.
@@ -401,6 +431,29 @@ impl WalEntryOnDisk {
             entry_id,
             payload: entry,
         }))
+    }
+
+    fn decode_until<E: serde::de::DeserializeOwned, R: Read>(
+        reader: &mut R,
+        mode: WalReplayMode,
+        max_entry_id: u64,
+    ) -> PersistenceResult<Option<WalEntryDecode<E>>> {
+        let Some(decoded) = Self::decode_raw_until(reader, mode, Some(max_entry_id))? else {
+            return Ok(None);
+        };
+        match decoded {
+            WalRawDecode::Record { entry_id, payload } => {
+                let entry: E = postcard::from_bytes(&payload)
+                    .map_err(|e| PersistenceError::Decode(e.to_string()))?;
+                Ok(Some(WalEntryDecode::Record(WalRecord {
+                    entry_id,
+                    payload: entry,
+                })))
+            }
+            WalRawDecode::PastLimit { entry_id } => {
+                Ok(Some(WalEntryDecode::PastLimit { entry_id }))
+            }
+        }
     }
 }
 
@@ -1209,7 +1262,7 @@ impl<E: serde::de::DeserializeOwned> WalReader<E> {
     /// Replay all WAL entries in sorted segment-id order.
     pub fn replay(&self) -> PersistenceResult<Vec<WalRecord<E>>> {
         let mut records = Vec::new();
-        self.replay_each_inner(WalReplayMode::Strict, |r| {
+        self.replay_each_inner(WalReplayMode::Strict, None, |r| {
             records.push(r);
             Ok(())
         })?;
@@ -1219,7 +1272,7 @@ impl<E: serde::de::DeserializeOwned> WalReader<E> {
     /// Best-effort replay: stop at first truncated tail record in the final segment.
     pub fn replay_best_effort(&self) -> PersistenceResult<Vec<WalRecord<E>>> {
         let mut records = Vec::new();
-        self.replay_each_inner(WalReplayMode::BestEffortTail, |r| {
+        self.replay_each_inner(WalReplayMode::BestEffortTail, None, |r| {
             records.push(r);
             Ok(())
         })?;
@@ -1235,7 +1288,7 @@ impl<E: serde::de::DeserializeOwned> WalReader<E> {
         &self,
         apply: impl FnMut(WalRecord<E>) -> PersistenceResult<()>,
     ) -> PersistenceResult<u64> {
-        self.replay_each_inner(WalReplayMode::Strict, apply)
+        self.replay_each_inner(WalReplayMode::Strict, None, apply)
     }
 
     /// Streaming best-effort replay: call `apply` for each WAL entry.
@@ -1246,7 +1299,7 @@ impl<E: serde::de::DeserializeOwned> WalReader<E> {
         &self,
         apply: impl FnMut(WalRecord<E>) -> PersistenceResult<()>,
     ) -> PersistenceResult<u64> {
-        self.replay_each_inner(WalReplayMode::BestEffortTail, apply)
+        self.replay_each_inner(WalReplayMode::BestEffortTail, None, apply)
     }
 
     /// Streaming replay with explicit mode selection.
@@ -1259,24 +1312,34 @@ impl<E: serde::de::DeserializeOwned> WalReader<E> {
         mode: WalReplayMode,
         apply: impl FnMut(WalRecord<E>) -> PersistenceResult<()>,
     ) -> PersistenceResult<u64> {
-        self.replay_each_inner(mode, apply)
+        self.replay_each_inner(mode, None, apply)
+    }
+
+    pub(crate) fn replay_each_with_mode_until(
+        &self,
+        mode: WalReplayMode,
+        max_entry_id: Option<u64>,
+        apply: impl FnMut(WalRecord<E>) -> PersistenceResult<()>,
+    ) -> PersistenceResult<u64> {
+        self.replay_each_inner(mode, max_entry_id, apply)
     }
 
     /// Count entries in the WAL without collecting them.
     ///
     /// Equivalent to `replay()?.len()` but avoids building the `Vec`.
     pub fn entry_count(&self) -> PersistenceResult<u64> {
-        self.replay_each_inner(WalReplayMode::Strict, |_| Ok(()))
+        self.replay_each_inner(WalReplayMode::Strict, None, |_| Ok(()))
     }
 
     /// Count entries (best-effort mode).
     pub fn entry_count_best_effort(&self) -> PersistenceResult<u64> {
-        self.replay_each_inner(WalReplayMode::BestEffortTail, |_| Ok(()))
+        self.replay_each_inner(WalReplayMode::BestEffortTail, None, |_| Ok(()))
     }
 
     fn replay_each_inner(
         &self,
         mode: WalReplayMode,
+        max_entry_id: Option<u64>,
         mut apply: impl FnMut(WalRecord<E>) -> PersistenceResult<()>,
     ) -> PersistenceResult<u64> {
         let wal_segments = enumerate_wal_segments(&*self.directory)?;
@@ -1313,14 +1376,42 @@ impl<E: serde::de::DeserializeOwned> WalReader<E> {
                 }
             };
 
-            while let Some(record) = WalEntryOnDisk::decode::<E, _>(&mut file, segment_mode)? {
-                if first_entry_id_in_segment.is_none() {
-                    first_entry_id_in_segment = Some(record.entry_id);
+            loop {
+                let decoded = match max_entry_id {
+                    Some(max) => {
+                        WalEntryOnDisk::decode_until::<E, _>(&mut file, segment_mode, max)?
+                    }
+                    None => WalEntryOnDisk::decode::<E, _>(&mut file, segment_mode)?
+                        .map(WalEntryDecode::Record),
+                };
+
+                match decoded {
+                    Some(WalEntryDecode::Record(record)) => {
+                        if first_entry_id_in_segment.is_none() {
+                            first_entry_id_in_segment = Some(record.entry_id);
+                        }
+                        validate_next_entry_id(last_seen_entry_id, record.entry_id)?;
+                        last_seen_entry_id = Some(record.entry_id);
+                        apply(record)?;
+                        count += 1;
+                    }
+                    Some(WalEntryDecode::PastLimit { entry_id }) => {
+                        if first_entry_id_in_segment.is_none() {
+                            first_entry_id_in_segment = Some(entry_id);
+                        }
+                        validate_next_entry_id(last_seen_entry_id, entry_id)?;
+                        if let Some(first_id) = first_entry_id_in_segment {
+                            if first_id != header.start_entry_id {
+                                return Err(PersistenceError::Format(format!(
+                                    "WAL segment start_entry_id mismatch (header={}, first_entry={})",
+                                    header.start_entry_id, first_id
+                                )));
+                            }
+                        }
+                        return Ok(count);
+                    }
+                    None => break,
                 }
-                validate_next_entry_id(last_seen_entry_id, record.entry_id)?;
-                last_seen_entry_id = Some(record.entry_id);
-                apply(record)?;
-                count += 1;
             }
 
             if let Some(first_id) = first_entry_id_in_segment {
