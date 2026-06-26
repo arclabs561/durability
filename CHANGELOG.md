@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.9] - 2026-06-26
+
 ### Fixed
 - Made latest-checkpoint recovery error instead of silently replaying an
   incomplete WAL suffix when checkpoint metadata is missing after WAL prefix
