@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `RecordLogWriter::flush_and_sync` now fsyncs the file's parent directory only
+  once (after the file is created), not on every record. The parent-dir fsync
+  makes the file name durable, and appends never change the directory entry, so
+  the per-record parent fsync added no durability and roughly doubled the per-op
+  sync cost under a per-record sync policy. Recovery semantics are unchanged.
+
 ## [0.6.10] - 2026-06-26
 
 ### Changed

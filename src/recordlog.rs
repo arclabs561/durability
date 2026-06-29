@@ -82,6 +82,12 @@ pub struct RecordLogWriter {
     write_buffer: Vec<u8>,
     write_buffer_limit: usize,
     last_flush_at: std::time::Instant,
+    /// Whether this writer has fsync'd the file's parent directory since creating
+    /// the file. The parent-dir fsync makes the file *name* durable and only needs
+    /// doing once: appends don't change the directory entry, so it is skipped on
+    /// later `flush_and_sync` calls (doing it per record roughly doubled the per-op
+    /// sync cost under a per-record sync policy).
+    parent_synced: bool,
 }
 
 impl RecordLogWriter {
@@ -124,6 +130,7 @@ impl RecordLogWriter {
             write_buffer: Vec::new(),
             write_buffer_limit: write_buffer_limit_bytes,
             last_flush_at: std::time::Instant::now(),
+            parent_synced: false,
         }
     }
 
@@ -199,7 +206,13 @@ impl RecordLogWriter {
     pub fn flush_and_sync(&mut self) -> PersistenceResult<()> {
         self.flush()?;
         storage::sync_file(&*self.dir, &self.path)?;
-        storage::sync_parent_dir(&*self.dir, &self.path)?;
+        // The file's directory entry only needs a parent-dir fsync once (after the
+        // file is created); appends never change the name, so syncing the parent on
+        // every record adds no durability and roughly doubles the per-op sync cost.
+        if !self.parent_synced {
+            storage::sync_parent_dir(&*self.dir, &self.path)?;
+            self.parent_synced = true;
+        }
         Ok(())
     }
 
@@ -625,5 +638,22 @@ mod tests {
         let xs: Vec<E> = r.read_all_postcard(RecordLogReadMode::Strict).unwrap();
         assert_eq!(xs.len(), 1);
         assert_eq!(xs[0].msg, "東京");
+    }
+
+    #[test]
+    fn recordlog_flush_and_sync_durable_across_many_appends() {
+        // The parent-dir fsync is done once (after creation), not per record. Many
+        // append + flush_and_sync cycles must still recover every record; the
+        // once-only parent sync must not drop durability of the file's name.
+        let tmp = tempfile::tempdir().unwrap();
+        let fs: Arc<dyn Directory> = Arc::new(FsDirectory::new(tmp.path()).unwrap());
+        let mut w = RecordLogWriter::new(fs.clone(), "log.bin");
+        for i in 0..20u32 {
+            w.append_postcard(&i).unwrap();
+            w.flush_and_sync().unwrap();
+        }
+        let r = RecordLogReader::new(fs, "log.bin");
+        let xs: Vec<u32> = r.read_all_postcard(RecordLogReadMode::Strict).unwrap();
+        assert_eq!(xs, (0..20u32).collect::<Vec<_>>());
     }
 }
