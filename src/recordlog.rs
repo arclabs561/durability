@@ -22,6 +22,10 @@
 //! This module supports both strict replay and best-effort replay.
 //! Best-effort replay is the common WAL posture used by systems like SQLite:
 //! scan forward validating checksums and stop at the first truncated tail record.
+//!
+//! The writer poisons itself after a write, flush, or sync failure. Once bytes
+//! may have reached the underlying file in an indeterminate state, subsequent
+//! appends return `InvalidState` instead of extending a possibly ambiguous log.
 
 use crate::error::{PersistenceError, PersistenceResult};
 use crate::formats::{FORMAT_VERSION, RECORDLOG_MAGIC};
@@ -82,6 +86,7 @@ pub struct RecordLogWriter {
     write_buffer: Vec<u8>,
     write_buffer_limit: usize,
     last_flush_at: std::time::Instant,
+    poisoned: bool,
     /// Whether this writer has fsync'd the file's parent directory since creating
     /// the file. The parent-dir fsync makes the file *name* durable and only needs
     /// doing once: appends don't change the directory entry, so it is skipped on
@@ -130,8 +135,25 @@ impl RecordLogWriter {
             write_buffer: Vec::new(),
             write_buffer_limit: write_buffer_limit_bytes,
             last_flush_at: std::time::Instant::now(),
+            poisoned: false,
             parent_synced: false,
         }
+    }
+
+    #[inline]
+    fn ensure_not_poisoned(&self) -> PersistenceResult<()> {
+        if self.poisoned {
+            return Err(PersistenceError::InvalidState(
+                "recordlog writer is poisoned after a prior write error".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn poison(&mut self) {
+        self.poisoned = true;
+        self.write_buffer.clear();
     }
 
     fn ensure_header(&mut self) -> PersistenceResult<()> {
@@ -158,10 +180,19 @@ impl RecordLogWriter {
         }
 
         let mut w = self.dir.create_file(&self.path)?;
-        w.write_all(&RECORDLOG_MAGIC)?;
-        w.write_all(&FORMAT_VERSION.to_le_bytes())?;
+        if let Err(e) = w.write_all(&RECORDLOG_MAGIC) {
+            self.poison();
+            return Err(e.into());
+        }
+        if let Err(e) = w.write_all(&FORMAT_VERSION.to_le_bytes()) {
+            self.poison();
+            return Err(e.into());
+        }
         if self.flush_policy == FlushPolicy::PerAppend {
-            w.flush()?;
+            if let Err(e) = w.flush() {
+                self.poison();
+                return Err(e.into());
+            }
         }
         self.header_checked = true;
         Ok(())
@@ -180,16 +211,27 @@ impl RecordLogWriter {
         }
         self.ensure_writer()?;
         let w = self.w.as_mut().expect("writer exists");
-        w.write_all(&self.write_buffer)?;
+        if let Err(e) = w.write_all(&self.write_buffer) {
+            self.poison();
+            return Err(e.into());
+        }
         self.write_buffer.clear();
         Ok(())
     }
 
     /// Flush the underlying writer (if one is open).
     pub fn flush(&mut self) -> PersistenceResult<()> {
+        self.ensure_not_poisoned()?;
+        self.flush_checked()
+    }
+
+    fn flush_checked(&mut self) -> PersistenceResult<()> {
         self.drain_buffer_to_writer()?;
         if let Some(w) = self.w.as_mut() {
-            w.flush()?;
+            if let Err(e) = w.flush() {
+                self.poison();
+                return Err(e.into());
+            }
         }
         self.since_flush = 0;
         self.last_flush_at = std::time::Instant::now();
@@ -204,13 +246,20 @@ impl RecordLogWriter {
     ///
     /// Returns `NotSupported` if the underlying `Directory` does not provide `file_path()`.
     pub fn flush_and_sync(&mut self) -> PersistenceResult<()> {
-        self.flush()?;
-        storage::sync_file(&*self.dir, &self.path)?;
+        self.ensure_not_poisoned()?;
+        self.flush_checked()?;
+        if let Err(e) = storage::sync_file(&*self.dir, &self.path) {
+            self.poison();
+            return Err(e);
+        }
         // The file's directory entry only needs a parent-dir fsync once (after the
         // file is created); appends never change the name, so syncing the parent on
         // every record adds no durability and roughly doubles the per-op sync cost.
         if !self.parent_synced {
-            storage::sync_parent_dir(&*self.dir, &self.path)?;
+            if let Err(e) = storage::sync_parent_dir(&*self.dir, &self.path) {
+                self.poison();
+                return Err(e);
+            }
             self.parent_synced = true;
         }
         Ok(())
@@ -218,6 +267,7 @@ impl RecordLogWriter {
 
     /// Append one record containing `payload`.
     pub fn append_bytes(&mut self, payload: &[u8]) -> PersistenceResult<()> {
+        self.ensure_not_poisoned()?;
         self.ensure_header()?;
         if payload.len() > usize::try_from(MAX_RECORD_BYTES).unwrap_or(usize::MAX) {
             return Err(PersistenceError::Format(format!(
@@ -247,19 +297,18 @@ impl RecordLogWriter {
         self.since_flush = self.since_flush.saturating_add(1);
         match self.flush_policy {
             FlushPolicy::PerAppend => {
-                self.flush()?;
-                self.since_flush = 0;
+                self.flush_checked()?;
             }
             FlushPolicy::EveryN(n) => {
                 // Note: guards don't participate in exhaustiveness checking; handle `n` here.
                 let n = n.max(1);
                 if self.since_flush >= n {
-                    self.flush()?;
+                    self.flush_checked()?;
                 }
             }
             FlushPolicy::Interval(d) => {
                 if self.last_flush_at.elapsed() >= d {
-                    self.flush()?;
+                    self.flush_checked()?;
                 }
             }
             FlushPolicy::Manual => {}
@@ -419,7 +468,136 @@ impl RecordLogReader {
 mod raw_tests {
     use super::*;
     use crate::storage::MemoryDirectory;
+    use std::io::{Read, Write};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[derive(Clone, Copy)]
+    enum FailOn {
+        Write,
+        Flush,
+    }
+
+    struct FailingWriterDir {
+        inner: Arc<dyn Directory>,
+        fail_next: Arc<AtomicBool>,
+        fail_on: FailOn,
+    }
+
+    impl FailingWriterDir {
+        fn wrap(&self, inner: Box<dyn Write + Send>) -> Box<dyn Write + Send> {
+            Box::new(FailingWriter {
+                inner,
+                fail_next: self.fail_next.clone(),
+                fail_on: self.fail_on,
+            })
+        }
+    }
+
+    impl Directory for FailingWriterDir {
+        fn create_file(&self, path: &str) -> PersistenceResult<Box<dyn Write + Send>> {
+            Ok(self.wrap(self.inner.create_file(path)?))
+        }
+
+        fn open_file(&self, path: &str) -> PersistenceResult<Box<dyn Read + Send>> {
+            self.inner.open_file(path)
+        }
+
+        fn exists(&self, path: &str) -> bool {
+            self.inner.exists(path)
+        }
+
+        fn delete(&self, path: &str) -> PersistenceResult<()> {
+            self.inner.delete(path)
+        }
+
+        fn atomic_rename(&self, from: &str, to: &str) -> PersistenceResult<()> {
+            self.inner.atomic_rename(from, to)
+        }
+
+        fn create_dir_all(&self, path: &str) -> PersistenceResult<()> {
+            self.inner.create_dir_all(path)
+        }
+
+        fn list_dir(&self, path: &str) -> PersistenceResult<Vec<String>> {
+            self.inner.list_dir(path)
+        }
+
+        fn append_file(&self, path: &str) -> PersistenceResult<Box<dyn Write + Send>> {
+            Ok(self.wrap(self.inner.append_file(path)?))
+        }
+
+        fn atomic_write(&self, path: &str, data: &[u8]) -> PersistenceResult<()> {
+            self.inner.atomic_write(path, data)
+        }
+
+        fn file_path(&self, path: &str) -> Option<PathBuf> {
+            self.inner.file_path(path)
+        }
+    }
+
+    struct FailingWriter {
+        inner: Box<dyn Write + Send>,
+        fail_next: Arc<AtomicBool>,
+        fail_on: FailOn,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if matches!(self.fail_on, FailOn::Write) && self.fail_next.swap(false, Ordering::SeqCst)
+            {
+                return Err(std::io::Error::other("injected write failure"));
+            }
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if matches!(self.fail_on, FailOn::Flush) && self.fail_next.swap(false, Ordering::SeqCst)
+            {
+                return Err(std::io::Error::other("injected flush failure"));
+            }
+            self.inner.flush()
+        }
+    }
+
+    fn existing_recordlog() -> Arc<dyn Directory> {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let mut w = RecordLogWriter::with_options(dir.clone(), "log.bin", FlushPolicy::Manual, 0);
+        w.append_bytes(b"seed").unwrap();
+        w.flush().unwrap();
+        dir
+    }
+
+    fn failing_writer_dir(inner: Arc<dyn Directory>, fail_on: FailOn) -> Arc<dyn Directory> {
+        Arc::new(FailingWriterDir {
+            inner,
+            fail_next: Arc::new(AtomicBool::new(true)),
+            fail_on,
+        })
+    }
+
+    fn assert_poisoned<T>(result: PersistenceResult<T>) {
+        match result {
+            Err(PersistenceError::InvalidState(msg)) => {
+                assert!(
+                    msg.contains("poisoned"),
+                    "expected poisoned error, got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected poisoned error, got: {other:?}"),
+            Ok(_) => panic!("expected poisoned error, got success"),
+        }
+    }
+
+    fn replay_payloads(dir: Arc<dyn Directory>) -> Vec<Vec<u8>> {
+        RecordLogReader::new(dir, "log.bin")
+            .read_all(RecordLogReadMode::Strict)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.payload)
+            .collect()
+    }
 
     #[test]
     fn recordlog_roundtrip_bytes() {
@@ -434,6 +612,61 @@ mod raw_tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].payload, b"one");
         assert_eq!(records[1].payload, b"two");
+    }
+
+    #[test]
+    fn recordlog_writer_poisons_after_write_failure() {
+        let base = existing_recordlog();
+        let dir = failing_writer_dir(base.clone(), FailOn::Write);
+        let mut w = RecordLogWriter::with_options(dir, "log.bin", FlushPolicy::Manual, 0);
+
+        let err = w.append_bytes(b"after").unwrap_err();
+        assert!(matches!(err, PersistenceError::Io(_)));
+        assert_poisoned(w.append_bytes(b"next"));
+        drop(w);
+
+        assert_eq!(
+            replay_payloads(base),
+            vec![b"seed".to_vec()],
+            "failed write does not leak the failed or post-poison records"
+        );
+    }
+
+    #[test]
+    fn recordlog_writer_poisons_after_flush_failure() {
+        let base = existing_recordlog();
+        let dir = failing_writer_dir(base.clone(), FailOn::Flush);
+        let mut w = RecordLogWriter::with_options(dir, "log.bin", FlushPolicy::Manual, 0);
+
+        w.append_bytes(b"after").unwrap();
+        let err = w.flush().unwrap_err();
+        assert!(matches!(err, PersistenceError::Io(_)));
+        assert_poisoned(w.append_bytes(b"next"));
+        drop(w);
+
+        assert_eq!(
+            replay_payloads(base),
+            vec![b"seed".to_vec(), b"after".to_vec()],
+            "flush failure poisons future writes without discarding an already written record"
+        );
+    }
+
+    #[test]
+    fn recordlog_writer_poisons_after_sync_failure() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let mut w = RecordLogWriter::new(dir.clone(), "log.bin");
+
+        w.append_bytes(b"before").unwrap();
+        let err = w.flush_and_sync().unwrap_err();
+        assert!(matches!(err, PersistenceError::NotSupported(_)));
+        assert_poisoned(w.append_bytes(b"next"));
+        drop(w);
+
+        assert_eq!(
+            replay_payloads(dir),
+            vec![b"before".to_vec()],
+            "sync failure poisons future writes without appending post-poison records"
+        );
     }
 }
 
