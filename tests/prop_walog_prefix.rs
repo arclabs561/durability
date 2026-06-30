@@ -1,6 +1,7 @@
 //! Property-based "fuzz-like" tests for `walog` replay semantics.
 //!
 //! Focus: multi-segment WALs + tail truncation handling.
+#![cfg(feature = "postcard")]
 
 use durability::formats::{WAL_FORMAT_VERSION, WAL_MAGIC};
 use durability::storage::{Directory, FsDirectory};

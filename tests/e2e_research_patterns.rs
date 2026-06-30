@@ -1,6 +1,7 @@
 //! Tests derived from WAL implementation research (2026-03-30).
 //!
 //! Patterns sourced from okaywal, growth-ring, and seglog.
+#![cfg(feature = "postcard")]
 
 use durability::storage::{Directory, FlushPolicy, FsDirectory, MemoryDirectory};
 use durability::walog::{

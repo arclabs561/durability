@@ -3,6 +3,7 @@
 //! Validates the reuse-seam invariant: recovery produces the same final state
 //! regardless of when checkpoints happen. Also validates point-in-time recovery
 //! produces a valid prefix of the full recovery.
+#![cfg(feature = "postcard")]
 
 use durability::checkpoint::CheckpointFile;
 use durability::recover::{recover_with_wal, RecoveryOptions};

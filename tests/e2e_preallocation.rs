@@ -1,4 +1,5 @@
 //! E2E tests for WAL segment preallocation.
+#![cfg(feature = "postcard")]
 
 use durability::storage::{Directory, FsDirectory};
 use durability::walog::{WalEntry, WalReader, WalWriter};

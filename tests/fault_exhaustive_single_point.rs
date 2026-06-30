@@ -4,6 +4,7 @@
 //! count total I/O operations, then iterate over ALL failure points.
 //! At each failure point, verify that best-effort recovery produces a valid
 //! prefix of the original entries.
+#![cfg(feature = "postcard")]
 
 mod support;
 

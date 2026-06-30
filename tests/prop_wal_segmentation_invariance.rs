@@ -2,6 +2,7 @@
 //!
 //! We build the same logical WAL stream under different segmentations and assert that
 //! strict replay yields identical entry sequences.
+#![cfg(feature = "postcard")]
 
 use durability::formats::{WAL_FORMAT_VERSION, WAL_MAGIC};
 use durability::storage::{Directory, FsDirectory};

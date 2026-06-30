@@ -1,4 +1,5 @@
 //! End-to-end test for crash-safe checkpoint publishing.
+#![cfg(feature = "postcard")]
 
 use durability::publish::CheckpointPublisher;
 use durability::recover::CheckpointState;

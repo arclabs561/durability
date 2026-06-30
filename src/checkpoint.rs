@@ -104,6 +104,8 @@ impl CheckpointHeader {
 /// # Example
 ///
 /// ```
+/// # #[cfg(feature = "postcard")]
+/// # {
 /// use durability::checkpoint::CheckpointFile;
 /// use durability::storage::MemoryDirectory;
 ///
@@ -117,6 +119,7 @@ impl CheckpointHeader {
 /// let (last_id, snap): (u64, Snapshot) = ckpt.read_postcard("snap.bin").unwrap();
 /// assert_eq!(last_id, 42);
 /// assert_eq!(snap, Snapshot { count: 7 });
+/// # }
 /// ```
 pub struct CheckpointFile {
     dir: Arc<dyn Directory>,

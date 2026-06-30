@@ -6,6 +6,7 @@
 //!
 //! In both cases, we publish+truncate and then assert `recover_latest()` matches
 //! the reference model.
+#![cfg(feature = "postcard")]
 
 use durability::publish::CheckpointPublisher;
 use durability::recover::RecoveryManager;

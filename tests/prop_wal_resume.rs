@@ -4,6 +4,7 @@
 //! - if the last segment is torn in the tail, strict replay fails
 //! - best-effort returns the valid prefix
 //! - `resume` repairs the tail, continues entry ids, and allows strict replay again
+#![cfg(feature = "postcard")]
 
 use durability::storage::{Directory, FsDirectory};
 use durability::walog::{WalEntry, WalReader, WalRecord, WalWriter};

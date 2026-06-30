@@ -2,6 +2,7 @@
 //!
 //! This is not an unbounded stress test. It's a deterministic, medium-sized run that
 //! catches lifecycle bugs: rotation, truncation, and recovery drift.
+#![cfg(feature = "postcard")]
 
 use durability::publish::CheckpointPublisher;
 use durability::recover::RecoveryManager;

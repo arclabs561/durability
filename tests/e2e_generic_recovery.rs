@@ -2,6 +2,7 @@
 //!
 //! These tests prove the generic recovery works with fully custom types
 //! (not WalEntry), validating the F3 generalization.
+#![cfg(feature = "postcard")]
 
 use durability::checkpoint::CheckpointFile;
 use durability::recover::{recover_with_wal, RecoveryOptions};

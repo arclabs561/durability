@@ -3,6 +3,7 @@
 //! We vary the failure point and assert the safety invariants:
 //! - no truncation unless the WAL checkpoint marker is durably recorded
 //! - failures never reduce recoverability (worst case: extra WAL remains)
+#![cfg(feature = "postcard")]
 
 mod support;
 

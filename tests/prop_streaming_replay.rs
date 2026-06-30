@@ -1,5 +1,6 @@
 //! Property test: streaming replay (replay_each) and batch replay (replay)
 //! must produce identical results for any sequence of entries.
+#![cfg(feature = "postcard")]
 
 use durability::storage::MemoryDirectory;
 use durability::walog::{WalEntry, WalReader, WalRecord, WalWriter};

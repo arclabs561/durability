@@ -3,6 +3,7 @@
 //! The important invariant is not just that recycled files can be reused, but
 //! that after the recycle pool has been consumed, replay and resume observe a
 //! clean contiguous WAL suffix with freshly-written recycled segment headers.
+#![cfg(feature = "postcard")]
 
 use durability::storage::{Directory, FlushPolicy, FsDirectory};
 use durability::walog::{WalEntry, WalMaintenance, WalReader, WalWriter};

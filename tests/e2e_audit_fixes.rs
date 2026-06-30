@@ -3,6 +3,7 @@
 //! C-1: decode_raw length<16 check moved before reading entry_id/checksum
 //! C-2: rotate_if_needed poisons writer on segment creation failure
 //! C-3: early-stop sentinel replaced with skip logic
+#![cfg(feature = "postcard")]
 
 use durability::error::{PersistenceError, PersistenceResult};
 use durability::recover::{recover_with_wal, RecoveryOptions};

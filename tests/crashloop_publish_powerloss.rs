@@ -17,6 +17,7 @@
 //!
 //! If you want additional coverage for IO errors (not crashes), see the existing fault-injection
 //! tests in `fault_publish_*`.
+#![cfg(feature = "postcard")]
 
 use durability::publish::CheckpointPublisher;
 use durability::recover::{RecoveredSegment, RecoveredState, RecoveryManager};

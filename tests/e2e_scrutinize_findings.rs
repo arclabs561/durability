@@ -2,6 +2,7 @@
 //!
 //! Each test validates a specific edge case or bug fix identified during
 //! implementation review.
+#![cfg(feature = "postcard")]
 
 use durability::storage::{Directory, FsDirectory, MemoryDirectory};
 use durability::walog::{WalEntry, WalReader, WalWriter};

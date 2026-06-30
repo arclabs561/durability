@@ -4,6 +4,7 @@
 //! - never panicking on junk input
 //! - rejecting corruption via explicit errors
 //! - maintaining allocation caps
+#![cfg(feature = "postcard")]
 
 use durability::checkpoint::CheckpointHeader;
 use durability::recordlog::{RecordLogReadMode, RecordLogReader};

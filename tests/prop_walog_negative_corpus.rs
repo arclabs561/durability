@@ -1,4 +1,5 @@
 //! Property-based negative tests for WAL: corruption in non-final segments must not be ignored.
+#![cfg(feature = "postcard")]
 
 use durability::formats::{WAL_FORMAT_VERSION, WAL_MAGIC};
 use durability::storage::{Directory, FsDirectory};

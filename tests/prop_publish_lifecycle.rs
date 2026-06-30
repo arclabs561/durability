@@ -4,6 +4,7 @@
 //! - checkpoint publish records a commit marker in the WAL
 //! - truncation never breaks recoverability (at worst leaves extra WAL segments)
 //! - recovery from checkpoint matches recovery from scratch after publish
+#![cfg(feature = "postcard")]
 
 use durability::publish::CheckpointPublisher;
 use durability::recover::{CheckpointSegment, CheckpointState};

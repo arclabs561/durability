@@ -2,6 +2,7 @@
 //!
 //! Strategy: write N entries to a WAL, arm the countdown so writes fail at
 //! various points, then verify recovery produces a valid prefix.
+#![cfg(feature = "postcard")]
 
 mod support;
 

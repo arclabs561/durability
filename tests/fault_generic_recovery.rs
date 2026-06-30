@@ -2,6 +2,7 @@
 //!
 //! Uses CountdownDirectory to simulate crashes at various points during
 //! WAL writes, then verifies recovery produces a valid prefix.
+#![cfg(feature = "postcard")]
 
 mod support;
 

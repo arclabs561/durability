@@ -5,6 +5,7 @@
 //! 2. Track a reference model of what should be durable after each flush.
 //! 3. At each "crash point" (drop without flush), verify that recovery
 //!    returns a prefix of the flushed entries.
+#![cfg(feature = "postcard")]
 
 use durability::storage::MemoryDirectory;
 use durability::walog::{WalEntry, WalReader, WalWriter};

@@ -2,6 +2,7 @@
 //!
 //! WAL segments written with preallocation must produce identical replay
 //! results to segments written without preallocation.
+#![cfg(feature = "postcard")]
 
 use durability::storage::{Directory, FsDirectory, MemoryDirectory};
 use durability::walog::{WalEntry, WalReader, WalWriter};

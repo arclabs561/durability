@@ -1,4 +1,5 @@
 //! Integration test for generic `CheckpointPublisher::publish()` with custom types.
+#![cfg(feature = "postcard")]
 
 use durability::publish::CheckpointPublisher;
 use durability::storage::FsDirectory;

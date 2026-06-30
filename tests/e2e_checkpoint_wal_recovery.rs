@@ -1,4 +1,5 @@
 //! End-to-end property tests for checkpoint + WAL recovery.
+#![cfg(feature = "postcard")]
 
 use durability::checkpoint::CheckpointFile;
 use durability::recover::{CheckpointSegment, CheckpointState, RecoveredState, RecoveryManager};

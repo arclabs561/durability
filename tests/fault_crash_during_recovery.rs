@@ -2,6 +2,7 @@
 //!
 //! Scenario: write entries, simulate crash (torn tail), then inject a failure
 //! during resume()'s repair phase. Verify that a subsequent resume() succeeds.
+#![cfg(feature = "postcard")]
 
 mod support;
 

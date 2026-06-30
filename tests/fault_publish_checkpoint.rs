@@ -3,6 +3,7 @@
 //! These tests focus on the crash-consistency nuance:
 //! - do not truncate WAL unless the checkpoint commit marker is durably recorded
 //! - failures should never make recovery worse (at worst, leave extra WAL segments)
+#![cfg(feature = "postcard")]
 
 mod support;
 

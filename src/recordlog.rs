@@ -63,6 +63,8 @@ pub struct Record {
 /// # Example
 ///
 /// ```
+/// # #[cfg(feature = "postcard")]
+/// # {
 /// use durability::recordlog::{RecordLogWriter, RecordLogReader, RecordLogReadMode};
 /// use durability::storage::MemoryDirectory;
 ///
@@ -75,6 +77,7 @@ pub struct Record {
 /// let r = RecordLogReader::new(dir, "log.bin");
 /// let msgs: Vec<String> = r.read_all_postcard(RecordLogReadMode::Strict).unwrap();
 /// assert_eq!(msgs, vec!["hello", "world"]);
+/// # }
 /// ```
 pub struct RecordLogWriter {
     dir: Arc<dyn Directory>,

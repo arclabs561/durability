@@ -1,4 +1,5 @@
 //! Property-based “fuzz-like” tests for `recordlog`.
+#![cfg(feature = "postcard")]
 
 use durability::recordlog::{RecordLogReadMode, RecordLogReader, RecordLogWriter};
 use durability::storage::{Directory, FsDirectory};

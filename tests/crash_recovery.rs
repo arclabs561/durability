@@ -5,6 +5,7 @@
 //! of committed records, never a corrupted record, never a panic, never an error.
 //! This exhaustively simulates a crash at every offset, the integration-level
 //! property per-record unit tests do not cover.
+#![cfg(feature = "postcard")]
 
 use std::fs::OpenOptions;
 

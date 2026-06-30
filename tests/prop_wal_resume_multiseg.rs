@@ -4,6 +4,7 @@
 //! - strict replay rejects torn tail in final segment
 //! - best-effort returns a prefix
 //! - `resume` repairs and continues ids without weakening corruption detection in non-final segments
+#![cfg(feature = "postcard")]
 
 use durability::formats::{WAL_FORMAT_VERSION, WAL_MAGIC};
 use durability::storage::{Directory, FsDirectory};

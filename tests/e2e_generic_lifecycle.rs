@@ -2,6 +2,7 @@
 //!
 //! Exercises: multi-segment WAL, checkpoint, truncation, recovery from
 //! checkpoint, all using custom types (not WalEntry).
+#![cfg(feature = "postcard")]
 
 use durability::checkpoint::CheckpointFile;
 use durability::recover::{recover_with_wal, RecoveryOptions};

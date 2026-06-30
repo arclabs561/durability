@@ -2,6 +2,7 @@
 //!
 //! This models "tailing"/retry behavior: best-effort should return the valid prefix
 //! while the record is torn, and strict replay should succeed once the record is completed.
+#![cfg(feature = "postcard")]
 
 use durability::formats::{WAL_FORMAT_VERSION, WAL_MAGIC};
 use durability::storage::{Directory, FsDirectory};

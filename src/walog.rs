@@ -543,6 +543,8 @@ fn validate_next_entry_id(prev: Option<u64>, entry_id: u64) -> PersistenceResult
 /// # Example
 ///
 /// ```
+/// # #[cfg(feature = "postcard")]
+/// # {
 /// use durability::storage::MemoryDirectory;
 /// use durability::walog::{WalWriter, WalReader};
 ///
@@ -560,6 +562,7 @@ fn validate_next_entry_id(prev: Option<u64>, entry_id: u64) -> PersistenceResult
 /// let records = WalReader::<Op>::new(dir).replay().unwrap();
 /// assert_eq!(records.len(), 1);
 /// assert_eq!(records[0].payload, Op::Set("k".into(), "v".into()));
+/// # }
 /// ```
 pub struct WalWriter<E> {
     directory: Arc<dyn Directory>,
@@ -1696,6 +1699,8 @@ const _: () = {
 /// # Example
 ///
 /// ```
+/// # #[cfg(feature = "postcard")]
+/// # {
 /// use durability::storage::MemoryDirectory;
 /// use durability::walog::{SyncWalWriter, WalReader};
 ///
@@ -1713,6 +1718,7 @@ const _: () = {
 ///
 /// let records = WalReader::<Op>::new(dir).replay().unwrap();
 /// assert_eq!(records.len(), 2);
+/// # }
 /// ```
 pub struct SyncWalWriter<E> {
     state: std::sync::Mutex<SyncState<E>>,
