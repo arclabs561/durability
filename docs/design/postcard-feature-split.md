@@ -9,18 +9,57 @@ avoid compiling postcard and its transitive dependencies.
 
 ## Research
 
+Sources:
+
+- Cargo Book, "Features": https://doc.rust-lang.org/cargo/reference/features.html
+- Cargo Book, "SemVer Compatibility": https://doc.rust-lang.org/cargo/reference/semver.html
+- Cargo Book, "Dependency Resolution": https://doc.rust-lang.org/cargo/reference/resolver.html#features
+- docs.rs, "Metadata for custom builds": https://docs.rs/about/metadata
+- `syn` manifest: https://github.com/dtolnay/syn/blob/master/Cargo.toml
+- `regex` manifest: https://github.com/rust-lang/regex/blob/master/Cargo.toml
+- `quick-xml` manifest: https://github.com/tafia/quick-xml/blob/master/Cargo.toml
+
 Primary source read-depth:
 
-- Cargo Book, "Features": read the feature definition, optional dependency,
-  default feature, feature unification, and feature-combination testing sections.
+- Cargo Book, "Features": read the page end to end, including feature
+  definition, optional dependency, `dep:` syntax, dependency feature syntax,
+  default feature behavior, feature unification, resolver version notes,
+  feature documentation, docs.rs metadata pointers, and feature-combination
+  testing.
 - Cargo Book, "SemVer Compatibility": read the Cargo feature and optional
-  dependency guidance, plus the item-removal/cfg-gating section.
-- Not read: the full Cargo resolver chapter and the full Rust API Guidelines.
+  dependency guidance, the 0.x versioning convention, and the
+  item-removal/cfg-gating section.
+- Cargo Book, "Dependency Resolution": read the feature-resolution sections,
+  including lockfile resolution, feature unification, resolver v2 exceptions,
+  and feature removal effects.
+- docs.rs, "Metadata for custom builds": read the available metadata fields for
+  selecting all features, no-default features, targets, and rustdoc args.
+- Implementation examples: read `syn`, `regex`, and `quick-xml` manifests for
+  feature naming, `dep:` usage, feature docs, docs.rs all-feature builds, weak
+  dependency feature forwarding, and feature-gated tests/examples.
+- Not read: Cargo source code, the full Rust API Guidelines, and a broad survey
+  of codec crates.
 
 The relevant Cargo constraints are: features should be additive; optional
 dependencies are the right mechanism for dependency opt-outs; `dep:` avoids
 exposing dependency names accidentally; and moving existing public code behind a
 feature is semver-sensitive.
+
+Deeper implications:
+
+- `postcard` is a public feature contract once published. That is acceptable
+  here because the gated API names and behavior are postcard-specific. If a
+  future release wants a generic typed codec surface, that should be a new
+  feature/API rather than silently repurposing `postcard`.
+- Keeping `postcard` in `default` preserves default-build compatibility, but
+  removing it from `default` later would itself be a SemVer-sensitive change.
+- Feature unification means `default-features = false` only proves this crate's
+  direct no-default surface. Another dependency path can still enable defaults.
+  `cargo tree -e features` is the right diagnostic when users report postcard in
+  a larger graph.
+- docs.rs should build with all features so gated modules and methods are
+  visible, while CI should also build no-default docs because broken rustdoc
+  links can appear only when `postcard` is disabled.
 
 ## Chosen approach
 

@@ -15,6 +15,7 @@ keywords = ["persistence", "wal", "checkpoint", "write-ahead-log", "recovery"]
 categories = ["filesystem", "database-implementations"]
 
 [package.metadata.docs.rs]
+all-features = true
 targets = []
 
 [workspace]

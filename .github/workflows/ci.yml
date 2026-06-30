@@ -25,7 +25,10 @@ jobs:
         run: cargo test --no-default-features --lib
 
       - name: doc
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+
+      - name: no-default docs
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --no-default-features
 
       - name: examples
         run: cargo build --examples --all-features
