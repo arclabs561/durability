@@ -7,7 +7,16 @@
 //! - append-only record log (`recordlog`)
 //! - generic write-ahead log (`walog`)
 //! - CRC-validated checkpoint snapshots (`checkpoint`)
-//! - generic recovery (`recover::recover_with_wal`) and segment-specific recovery (`recover`, `publish`)
+//! - generic recovery (`recover::recover_with_wal`) and segment-specific recovery (`recover`, `publish`) with the default `postcard` feature
+//!
+//! ## Features
+//!
+//! - `postcard` (default): serde/postcard typed WAL, checkpoint, recovery, and publish helpers.
+//! - `async`: tokio-compatible async directory abstraction.
+//! - `mmap`: mmap and advisory helpers.
+//!
+//! With `default-features = false`, the crate still provides the directory abstraction,
+//! raw record logs, raw checkpoint payloads, WAL framing/maintenance, and sync helpers.
 //!
 //! ## Contract (what you can rely on)
 //!
@@ -36,8 +45,10 @@ pub mod checkpoint;
 pub mod error;
 #[doc(hidden)]
 pub mod formats;
+#[cfg(feature = "postcard")]
 pub mod publish;
 pub mod recordlog;
+#[cfg(feature = "postcard")]
 pub mod recover;
 pub mod storage;
 pub mod walog;
@@ -51,7 +62,7 @@ pub mod mmap;
 pub use error::{PersistenceError, PersistenceResult};
 pub use storage::{Directory, FsDirectory, MemoryDirectory};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "postcard"))]
 mod tests {
     use super::*;
     use crate::checkpoint::CheckpointFile;

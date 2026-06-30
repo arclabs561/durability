@@ -14,5 +14,5 @@ pub const FORMAT_VERSION: u32 = 1;
 /// On-disk format version for WAL segment files.
 ///
 /// Version 2: entry_id moved from payload to frame header; type byte removed.
-/// Frame: `[length:u32][entry_id:u64][crc32:u32][postcard payload...]`.
+/// Frame: `[length:u32][entry_id:u64][crc32:u32][payload bytes...]`.
 pub const WAL_FORMAT_VERSION: u32 = 2;

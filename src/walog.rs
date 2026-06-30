@@ -2,10 +2,10 @@
 //!
 //! ## Generic design
 //!
-//! `WalWriter<E>` and `WalReader<E>` are generic over any entry type `E` that implements
-//! `Serialize + DeserializeOwned`. Entry IDs are assigned by the writer and stored in the
-//! frame header, not in the payload. On replay, entries are returned as `WalRecord<E>`
-//! pairing the assigned entry ID with the deserialized payload.
+//! Entry IDs are assigned by the writer and stored in the frame header, not in
+//! the payload. The core WAL stores raw payload bytes. With the default
+//! `postcard` feature, `WalWriter<E>` and `WalReader<E>` also provide typed
+//! serde/postcard append and replay helpers.
 //!
 //! ## Public invariants (must not change without a format bump)
 //!
@@ -14,8 +14,8 @@
 //! - **Segment header**: `[WAL_MAGIC][WAL_FORMAT_VERSION][start_entry_id:u64][segment_id:u64]`
 //!   (little-endian for integers).
 //! - **Entry ids are strictly increasing** across the concatenated replay stream.
-//! - **Entry framing**: `[length:u32][entry_id:u64][crc32:u32][postcard payload...]`.
-//! - **Checksum**: `crc32fast` over the postcard payload bytes.
+//! - **Entry framing**: `[length:u32][entry_id:u64][crc32:u32][payload bytes...]`.
+//! - **Checksum**: `crc32fast` over the payload bytes.
 //!
 //! ## On-disk layout
 //!
@@ -25,9 +25,9 @@
 //!   [entry 1][entry 2][...][entry N]
 //!
 //! Entry frame:
-//!   [length:u32][entry_id:u64][crc32:u32][postcard payload...]
+//!   [length:u32][entry_id:u64][crc32:u32][payload bytes...]
 //!   length covers the entire frame (4 + 8 + 4 + payload_len).
-//!   CRC covers only the postcard payload bytes.
+//!   CRC covers only the payload bytes.
 //! ```
 //!
 //! All integers are little-endian.
@@ -37,8 +37,10 @@
 //! - [`WalWriter`]: single-owner writer. Use [`WalWriter::open`] as the recommended
 //!   entry point (creates or resumes).
 //! - [`SyncWalWriter`]: thread-safe wrapper around a single [`WalWriter`]. Multiple
-//!   threads can call [`SyncWalWriter::append`] concurrently; durable appends are
-//!   serialized through [`SyncWalWriter::append_durable`].
+//!   threads can call [`SyncWalWriter::append_bytes`] concurrently; durable byte
+//!   appends are serialized through [`SyncWalWriter::append_bytes_durable`].
+//!   The default `postcard` feature also provides typed `append` and
+//!   `append_durable` helpers.
 //!
 //! ## Tuning
 //!
@@ -117,7 +119,7 @@ pub trait WalObserver: Send + Sync {
 /// segment-lifecycle WALs.
 ///
 /// For custom domains, define your own `#[derive(Serialize, Deserialize)]` enum
-/// and use `WalWriter<YourEntry>` directly.
+/// and use `WalWriter<YourEntry>` directly with the default `postcard` feature.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WalEntry {
@@ -250,17 +252,12 @@ impl WalSegmentHeader {
 
 /// Encode/decode WAL entries on disk.
 ///
-/// Frame layout: `[length:u32][entry_id:u64][crc32:u32][postcard payload...]`
+/// Frame layout: `[length:u32][entry_id:u64][crc32:u32][payload bytes...]`
 /// where `length` = 4 (len) + 8 (entry_id) + 4 (crc) + payload_len.
 ///
 /// Internal wire format; exposed for testing and fuzzing.
 #[doc(hidden)]
 pub struct WalEntryOnDisk;
-
-enum WalEntryDecode<E> {
-    Record(WalRecord<E>),
-    PastLimit { entry_id: u64 },
-}
 
 enum WalRawDecode {
     Record { entry_id: u64, payload: Vec<u8> },
@@ -310,11 +307,15 @@ impl WalEntryOnDisk {
         Ok(Some(len))
     }
 
-    /// Encode a WAL entry into bytes suitable for appending.
-    pub fn encode<E: serde::Serialize>(entry_id: u64, entry: &E) -> PersistenceResult<Vec<u8>> {
-        let payload =
-            postcard::to_allocvec(entry).map_err(|e| PersistenceError::Encode(e.to_string()))?;
-        let checksum = crc32fast::hash(&payload);
+    /// Encode raw WAL payload bytes into a framed entry suitable for appending.
+    pub fn encode_bytes(entry_id: u64, payload: &[u8]) -> PersistenceResult<Vec<u8>> {
+        if payload.len() > MAX_WAL_ENTRY_PAYLOAD_BYTES {
+            return Err(PersistenceError::Format(format!(
+                "WAL entry payload too large: {} bytes",
+                payload.len()
+            )));
+        }
+        let checksum = crc32fast::hash(payload);
 
         // Frame: [length:u32][entry_id:u64][crc32:u32][payload...]
         let length_u64 = 4u64 + 8u64 + 4u64 + (payload.len() as u64);
@@ -325,8 +326,16 @@ impl WalEntryOnDisk {
         encoded.extend_from_slice(&length.to_le_bytes());
         encoded.extend_from_slice(&entry_id.to_le_bytes());
         encoded.extend_from_slice(&checksum.to_le_bytes());
-        encoded.extend_from_slice(&payload);
+        encoded.extend_from_slice(payload);
         Ok(encoded)
+    }
+
+    /// Encode a postcard WAL entry into bytes suitable for appending.
+    #[cfg(feature = "postcard")]
+    pub fn encode<E: serde::Serialize>(entry_id: u64, entry: &E) -> PersistenceResult<Vec<u8>> {
+        let payload =
+            postcard::to_allocvec(entry).map_err(|e| PersistenceError::Encode(e.to_string()))?;
+        Self::encode_bytes(entry_id, &payload)
     }
 
     /// Decode the next WAL entry, returning `Ok(None)` at EOF.
@@ -418,6 +427,7 @@ impl WalEntryOnDisk {
     }
 
     /// Decode the next WAL entry and deserialize the payload.
+    #[cfg(feature = "postcard")]
     pub fn decode<E: serde::de::DeserializeOwned, R: Read>(
         reader: &mut R,
         mode: WalReplayMode,
@@ -431,29 +441,6 @@ impl WalEntryOnDisk {
             entry_id,
             payload: entry,
         }))
-    }
-
-    fn decode_until<E: serde::de::DeserializeOwned, R: Read>(
-        reader: &mut R,
-        mode: WalReplayMode,
-        max_entry_id: u64,
-    ) -> PersistenceResult<Option<WalEntryDecode<E>>> {
-        let Some(decoded) = Self::decode_raw_until(reader, mode, Some(max_entry_id))? else {
-            return Ok(None);
-        };
-        match decoded {
-            WalRawDecode::Record { entry_id, payload } => {
-                let entry: E = postcard::from_bytes(&payload)
-                    .map_err(|e| PersistenceError::Decode(e.to_string()))?;
-                Ok(Some(WalEntryDecode::Record(WalRecord {
-                    entry_id,
-                    payload: entry,
-                })))
-            }
-            WalRawDecode::PastLimit { entry_id } => {
-                Ok(Some(WalEntryDecode::PastLimit { entry_id }))
-            }
-        }
     }
 }
 
@@ -599,7 +586,7 @@ pub struct WalWriter<E> {
     _marker: PhantomData<E>,
 }
 
-impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
+impl<E> WalWriter<E> {
     /// Create a new WAL writer.
     ///
     /// Fast-by-default: buffered writes (64 KiB) + flush every 64 appends.
@@ -746,25 +733,30 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
     ///
     /// Returns the entry IDs assigned to each entry (in order).
     /// If any entry fails to encode, no entries are written.
-    pub fn append_batch(&mut self, entries: &[E]) -> PersistenceResult<Vec<u64>> {
+    #[cfg(feature = "postcard")]
+    pub fn append_batch(&mut self, entries: &[E]) -> PersistenceResult<Vec<u64>>
+    where
+        E: serde::Serialize,
+    {
+        self.append_batch_postcard(entries)
+    }
+
+    #[cfg(feature = "postcard")]
+    fn append_batch_encoded(
+        &mut self,
+        encoded_pairs: Vec<(u64, Vec<u8>)>,
+    ) -> PersistenceResult<Vec<u64>> {
         if self.poisoned {
             return Err(PersistenceError::InvalidState(
                 "WAL writer is poisoned after a prior write error".into(),
             ));
         }
-        if entries.is_empty() {
+        if encoded_pairs.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Pre-encode all entries to detect errors before writing any.
-        let mut encoded_pairs: Vec<(u64, Vec<u8>)> = Vec::with_capacity(entries.len());
-        for (next_id, entry) in (self.current_entry_id..).zip(entries.iter()) {
-            let encoded = WalEntryOnDisk::encode(next_id, entry)?;
-            encoded_pairs.push((next_id, encoded));
-        }
-
         // Write all entries.
-        let mut ids = Vec::with_capacity(entries.len());
+        let mut ids = Vec::with_capacity(encoded_pairs.len());
         for (entry_id, encoded) in encoded_pairs {
             let encoded_len = encoded.len();
             let _wal_path = self.ensure_segment_open(entry_id)?;
@@ -780,6 +772,20 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
         // Single flush for the entire batch.
         self.flush()?;
         Ok(ids)
+    }
+
+    #[cfg(feature = "postcard")]
+    fn append_batch_postcard(&mut self, entries: &[E]) -> PersistenceResult<Vec<u64>>
+    where
+        E: serde::Serialize,
+    {
+        // Pre-encode all entries to detect errors before writing any.
+        let mut encoded_pairs: Vec<(u64, Vec<u8>)> = Vec::with_capacity(entries.len());
+        for (next_id, entry) in (self.current_entry_id..).zip(entries.iter()) {
+            let encoded = WalEntryOnDisk::encode(next_id, entry)?;
+            encoded_pairs.push((next_id, encoded));
+        }
+        self.append_batch_encoded(encoded_pairs)
     }
 
     /// Open a WAL directory, creating it if empty or resuming if it exists.
@@ -1128,20 +1134,35 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> WalWriter<E> {
         Ok(())
     }
 
-    /// Append an entry, returning its assigned entry id.
-    pub fn append(&mut self, entry: &E) -> PersistenceResult<u64> {
+    /// Append raw payload bytes, returning the assigned entry id.
+    pub fn append_bytes(&mut self, payload: &[u8]) -> PersistenceResult<u64> {
+        let entry_id = self.current_entry_id;
+        let encoded = WalEntryOnDisk::encode_bytes(entry_id, payload)?;
+        self.append_encoded(entry_id, &encoded)
+    }
+
+    /// Append a postcard-encoded entry, returning its assigned entry id.
+    #[cfg(feature = "postcard")]
+    pub fn append(&mut self, entry: &E) -> PersistenceResult<u64>
+    where
+        E: serde::Serialize,
+    {
+        let entry_id = self.current_entry_id;
+        let encoded = WalEntryOnDisk::encode(entry_id, entry)?;
+        self.append_encoded(entry_id, &encoded)
+    }
+
+    fn append_encoded(&mut self, entry_id: u64, encoded: &[u8]) -> PersistenceResult<u64> {
         if self.poisoned {
             return Err(PersistenceError::InvalidState(
                 "WAL writer is poisoned after a prior write error".into(),
             ));
         }
-        let entry_id = self.current_entry_id;
         let _wal_path = self.ensure_segment_open(entry_id)?;
-        let encoded = WalEntryOnDisk::encode(entry_id, entry)?;
         let encoded_len = encoded.len();
 
         self.rotate_if_needed(entry_id, encoded_len as u64)?;
-        self.buffer_encoded(&encoded)?;
+        self.buffer_encoded(encoded)?;
         self.apply_flush_policy()?;
 
         if let Some(obs) = &self.observer {
@@ -1250,7 +1271,7 @@ pub struct WalReader<E> {
     _marker: PhantomData<E>,
 }
 
-impl<E: serde::de::DeserializeOwned> WalReader<E> {
+impl<E> WalReader<E> {
     /// Create a new WAL reader.
     pub fn new(directory: impl Into<Arc<dyn Directory>>) -> Self {
         Self {
@@ -1259,8 +1280,70 @@ impl<E: serde::de::DeserializeOwned> WalReader<E> {
         }
     }
 
+    /// Replay all WAL entries as raw payload bytes in sorted segment-id order.
+    pub fn replay_bytes(&self) -> PersistenceResult<Vec<WalRecord<Vec<u8>>>> {
+        let mut records = Vec::new();
+        self.replay_bytes_each_inner(WalReplayMode::Strict, None, |r| {
+            records.push(r);
+            Ok(())
+        })?;
+        Ok(records)
+    }
+
+    /// Best-effort raw replay: stop at first truncated tail record in the final segment.
+    pub fn replay_bytes_best_effort(&self) -> PersistenceResult<Vec<WalRecord<Vec<u8>>>> {
+        let mut records = Vec::new();
+        self.replay_bytes_each_inner(WalReplayMode::BestEffortTail, None, |r| {
+            records.push(r);
+            Ok(())
+        })?;
+        Ok(records)
+    }
+
+    /// Streaming raw replay: call `apply` for each WAL entry (strict mode).
+    ///
+    /// Unlike [`replay_bytes`](Self::replay_bytes), this does not collect entries
+    /// into a `Vec`, making it suitable for large WALs.
+    pub fn replay_bytes_each(
+        &self,
+        apply: impl FnMut(WalRecord<Vec<u8>>) -> PersistenceResult<()>,
+    ) -> PersistenceResult<u64> {
+        self.replay_bytes_each_inner(WalReplayMode::Strict, None, apply)
+    }
+
+    /// Streaming raw best-effort replay.
+    pub fn replay_bytes_each_best_effort(
+        &self,
+        apply: impl FnMut(WalRecord<Vec<u8>>) -> PersistenceResult<()>,
+    ) -> PersistenceResult<u64> {
+        self.replay_bytes_each_inner(WalReplayMode::BestEffortTail, None, apply)
+    }
+
+    /// Streaming raw replay with explicit mode selection.
+    pub fn replay_bytes_each_with_mode(
+        &self,
+        mode: WalReplayMode,
+        apply: impl FnMut(WalRecord<Vec<u8>>) -> PersistenceResult<()>,
+    ) -> PersistenceResult<u64> {
+        self.replay_bytes_each_inner(mode, None, apply)
+    }
+
+    /// Count entries in the WAL without collecting them.
+    pub fn entry_count(&self) -> PersistenceResult<u64> {
+        self.replay_bytes_each_inner(WalReplayMode::Strict, None, |_| Ok(()))
+    }
+
+    /// Count entries (best-effort mode).
+    pub fn entry_count_best_effort(&self) -> PersistenceResult<u64> {
+        self.replay_bytes_each_inner(WalReplayMode::BestEffortTail, None, |_| Ok(()))
+    }
+
     /// Replay all WAL entries in sorted segment-id order.
-    pub fn replay(&self) -> PersistenceResult<Vec<WalRecord<E>>> {
+    #[cfg(feature = "postcard")]
+    pub fn replay(&self) -> PersistenceResult<Vec<WalRecord<E>>>
+    where
+        E: serde::de::DeserializeOwned,
+    {
         let mut records = Vec::new();
         self.replay_each_inner(WalReplayMode::Strict, None, |r| {
             records.push(r);
@@ -1270,7 +1353,11 @@ impl<E: serde::de::DeserializeOwned> WalReader<E> {
     }
 
     /// Best-effort replay: stop at first truncated tail record in the final segment.
-    pub fn replay_best_effort(&self) -> PersistenceResult<Vec<WalRecord<E>>> {
+    #[cfg(feature = "postcard")]
+    pub fn replay_best_effort(&self) -> PersistenceResult<Vec<WalRecord<E>>>
+    where
+        E: serde::de::DeserializeOwned,
+    {
         let mut records = Vec::new();
         self.replay_each_inner(WalReplayMode::BestEffortTail, None, |r| {
             records.push(r);
@@ -1284,10 +1371,14 @@ impl<E: serde::de::DeserializeOwned> WalReader<E> {
     /// Unlike [`replay`](Self::replay), this does not collect entries into a `Vec`,
     /// making it suitable for large WALs that would otherwise exhaust memory.
     /// Returns the number of entries replayed.
+    #[cfg(feature = "postcard")]
     pub fn replay_each(
         &self,
         apply: impl FnMut(WalRecord<E>) -> PersistenceResult<()>,
-    ) -> PersistenceResult<u64> {
+    ) -> PersistenceResult<u64>
+    where
+        E: serde::de::DeserializeOwned,
+    {
         self.replay_each_inner(WalReplayMode::Strict, None, apply)
     }
 
@@ -1295,10 +1386,14 @@ impl<E: serde::de::DeserializeOwned> WalReader<E> {
     ///
     /// Best-effort: stops at first truncated tail record in the final segment.
     /// Returns the number of entries replayed.
+    #[cfg(feature = "postcard")]
     pub fn replay_each_best_effort(
         &self,
         apply: impl FnMut(WalRecord<E>) -> PersistenceResult<()>,
-    ) -> PersistenceResult<u64> {
+    ) -> PersistenceResult<u64>
+    where
+        E: serde::de::DeserializeOwned,
+    {
         self.replay_each_inner(WalReplayMode::BestEffortTail, None, apply)
     }
 
@@ -1307,40 +1402,56 @@ impl<E: serde::de::DeserializeOwned> WalReader<E> {
     /// Combines [`replay_each`](Self::replay_each) and
     /// [`replay_each_best_effort`](Self::replay_each_best_effort) behind a mode parameter.
     /// Returns the number of entries replayed.
+    #[cfg(feature = "postcard")]
     pub fn replay_each_with_mode(
         &self,
         mode: WalReplayMode,
         apply: impl FnMut(WalRecord<E>) -> PersistenceResult<()>,
-    ) -> PersistenceResult<u64> {
+    ) -> PersistenceResult<u64>
+    where
+        E: serde::de::DeserializeOwned,
+    {
         self.replay_each_inner(mode, None, apply)
     }
 
+    #[cfg(feature = "postcard")]
     pub(crate) fn replay_each_with_mode_until(
         &self,
         mode: WalReplayMode,
         max_entry_id: Option<u64>,
         apply: impl FnMut(WalRecord<E>) -> PersistenceResult<()>,
-    ) -> PersistenceResult<u64> {
+    ) -> PersistenceResult<u64>
+    where
+        E: serde::de::DeserializeOwned,
+    {
         self.replay_each_inner(mode, max_entry_id, apply)
     }
 
-    /// Count entries in the WAL without collecting them.
-    ///
-    /// Equivalent to `replay()?.len()` but avoids building the `Vec`.
-    pub fn entry_count(&self) -> PersistenceResult<u64> {
-        self.replay_each_inner(WalReplayMode::Strict, None, |_| Ok(()))
-    }
-
-    /// Count entries (best-effort mode).
-    pub fn entry_count_best_effort(&self) -> PersistenceResult<u64> {
-        self.replay_each_inner(WalReplayMode::BestEffortTail, None, |_| Ok(()))
-    }
-
+    #[cfg(feature = "postcard")]
     fn replay_each_inner(
         &self,
         mode: WalReplayMode,
         max_entry_id: Option<u64>,
         mut apply: impl FnMut(WalRecord<E>) -> PersistenceResult<()>,
+    ) -> PersistenceResult<u64>
+    where
+        E: serde::de::DeserializeOwned,
+    {
+        self.replay_bytes_each_inner(mode, max_entry_id, |record| {
+            let payload: E = postcard::from_bytes(&record.payload)
+                .map_err(|e| PersistenceError::Decode(e.to_string()))?;
+            apply(WalRecord {
+                entry_id: record.entry_id,
+                payload,
+            })
+        })
+    }
+
+    fn replay_bytes_each_inner(
+        &self,
+        mode: WalReplayMode,
+        max_entry_id: Option<u64>,
+        mut apply: impl FnMut(WalRecord<Vec<u8>>) -> PersistenceResult<()>,
     ) -> PersistenceResult<u64> {
         let wal_segments = enumerate_wal_segments(&*self.directory)?;
         let last_segment_id = wal_segments.last().map(|(id, _)| *id);
@@ -1379,23 +1490,22 @@ impl<E: serde::de::DeserializeOwned> WalReader<E> {
             loop {
                 let decoded = match max_entry_id {
                     Some(max) => {
-                        WalEntryOnDisk::decode_until::<E, _>(&mut file, segment_mode, max)?
+                        WalEntryOnDisk::decode_raw_until(&mut file, segment_mode, Some(max))?
                     }
-                    None => WalEntryOnDisk::decode::<E, _>(&mut file, segment_mode)?
-                        .map(WalEntryDecode::Record),
+                    None => WalEntryOnDisk::decode_raw_until(&mut file, segment_mode, None)?,
                 };
 
                 match decoded {
-                    Some(WalEntryDecode::Record(record)) => {
+                    Some(WalRawDecode::Record { entry_id, payload }) => {
                         if first_entry_id_in_segment.is_none() {
-                            first_entry_id_in_segment = Some(record.entry_id);
+                            first_entry_id_in_segment = Some(entry_id);
                         }
-                        validate_next_entry_id(last_seen_entry_id, record.entry_id)?;
-                        last_seen_entry_id = Some(record.entry_id);
-                        apply(record)?;
+                        validate_next_entry_id(last_seen_entry_id, entry_id)?;
+                        last_seen_entry_id = Some(entry_id);
+                        apply(WalRecord { entry_id, payload })?;
                         count += 1;
                     }
-                    Some(WalEntryDecode::PastLimit { entry_id }) => {
+                    Some(WalRawDecode::PastLimit { entry_id }) => {
                         if first_entry_id_in_segment.is_none() {
                             first_entry_id_in_segment = Some(entry_id);
                         }
@@ -1578,8 +1688,10 @@ const _: () = {
 ///
 /// Wraps a [`WalWriter`] in a `Mutex`, allowing multiple threads to append
 /// concurrently. Durable operations are serialized through the same mutex:
-/// [`append_durable`](Self::append_durable) appends one entry, then syncs the
-/// writer if that entry is newer than the last synced entry.
+/// [`append_bytes_durable`](Self::append_bytes_durable) appends one payload,
+/// then syncs the writer if that entry is newer than the last synced entry.
+/// The default `postcard` feature also provides a typed `append_durable`
+/// helper.
 ///
 /// # Example
 ///
@@ -1611,7 +1723,7 @@ struct SyncState<E> {
     last_synced_entry_id: u64,
 }
 
-impl<E: serde::Serialize + serde::de::DeserializeOwned> SyncWalWriter<E> {
+impl<E> SyncWalWriter<E> {
     /// Create a new thread-safe WAL writer (fails if segments already exist).
     pub fn new(directory: impl Into<Arc<dyn Directory>>) -> PersistenceResult<Self> {
         Ok(Self::from_writer(WalWriter::new(directory)))
@@ -1647,7 +1759,11 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> SyncWalWriter<E> {
 
     /// Append an entry. Does not sync; call [`flush`](Self::flush) or
     /// [`flush_and_sync`](Self::flush_and_sync) afterward.
-    pub fn append(&self, entry: &E) -> PersistenceResult<u64> {
+    #[cfg(feature = "postcard")]
+    pub fn append(&self, entry: &E) -> PersistenceResult<u64>
+    where
+        E: serde::Serialize,
+    {
         self.state
             .lock()
             .map_err(|_| PersistenceError::LockFailed {
@@ -1659,7 +1775,11 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> SyncWalWriter<E> {
     }
 
     /// Append multiple entries as a batch.
-    pub fn append_batch(&self, entries: &[E]) -> PersistenceResult<Vec<u64>> {
+    #[cfg(feature = "postcard")]
+    pub fn append_batch(&self, entries: &[E]) -> PersistenceResult<Vec<u64>>
+    where
+        E: serde::Serialize,
+    {
         self.state
             .lock()
             .map_err(|_| PersistenceError::LockFailed {
@@ -1670,12 +1790,29 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> SyncWalWriter<E> {
             .append_batch(entries)
     }
 
+    /// Append raw payload bytes. Does not sync; call [`flush`](Self::flush) or
+    /// [`flush_and_sync`](Self::flush_and_sync) afterward.
+    pub fn append_bytes(&self, payload: &[u8]) -> PersistenceResult<u64> {
+        self.state
+            .lock()
+            .map_err(|_| PersistenceError::LockFailed {
+                resource: "SyncWalWriter".into(),
+                reason: "mutex poisoned".into(),
+            })?
+            .writer
+            .append_bytes(payload)
+    }
+
     /// Append an entry and wait until it is durable on stable storage.
     ///
     /// If another thread previously synced past this entry's ID, skip the
     /// redundant sync. With the current mutex-based writer this mainly covers
     /// entries appended before this call, not a concurrent write barrier.
-    pub fn append_durable(&self, entry: &E) -> PersistenceResult<u64> {
+    #[cfg(feature = "postcard")]
+    pub fn append_durable(&self, entry: &E) -> PersistenceResult<u64>
+    where
+        E: serde::Serialize,
+    {
         let mut state = self
             .state
             .lock()
@@ -1684,6 +1821,23 @@ impl<E: serde::Serialize + serde::de::DeserializeOwned> SyncWalWriter<E> {
                 reason: "mutex poisoned".into(),
             })?;
         let id = state.writer.append(entry)?;
+        if id > state.last_synced_entry_id {
+            state.writer.flush_and_sync()?;
+            state.last_synced_entry_id = state.writer.last_entry_id().unwrap_or(id);
+        }
+        Ok(id)
+    }
+
+    /// Append raw payload bytes and wait until they are durable on stable storage.
+    pub fn append_bytes_durable(&self, payload: &[u8]) -> PersistenceResult<u64> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PersistenceError::LockFailed {
+                resource: "SyncWalWriter".into(),
+                reason: "mutex poisoned".into(),
+            })?;
+        let id = state.writer.append_bytes(payload)?;
         if id > state.last_synced_entry_id {
             state.writer.flush_and_sync()?;
             state.last_synced_entry_id = state.writer.last_entry_id().unwrap_or(id);
@@ -1749,6 +1903,48 @@ const _: () = {
 };
 
 #[cfg(test)]
+mod raw_tests {
+    use super::*;
+    use crate::storage::MemoryDirectory;
+
+    #[test]
+    fn wal_roundtrip_bytes() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let mut w = WalWriter::<()>::new(dir.clone());
+        assert_eq!(w.append_bytes(b"one").unwrap(), 1);
+        assert_eq!(w.append_bytes(b"two").unwrap(), 2);
+        w.flush().unwrap();
+        drop(w);
+
+        let records = WalReader::<()>::new(dir).replay_bytes().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].entry_id, 1);
+        assert_eq!(records[0].payload, b"one");
+        assert_eq!(records[1].entry_id, 2);
+        assert_eq!(records[1].payload, b"two");
+    }
+
+    #[test]
+    fn sync_wal_roundtrip_bytes() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let sw = SyncWalWriter::<()>::open(dir.clone()).unwrap();
+        assert_eq!(sw.append_bytes(b"alpha").unwrap(), 1);
+        assert_eq!(sw.append_bytes(b"beta").unwrap(), 2);
+        sw.flush().unwrap();
+        drop(sw);
+
+        let records = WalReader::<()>::new(dir).replay_bytes().unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| r.payload.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"alpha".as_slice(), b"beta".as_slice()]
+        );
+    }
+}
+
+#[cfg(all(test, feature = "postcard"))]
 mod tests {
     use super::*;
     use crate::storage::MemoryDirectory;

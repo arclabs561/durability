@@ -5,6 +5,23 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Added raw checkpoint APIs: `CheckpointFile::write_bytes`,
+  `write_bytes_durable`, and `read_bytes`.
+- Added raw WAL APIs: `WalWriter::append_bytes`, `WalReader::replay_bytes`,
+  raw streaming replay helpers, and `SyncWalWriter` byte append variants.
+- Added a default-enabled `postcard` feature for typed serde/postcard WAL,
+  checkpoint, recovery, and publish helpers.
+
+### Changed
+
+- `postcard` is now optional. Default builds keep the existing typed APIs;
+  `default-features = false` builds expose the raw persistence primitives
+  without compiling `postcard`.
+
 ## [0.6.11] - 2026-06-28
 
 ### Changed

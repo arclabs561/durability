@@ -1,8 +1,9 @@
 //! Generic checkpoint file (single snapshot blob).
 //!
-//! This is a generic building block: store one postcard-encoded snapshot with
-//! a small header and CRC32. Higher layers decide *when* to checkpoint and what
-//! the snapshot schema is.
+//! This is a generic building block: store one snapshot payload with a small
+//! header and CRC32. Higher layers decide *when* to checkpoint and what the
+//! snapshot schema is. The core API stores raw bytes; the default `postcard`
+//! feature adds serde/postcard convenience methods.
 //!
 //! ## Public invariants (must not change without a format bump)
 //!
@@ -127,18 +128,16 @@ impl CheckpointFile {
         Self { dir: dir.into() }
     }
 
-    /// Write `value` to `path` as postcard bytes with header + CRC.
+    /// Write `payload` to `path` with header + CRC.
     ///
     /// `last_applied_id` should be the last applied log entry id included in
-    /// `value` (use `0` if not applicable).
-    pub fn write_postcard<T: serde::Serialize>(
+    /// the payload (use `0` if not applicable).
+    pub fn write_bytes(
         &self,
         path: &str,
         last_applied_id: u64,
-        value: &T,
+        payload: &[u8],
     ) -> PersistenceResult<()> {
-        let payload =
-            postcard::to_allocvec(value).map_err(|e| PersistenceError::Encode(e.to_string()))?;
         if payload.len() > MAX_CHECKPOINT_PAYLOAD_BYTES {
             return Err(PersistenceError::Format(format!(
                 "checkpoint payload too large: {} bytes (max {})",
@@ -146,50 +145,47 @@ impl CheckpointFile {
                 MAX_CHECKPOINT_PAYLOAD_BYTES
             )));
         }
-        let checksum = crc32fast::hash(&payload);
+        let checksum = crc32fast::hash(payload);
         let h = CheckpointHeader::new(last_applied_id, payload.len() as u64, checksum);
         let mut buf = Vec::with_capacity(CheckpointHeader::SIZE + payload.len());
         h.write(&mut buf)?;
-        buf.extend_from_slice(&payload);
+        buf.extend_from_slice(payload);
         self.dir.atomic_write(path, &buf)?;
         Ok(())
     }
 
-    /// Write a checkpoint and attempt to make it durable on stable storage.
+    /// Write a raw checkpoint payload and attempt to make it durable on stable storage.
     ///
-    /// This is stronger than [`CheckpointFile::write_postcard`]:
-    /// - `write_postcard` relies on `Directory::atomic_write` for atomic publish.
-    /// - `write_postcard_durable` additionally performs explicit stable-storage barriers on the
-    ///   final path (file + parent dir), so “success” better matches “survives power loss”.
+    /// This is stronger than [`CheckpointFile::write_bytes`]:
+    /// - `write_bytes` relies on `Directory::atomic_write` for atomic publish.
+    /// - `write_bytes_durable` additionally performs explicit stable-storage barriers on the
+    ///   final path (file + parent dir), so "success" better matches "survives power loss".
     ///
     /// Returns `NotSupported` if the underlying directory does not provide `file_path()`.
     ///
     /// Note: if a barrier fails after the atomic publish, this returns an error even though the
-    /// checkpoint file may now exist. The error means “not proven durable”.
-    pub fn write_postcard_durable<T: serde::Serialize>(
+    /// checkpoint file may now exist. The error means "not proven durable".
+    pub fn write_bytes_durable(
         &self,
         path: &str,
         last_applied_id: u64,
-        value: &T,
+        payload: &[u8],
     ) -> PersistenceResult<()> {
         if self.dir.file_path(path).is_none() {
             return Err(PersistenceError::NotSupported(
-                "write_postcard_durable requires Directory::file_path()".into(),
+                "write_bytes_durable requires Directory::file_path()".into(),
             ));
         }
-        self.write_postcard(path, last_applied_id, value)?;
+        self.write_bytes(path, last_applied_id, payload)?;
         storage::sync_file(&*self.dir, path)?;
         storage::sync_parent_dir(&*self.dir, path)?;
         Ok(())
     }
 
-    /// Read `path` and decode postcard bytes after CRC validation.
+    /// Read `path` and return CRC-validated raw payload bytes.
     ///
-    /// Returns `(last_applied_id, value)`.
-    pub fn read_postcard<T: serde::de::DeserializeOwned>(
-        &self,
-        path: &str,
-    ) -> PersistenceResult<(u64, T)> {
+    /// Returns `(last_applied_id, payload)`.
+    pub fn read_bytes(&self, path: &str) -> PersistenceResult<(u64, Vec<u8>)> {
         let mut f = self.dir.open_file(path)?;
         let h = CheckpointHeader::read(&mut *f)?;
         let len = usize::try_from(h.payload_len)
@@ -209,13 +205,86 @@ impl CheckpointFile {
                 actual: got,
             });
         }
+        Ok((h.last_applied_id, payload))
+    }
+
+    /// Write `value` to `path` as postcard bytes with header + CRC.
+    ///
+    /// `last_applied_id` should be the last applied log entry id included in
+    /// `value` (use `0` if not applicable).
+    #[cfg(feature = "postcard")]
+    pub fn write_postcard<T: serde::Serialize>(
+        &self,
+        path: &str,
+        last_applied_id: u64,
+        value: &T,
+    ) -> PersistenceResult<()> {
+        let payload =
+            postcard::to_allocvec(value).map_err(|e| PersistenceError::Encode(e.to_string()))?;
+        self.write_bytes(path, last_applied_id, &payload)
+    }
+
+    /// Write a checkpoint and attempt to make it durable on stable storage.
+    ///
+    /// This is stronger than [`CheckpointFile::write_postcard`]:
+    /// - `write_postcard` relies on `Directory::atomic_write` for atomic publish.
+    /// - `write_postcard_durable` additionally performs explicit stable-storage barriers on the
+    ///   final path (file + parent dir), so "success" better matches "survives power loss".
+    ///
+    /// Returns `NotSupported` if the underlying directory does not provide `file_path()`.
+    ///
+    /// Note: if a barrier fails after the atomic publish, this returns an error even though the
+    /// checkpoint file may now exist. The error means "not proven durable".
+    #[cfg(feature = "postcard")]
+    pub fn write_postcard_durable<T: serde::Serialize>(
+        &self,
+        path: &str,
+        last_applied_id: u64,
+        value: &T,
+    ) -> PersistenceResult<()> {
+        if self.dir.file_path(path).is_none() {
+            return Err(PersistenceError::NotSupported(
+                "write_postcard_durable requires Directory::file_path()".into(),
+            ));
+        }
+        let payload =
+            postcard::to_allocvec(value).map_err(|e| PersistenceError::Encode(e.to_string()))?;
+        self.write_bytes_durable(path, last_applied_id, &payload)
+    }
+
+    /// Read `path` and decode postcard bytes after CRC validation.
+    ///
+    /// Returns `(last_applied_id, value)`.
+    #[cfg(feature = "postcard")]
+    pub fn read_postcard<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> PersistenceResult<(u64, T)> {
+        let (last_applied_id, payload) = self.read_bytes(path)?;
         let val: T =
             postcard::from_bytes(&payload).map_err(|e| PersistenceError::Decode(e.to_string()))?;
-        Ok((h.last_applied_id, val))
+        Ok((last_applied_id, val))
     }
 }
 
 #[cfg(test)]
+mod raw_tests {
+    use super::*;
+    use crate::storage::MemoryDirectory;
+
+    #[test]
+    fn checkpoint_roundtrip_bytes() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let ckpt = CheckpointFile::new(dir);
+        ckpt.write_bytes("c.bin", 42, b"raw snapshot").unwrap();
+
+        let (last_id, out) = ckpt.read_bytes("c.bin").unwrap();
+        assert_eq!(last_id, 42);
+        assert_eq!(out, b"raw snapshot");
+    }
+}
+
+#[cfg(all(test, feature = "postcard"))]
 mod tests {
     use super::*;
     use crate::storage::{FsDirectory, MemoryDirectory};

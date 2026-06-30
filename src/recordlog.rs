@@ -268,6 +268,7 @@ impl RecordLogWriter {
     }
 
     /// Append one postcard-encoded value as a record payload.
+    #[cfg(feature = "postcard")]
     pub fn append_postcard<T: serde::Serialize>(&mut self, value: &T) -> PersistenceResult<()> {
         let payload =
             postcard::to_allocvec(value).map_err(|e| PersistenceError::Encode(e.to_string()))?;
@@ -398,6 +399,7 @@ impl RecordLogReader {
     }
 
     /// Read all records as postcard-decoded values.
+    #[cfg(feature = "postcard")]
     pub fn read_all_postcard<T: serde::de::DeserializeOwned>(
         &self,
         mode: RecordLogReadMode,
@@ -414,6 +416,28 @@ impl RecordLogReader {
 }
 
 #[cfg(test)]
+mod raw_tests {
+    use super::*;
+    use crate::storage::MemoryDirectory;
+    use std::sync::Arc;
+
+    #[test]
+    fn recordlog_roundtrip_bytes() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let mut w = RecordLogWriter::new(dir.clone(), "log.bin");
+        w.append_bytes(b"one").unwrap();
+        w.append_bytes(b"two").unwrap();
+        w.flush().unwrap();
+
+        let r = RecordLogReader::new(dir, "log.bin");
+        let records = r.read_all(RecordLogReadMode::Strict).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].payload, b"one");
+        assert_eq!(records[1].payload, b"two");
+    }
+}
+
+#[cfg(all(test, feature = "postcard"))]
 mod tests {
     use super::*;
     use crate::storage::{FsDirectory, MemoryDirectory};

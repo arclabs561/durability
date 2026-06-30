@@ -37,6 +37,17 @@ assert_eq!(records[0].entry_id, 1);
 `WalWriter<E>` and `WalReader<E>` are generic -- define your own entry type with
 `#[derive(Serialize, Deserialize)]` and use `WalWriter::<YourType>::open(dir)`.
 
+## Feature flags
+
+`postcard` is enabled by default. It provides typed serde/postcard helpers:
+`WalWriter::append`, `WalReader::replay`, `CheckpointFile::write_postcard`,
+`recover`, and `publish`.
+
+With `default-features = false`, `durability` still provides `Directory`,
+`RecordLogWriter::append_bytes`, `RecordLogReader::read_all`,
+`CheckpointFile::{write_bytes, read_bytes}`, raw WAL append/replay, WAL
+maintenance, and sync helpers.
+
 ## Thread-safe writer
 
 `SyncWalWriter` wraps a `WalWriter` in a `Mutex` for concurrent access.
@@ -136,11 +147,11 @@ let data = bridge.read_file("data.bin").await.unwrap();
 | Module | Purpose |
 |--------|---------|
 | `storage` | `Directory` trait, `FsDirectory`, `MemoryDirectory`, sync helpers |
-| `walog` | Generic WAL: `WalWriter<E>`, `WalReader<E>`, `SyncWalWriter<E>`, `WalObserver` |
+| `walog` | Generic WAL: raw bytes always, typed serde/postcard helpers with feature `postcard` |
 | `recordlog` | Append-only single-file log with CRC framing |
-| `checkpoint` | CRC-validated snapshot files (postcard payloads) |
-| `recover` | Generic `recover_with_wal()` + segment-specific `RecoveryManager` |
-| `publish` | Crash-safe checkpoint publish + WAL truncation |
+| `checkpoint` | CRC-validated snapshot files |
+| `recover` | Generic `recover_with_wal()` + segment-specific `RecoveryManager` (feature `postcard`) |
+| `publish` | Crash-safe checkpoint publish + WAL truncation (feature `postcard`) |
 | `async_dir` | `AsyncDirectory` trait + `BlockingBridge` (feature `async`) |
 
 ## Not provided

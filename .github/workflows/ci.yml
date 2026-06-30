@@ -21,6 +21,9 @@ jobs:
       - name: clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: no-default feature build
+        run: cargo test --no-default-features --lib
+
       - name: doc
         run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
