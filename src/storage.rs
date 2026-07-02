@@ -144,6 +144,28 @@ pub trait Directory: Send + Sync {
         sync_parent_dir(self, path)
     }
 
+    /// Delete `path` and then sync its parent directory.
+    ///
+    /// This is the durable-delete counterpart to [`Directory::delete`]: the
+    /// deletion updates the directory entry, so stable-storage durability
+    /// requires a parent-directory sync after the delete. Missing paths keep
+    /// `delete`'s no-op semantics.
+    ///
+    /// Returns `NotSupported` if `file_path()` returns `None`.
+    fn delete_durable(&self, path: &str) -> PersistenceResult<()> {
+        if self.file_path(path).is_none() {
+            return Err(PersistenceError::NotSupported(
+                "delete_durable requires Directory::file_path()".into(),
+            ));
+        }
+        if !self.exists(path) {
+            return Ok(());
+        }
+        self.delete(path)?;
+        self.durable_sync_parent_dir(path)?;
+        Ok(())
+    }
+
     /// Atomically rename and then sync the destination parent directory.
     ///
     /// Returns `NotSupported` if `file_path()` returns `None`.

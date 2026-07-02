@@ -6,10 +6,13 @@ use std::sync::Arc;
 #[test]
 fn durable_ops_fail_fast_on_non_fs_backends() {
     let mem = MemoryDirectory::new();
+    mem.atomic_write("a.bin", b"hi").unwrap();
 
     // Should fail without mutating state.
     assert!(mem.atomic_write_durable("a.bin", b"hi").is_err());
     assert!(mem.atomic_rename_durable("a.bin", "b.bin").is_err());
+    assert!(mem.delete_durable("a.bin").is_err());
+    assert!(mem.exists("a.bin"));
 }
 
 #[test]
@@ -57,10 +60,25 @@ fn atomic_rename_durable_across_directories() {
 }
 
 #[test]
+fn delete_durable_removes_file_and_keeps_missing_noop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fs = FsDirectory::new(tmp.path()).unwrap();
+
+    fs.atomic_write("dir/a.bin", b"payload").unwrap();
+    fs.delete_durable("dir/a.bin").unwrap();
+
+    assert!(!fs.exists("dir/a.bin"));
+    fs.delete_durable("dir/a.bin").unwrap();
+}
+
+#[test]
 fn durable_ops_work_through_dyn_directory_when_fs_backed() {
     let tmp = tempfile::tempdir().unwrap();
     let dir: Arc<dyn Directory> = Arc::new(FsDirectory::new(tmp.path()).unwrap());
 
     // Free helpers work through &dyn Directory.
     let _ = durability::storage::sync_parent_dir(&*dir, "wal/wal_1.log").err();
+    dir.atomic_write("wal/wal_1.log", b"payload").unwrap();
+    dir.delete_durable("wal/wal_1.log").unwrap();
+    assert!(!dir.exists("wal/wal_1.log"));
 }

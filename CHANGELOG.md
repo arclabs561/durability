@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   raw streaming replay helpers, and `SyncWalWriter` byte append variants.
 - Added a default-enabled `postcard` feature for typed serde/postcard WAL,
   checkpoint, recovery, and publish helpers.
+- Added `Directory::delete_durable` for delete operations that need the same
+  parent-directory sync as durable renames and writes.
 
 ### Changed
 
