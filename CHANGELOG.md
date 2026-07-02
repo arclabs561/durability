@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `postcard` is now optional. Default builds keep the existing typed APIs;
   `default-features = false` builds expose the raw persistence primitives
   without compiling `postcard`.
+- `RecordLogWriter` now poisons itself after any write, flush, or sync error:
+  every later `append_bytes`/`flush`/`flush_and_sync` returns
+  `PersistenceError::InvalidState` instead of writing past a failure. Callers
+  that retried through a failed writer must reopen the log instead.
 
 ## [0.6.11] - 2026-06-28
 
