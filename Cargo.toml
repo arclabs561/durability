@@ -42,18 +42,30 @@ tempfile = "3.24.0"
 proptest = "1.9.0"
 criterion = { version = "0.5.1", features = ["html_reports"] }
 
+[[example]]
+name = "kv_store"
+required-features = ["postcard"]
+
+[[example]]
+name = "segment_lifecycle"
+required-features = ["postcard"]
+
 [[bench]]
 name = "bench_recordlog"
 harness = false
+required-features = ["postcard"]
 
 [[bench]]
 name = "bench_checkpoint"
 harness = false
+required-features = ["postcard"]
 
 [[bench]]
 name = "bench_walog"
 harness = false
+required-features = ["postcard"]
 
 [[bench]]
 name = "bench_recover"
 harness = false
+required-features = ["postcard"]

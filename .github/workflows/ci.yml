@@ -41,3 +41,17 @@ jobs:
         run: |
           cargo install cargo-semver-checks --locked || true
           cargo semver-checks
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.80.0
+
+      - name: check library with all features
+        run: cargo check --lib --all-features
+
+      - name: check raw library without default features
+        run: cargo check --lib --no-default-features

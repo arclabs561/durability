@@ -6,19 +6,13 @@
 //! Run:
 //! `cargo run -p durability --example kv_store`
 
-#[cfg(feature = "postcard")]
 use durability::checkpoint::CheckpointFile;
-#[cfg(feature = "postcard")]
 use durability::recover::{recover_with_wal, RecoveryOptions};
-#[cfg(feature = "postcard")]
 use durability::storage::FsDirectory;
-#[cfg(feature = "postcard")]
 use durability::walog::WalWriter;
-#[cfg(feature = "postcard")]
 use std::collections::BTreeMap;
 
 /// Custom WAL entry type for a key-value store.
-#[cfg(feature = "postcard")]
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 enum KvOp {
     Put { key: String, value: String },
@@ -26,19 +20,13 @@ enum KvOp {
 }
 
 /// Checkpoint: sorted key-value pairs.
-#[cfg(feature = "postcard")]
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct KvSnapshot {
     pairs: Vec<(String, String)>,
 }
 
-#[cfg(feature = "postcard")]
 type KvState = BTreeMap<String, String>;
 
-#[cfg(not(feature = "postcard"))]
-fn main() {}
-
-#[cfg(feature = "postcard")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tmp = tempfile::tempdir()?;
     let dir = FsDirectory::arc(tmp.path())?;

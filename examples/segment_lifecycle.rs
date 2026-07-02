@@ -8,19 +8,11 @@
 //! Run:
 //! `cargo run -p durability --example segment_lifecycle`
 
-#[cfg(feature = "postcard")]
 use durability::checkpoint::CheckpointFile;
-#[cfg(feature = "postcard")]
 use durability::recover::RecoveryManager;
-#[cfg(feature = "postcard")]
 use durability::storage::FsDirectory;
-#[cfg(feature = "postcard")]
 use durability::walog::{WalEntry, WalWriter};
 
-#[cfg(not(feature = "postcard"))]
-fn main() {}
-
-#[cfg(feature = "postcard")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tmp = tempfile::tempdir()?;
     let dir = FsDirectory::arc(tmp.path())?;

@@ -17,6 +17,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Verify version matches tag
         run: |
@@ -26,17 +28,68 @@ jobs:
             echo "Tag v$TAG does not match Cargo.toml version $CARGO_VERSION"
             exit 1
           fi
+          echo "VERSION=$CARGO_VERSION" >> "$GITHUB_ENV"
 
-      - name: Run tests
-        run: cargo test
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: no-default feature build
+        run: cargo test --no-default-features --lib
+
+      - name: doc
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+
+      - name: no-default docs
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --no-default-features
+
+      - name: examples
+        run: cargo build --examples --all-features
+
+      - name: test
+        run: cargo test --all-features
+
+      - name: Install MSRV Rust
+        run: rustup toolchain install 1.80.0 --profile minimal --no-self-update
+
+      - name: MSRV all-features library check
+        run: cargo +1.80.0 check --lib --all-features
+
+      - name: MSRV raw library check
+        run: cargo +1.80.0 check --lib --no-default-features
+
+      - name: Check crates.io version
+        id: crates
+        run: |
+          status=$(curl -sS -o /tmp/crate-version.json -w '%{http_code}' \
+            -A 'durability-publish-workflow' \
+            "https://crates.io/api/v1/crates/durability/${VERSION}")
+          case "$status" in
+            200)
+              echo "published=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              cat /tmp/crate-version.json
+              echo "Unexpected crates.io status: $status"
+              exit 1
+              ;;
+          esac
 
       - name: Dry run
+        if: steps.crates.outputs.published != 'true'
         run: cargo publish --dry-run
 
       - name: cargo-semver-checks
+        if: steps.crates.outputs.published != 'true'
         uses: obi1kenobi/cargo-semver-checks-action@v2
 
       - name: Authenticate (OIDC trusted publishing)
+        if: steps.crates.outputs.published != 'true'
         # Pin to a specific tag: rust-lang/crates-io-auth-action does not
         # publish a sliding `v1` major tag, so `@v1` resolves to v1.0.0
         # (Node 20). v1.0.4 uses Node 24 and avoids the deprecation
@@ -45,6 +98,7 @@ jobs:
         id: auth
 
       - name: Publish
+        if: steps.crates.outputs.published != 'true'
         run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
