@@ -15,7 +15,7 @@ reader visibility; those live one layer up.
 
 ```toml
 [dependencies]
-durability = "0.6"
+durability = "0.7"
 ```
 
 ```rust
@@ -144,7 +144,7 @@ The `async` feature provides `AsyncDirectory` and `BlockingBridge` for tokio:
 
 ```toml
 [dependencies]
-durability = { version = "0.6", features = ["async"] }
+durability = { version = "0.7", features = ["async"] }
 ```
 
 ```rust,no_run
