@@ -39,7 +39,7 @@ assert_eq!(records.len(), 2);
 assert_eq!(records[0].entry_id, 1);
 ```
 
-`WalWriter<E>` and `WalReader<E>` are generic -- define your own entry type with
+`WalWriter<E>` and `WalReader<E>` are generic: define your own entry type with
 `#[derive(Serialize, Deserialize)]` and use `WalWriter::<YourType>::open(dir)`.
 
 ## Feature flags
