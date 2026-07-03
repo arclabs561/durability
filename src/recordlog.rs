@@ -406,16 +406,16 @@ impl RecordLogReader {
                 Err(e) => return Err(e.into()),
             }
         };
-        let mut payload = vec![0u8; len as usize];
-        if let Err(e) = r.read_exact(&mut payload) {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        let payload = match storage::read_exact_bounded(&mut *r, len as usize) {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 return match mode {
                     RecordLogReadMode::Strict => Err(e.into()),
                     RecordLogReadMode::BestEffort => Ok(None),
                 };
             }
-            return Err(e.into());
-        }
+            Err(e) => return Err(e.into()),
+        };
         let got = crc32fast::hash(&payload);
         if got != expected_crc {
             return Err(PersistenceError::CrcMismatch {

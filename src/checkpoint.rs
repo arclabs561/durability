@@ -199,8 +199,7 @@ impl CheckpointFile {
                 len, MAX_CHECKPOINT_PAYLOAD_BYTES
             )));
         }
-        let mut payload = vec![0u8; len];
-        f.read_exact(&mut payload)?;
+        let payload = storage::read_exact_bounded(&mut *f, len)?;
         let got = crc32fast::hash(&payload);
         if got != h.checksum {
             return Err(PersistenceError::CrcMismatch {

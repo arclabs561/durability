@@ -43,6 +43,38 @@ proptest! {
 }
 
 #[test]
+fn checkpoint_read_rejects_truncated_payload_without_eager_allocation() {
+    // A corrupt payload_len between the true remaining bytes and the format
+    // cap must fail as a truncation error, and the payload buffer must grow
+    // with bytes actually read rather than eagerly allocating the claimed
+    // length (a corrupt 1 KB file claiming the 256 MiB cap would otherwise
+    // zero-allocate the full cap before read_exact failed).
+    use durability::checkpoint::CheckpointFile;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir: Arc<dyn Directory> = Arc::new(FsDirectory::new(tmp.path()).unwrap());
+
+    // Write a valid checkpoint with a 4 MiB payload, then truncate the file
+    // so the header's payload_len claims far more than the bytes present.
+    let payload = vec![0xABu8; 4 * 1024 * 1024];
+    let ckpt = CheckpointFile::new(dir.clone());
+    ckpt.write_bytes("ckpt.bin", 7, &payload).unwrap();
+
+    let raw = dir.file_path("ckpt.bin").expect("fs-backed path");
+    let full_len = std::fs::metadata(&raw).unwrap().len();
+    let f = std::fs::OpenOptions::new().write(true).open(&raw).unwrap();
+    f.set_len(full_len - payload.len() as u64 + 8).unwrap();
+    f.sync_all().unwrap();
+
+    let err = ckpt.read_bytes("ckpt.bin").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("truncated") || msg.to_lowercase().contains("eof"),
+        "expected a truncation error, got: {msg}"
+    );
+}
+
+#[test]
 fn recordlog_best_effort_never_panics_on_random_bytes_file() {
     let tmp = tempfile::tempdir().unwrap();
     let dir: Arc<dyn Directory> = Arc::new(FsDirectory::new(tmp.path()).unwrap());

@@ -11,6 +11,36 @@ use crate::error::{PersistenceError, PersistenceResult};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+/// Read exactly `len` payload bytes without trusting `len` for the upfront
+/// allocation.
+///
+/// The length came from a length prefix that has passed its format cap but is
+/// otherwise unverified: a corrupt value between the true remaining bytes and
+/// the cap would make an eager `vec![0u8; len]` allocate up to the cap (e.g.
+/// a 256 MiB zeroed buffer from a 1 KB corrupt checkpoint) before the read
+/// fails. Growing the buffer with the bytes actually read bounds the
+/// allocation by real data. A short read surfaces as `UnexpectedEof`, the
+/// same error class `read_exact` produces, so caller error handling and
+/// best-effort-tail semantics are unchanged.
+pub(crate) fn read_exact_bounded<R: std::io::Read + ?Sized>(
+    r: &mut R,
+    len: usize,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    // Cap the speculative reserve; beyond this, growth is amortized by
+    // read_to_end and tracks bytes actually present.
+    const INITIAL_RESERVE_CAP: usize = 1 << 20;
+    let mut payload = Vec::with_capacity(len.min(INITIAL_RESERVE_CAP));
+    let n = r.take(len as u64).read_to_end(&mut payload)?;
+    if n < len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("payload truncated: got {n} of {len} bytes"),
+        ));
+    }
+    Ok(payload)
+}
+
 /// Make the **data** of `path` durable (`fdatasync`).
 ///
 /// Uses `sync_data()` (fdatasync) rather than `sync_all()` (fsync). For

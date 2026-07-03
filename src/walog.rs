@@ -404,16 +404,16 @@ impl WalEntryOnDisk {
                 "WAL entry payload too large: {payload_len} bytes"
             )));
         }
-        let mut payload = vec![0u8; payload_len];
-        if let Err(e) = reader.read_exact(&mut payload) {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        let payload = match crate::storage::read_exact_bounded(reader, payload_len) {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 return match mode {
                     WalReplayMode::Strict => Err(e.into()),
                     WalReplayMode::BestEffortTail => Ok(None),
                 };
             }
-            return Err(e.into());
-        }
+            Err(e) => return Err(e.into()),
+        };
 
         let computed = crc32fast::hash(&payload);
         if computed != checksum {

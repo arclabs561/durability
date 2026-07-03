@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Length-prefixed payload reads (checkpoint, record log, WAL) no longer
+  allocate the claimed length up front. A corrupt length prefix between the
+  true remaining bytes and the format cap previously forced a zeroed
+  allocation up to the cap (256 MiB for checkpoints) before the read failed;
+  the buffer now grows with the bytes actually present, and a short read
+  still surfaces as the same truncation error class.
 - Recovery no longer falls back to an older checkpoint when a newer checkpoint's
   file is missing and the WAL does not provably start at entry 1. Prefix
   truncation could have dropped entries between the two, so replaying forward
