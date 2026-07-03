@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Recovery no longer falls back to an older checkpoint when a newer checkpoint's
+  file is missing and the WAL does not provably start at entry 1. Prefix
+  truncation could have dropped entries between the two, so replaying forward
+  from the older checkpoint risked silently skipping them; `recover_latest`
+  (and the best-effort variant) now return `InvalidState` instead. Recovery is
+  unaffected when the newest checkpoint file is present or when the WAL retains
+  the full entry-1 prefix.
+
 ## [0.6.12] - 2026-07-02
 
 ### Added

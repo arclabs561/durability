@@ -84,6 +84,16 @@ deleted or retained, and suffix segment present or absent.
 Deletion test: no production code should change unless this model finds a real
 counterexample. The first deliverable is a test/fault harness.
 
+Status: the silent-skip cell of the matrix is closed. When a checkpoint newer
+than the surviving one is missing AND the WAL does not provably start at entry
+1, `latest_checkpoint_from_wal` now refuses rather than falling back to the
+older checkpoint (which could skip entries a prefix truncation dropped). This
+is the Postgres-in-v11 choice: no automatic secondary-checkpoint fallback
+across an unproven prefix. The broader object-subset matrix (checkpoint file,
+WAL marker, prefix segment, suffix segment each present/absent) is still open;
+the RocksDB alternative, tracking WAL identity + synced size in the manifest so
+gaps are *detectable* rather than *refused*, remains a larger follow-up.
+
 Gate: a property or matrix test enumerates valid object-subset outcomes for
 checkpoint publish and recovery, and it passes under the default `cargo test`
 gate.

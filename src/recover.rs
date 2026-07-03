@@ -289,8 +289,26 @@ impl RecoveryManager {
             }
         }
 
-        if let Some((_, path)) = best {
-            return Ok(Some(path));
+        if let Some((best_id, best_path)) = best {
+            // A checkpoint newer than `best` had its file go missing. Falling
+            // back to the older surviving checkpoint is only safe when the WAL
+            // retains the full entry prefix (starts at entry 1); otherwise a
+            // prefix truncation may have dropped entries between `best` and the
+            // missing newer checkpoint, and replaying forward from `best` would
+            // silently skip them. Refuse rather than recover a gapped state --
+            // Postgres removed the analogous secondary-checkpoint fallback in
+            // v11 for exactly this reason.
+            if let Some((missing_id, missing_path, missing_last)) = &latest_missing {
+                if *missing_id > best_id && !wal_starts_at_entry_one {
+                    return Err(PersistenceError::InvalidState(format!(
+                        "checkpoint {missing_path} (WAL entry {missing_id}) is missing and newer \
+                         than the surviving checkpoint {best_path} (entry {best_id}); the WAL \
+                         prefix through entry {missing_last} is unavailable, so recovering from \
+                         {best_path} could skip entries dropped by prefix truncation"
+                    )));
+                }
+            }
+            return Ok(Some(best_path));
         }
 
         if let Some((marker_entry_id, path, checkpoint_last_entry_id)) = latest_missing {
@@ -420,8 +438,9 @@ impl RecoveryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::{WAL_FORMAT_VERSION, WAL_MAGIC};
     use crate::storage::MemoryDirectory;
-    use crate::walog::{WalEntry, WalWriter};
+    use crate::walog::{WalEntry, WalEntryOnDisk, WalSegmentHeader, WalWriter};
     use std::io::Read;
 
     #[test]
@@ -575,5 +594,90 @@ mod tests {
             .read_to_end(&mut b)
             .unwrap();
         assert_eq!(a, b);
+    }
+
+    /// Craft a single WAL segment file whose entries start at `start_entry_id`
+    /// (simulating a prefix truncation when `start_entry_id > 1`). `entries`
+    /// are appended contiguously from `start_entry_id`.
+    fn write_wal_segment(dir: &Arc<dyn Directory>, start_entry_id: u64, entries: &[WalEntry]) {
+        let mut buf = Vec::new();
+        WalSegmentHeader {
+            magic: WAL_MAGIC,
+            version: WAL_FORMAT_VERSION,
+            start_entry_id,
+            segment_id: 1,
+        }
+        .write(&mut buf)
+        .unwrap();
+        for (i, entry) in entries.iter().enumerate() {
+            let encoded = WalEntryOnDisk::encode(start_entry_id + i as u64, entry).unwrap();
+            buf.extend_from_slice(&encoded);
+        }
+        dir.atomic_write("wal/wal_1.log", &buf).unwrap();
+    }
+
+    /// The two checkpoint markers used by the fallback-safety tests: an older
+    /// checkpoint whose file exists, then a newer one whose file is missing.
+    fn markers_old_exists_new_missing() -> Vec<WalEntry> {
+        vec![
+            WalEntry::AddSegment {
+                segment_id: 1,
+                doc_count: 10,
+            },
+            WalEntry::Checkpoint {
+                checkpoint_path: "checkpoints/c_old.chk".into(),
+                last_entry_id: 1,
+            },
+            WalEntry::AddSegment {
+                segment_id: 2,
+                doc_count: 20,
+            },
+            WalEntry::Checkpoint {
+                checkpoint_path: "checkpoints/c_new.chk".into(),
+                last_entry_id: 3,
+            },
+        ]
+    }
+
+    fn write_existing_old_checkpoint(dir: &Arc<dyn Directory>) {
+        let ckpt = CheckpointFile::new(dir.clone());
+        let state = CheckpointState { segments: vec![] };
+        ckpt.write_postcard("checkpoints/c_old.chk", 1, &state)
+            .unwrap();
+    }
+
+    #[test]
+    fn recovery_refuses_older_checkpoint_when_newer_is_missing_and_prefix_truncated() {
+        // A newer checkpoint's file is gone and the WAL starts past entry 1, so
+        // the prefix between the old checkpoint and now may have been dropped by
+        // truncation. Falling back to the old checkpoint could silently skip
+        // entries; recovery must refuse instead.
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        write_existing_old_checkpoint(&dir);
+        write_wal_segment(&dir, 3, &markers_old_exists_new_missing());
+
+        let err = RecoveryManager::new(dir)
+            .latest_checkpoint_from_wal(false)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("c_new.chk") && msg.contains("could skip entries"),
+            "expected a prefix-truncation refusal, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn recovery_falls_back_to_older_checkpoint_when_prefix_is_intact() {
+        // Same missing-newer-checkpoint shape, but the WAL provably starts at
+        // entry 1, so replaying forward from the old checkpoint cannot skip
+        // anything. The fallback is safe and returns the surviving checkpoint.
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        write_existing_old_checkpoint(&dir);
+        write_wal_segment(&dir, 1, &markers_old_exists_new_missing());
+
+        let ckpt = RecoveryManager::new(dir)
+            .latest_checkpoint_from_wal(false)
+            .unwrap();
+        assert_eq!(ckpt.as_deref(), Some("checkpoints/c_old.chk"));
     }
 }
