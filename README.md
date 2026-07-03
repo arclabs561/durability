@@ -6,6 +6,11 @@
 
 Durability primitives for local persistence.
 
+`durability` is the I/O floor for the storage crates: filesystem and in-memory
+directories, atomic writes, WALs, record logs, checkpoint files, CRC validation,
+and sync helpers. It does not own indexing, segment selection, compaction, or
+reader visibility; those live one layer up.
+
 ## Quick start
 
 ```toml
@@ -47,6 +52,17 @@ With `default-features = false`, `durability` still provides `Directory`,
 `RecordLogWriter::append_bytes`, `RecordLogReader::read_all`,
 `CheckpointFile::{write_bytes, read_bytes}`, raw WAL append/replay, WAL
 maintenance, and sync helpers.
+
+## Backends
+
+`FsDirectory` is the stable-storage backend. It exposes filesystem paths for
+fsync, parent-directory sync, and mmap helpers. `MemoryDirectory` is useful for
+tests and process-local stores; it does not provide power-loss durability and
+cannot support mmap.
+
+The optional `mmap` feature provides `MappedFile` for read-only memory maps with
+advisory access hints. Higher-level crates decide which files are safe and useful
+to map.
 
 ## Thread-safe writer
 
