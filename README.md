@@ -173,7 +173,7 @@ let data = bridge.read_file("data.bin").await.unwrap();
 ## Not provided
 
 - **Multi-process locking**: single-writer-per-directory assumed. Advisory lockfile catches in-process double-instantiation only.
-- **Strong consistency by default**: writes are buffered. Use `flush_and_sync()` for a durability barrier.
+- **Per-write fsync by default**: writes are buffered. Use `flush_and_sync()` for a durability barrier.
 - **fsync failure recovery**: a failed fsync poisons the writer. Callers should treat this as unrecoverable and restart from WAL.
 
 ## Contract
