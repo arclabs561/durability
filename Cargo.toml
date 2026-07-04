@@ -21,7 +21,7 @@ targets = []
 [workspace]
 
 [dependencies]
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"], optional = true }
 thiserror = "2"
 
 crc32fast = "1.4"
@@ -35,7 +35,8 @@ libc = { version = "0.2", optional = true }
 default = ["postcard"]
 async = ["dep:tokio"]
 mmap = ["dep:memmap2", "dep:libc"]
-postcard = ["dep:postcard"]
+postcard = ["dep:postcard", "serde"]
+serde = ["dep:serde"]
 
 [dev-dependencies]
 tempfile = "3.24.0"

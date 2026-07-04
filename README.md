@@ -48,6 +48,9 @@ assert_eq!(records[0].entry_id, 1);
 `WalWriter::append`, `WalReader::replay`, `CheckpointFile::write_postcard`,
 `recover`, and `publish`.
 
+`serde` is enabled by `postcard`. In no-default builds, enable `serde` directly
+if you only need `WalEntry` serialization derives without postcard helpers.
+
 With `default-features = false`, `durability` still provides `Directory`,
 `RecordLogWriter::append_bytes`, `RecordLogReader::read_all`,
 `CheckpointFile::{write_bytes, read_bytes}`, raw WAL append/replay, WAL

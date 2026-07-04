@@ -121,7 +121,8 @@ pub trait WalObserver: Send + Sync {
 /// For custom domains, define your own `#[derive(Serialize, Deserialize)]` enum
 /// and use `WalWriter<YourEntry>` directly with the default `postcard` feature.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum WalEntry {
     /// A new segment became visible.
     AddSegment {
