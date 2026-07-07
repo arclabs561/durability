@@ -2,14 +2,13 @@
 
 [![crates.io](https://img.shields.io/crates/v/durability.svg)](https://crates.io/crates/durability)
 [![Documentation](https://docs.rs/durability/badge.svg)](https://docs.rs/durability)
-[![CI](https://github.com/arclabs561/durability/actions/workflows/ci.yml/badge.svg)](https://github.com/arclabs561/durability/actions/workflows/ci.yml)
 
 Durability primitives for local persistence.
 
-`durability` is the I/O floor for the storage crates: filesystem and in-memory
-directories, atomic writes, WALs, record logs, checkpoint files, CRC validation,
-and sync helpers. It does not own indexing, segment selection, compaction, or
-reader visibility; those live one layer up.
+`durability` provides filesystem and in-memory directories, atomic writes, WALs,
+record logs, checkpoint files, CRC validation, and sync helpers.
+
+It does not own indexing, segment selection, compaction, or reader visibility.
 
 ## Quick start
 
