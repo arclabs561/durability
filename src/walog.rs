@@ -15,7 +15,8 @@
 //!   (little-endian for integers).
 //! - **Entry ids are strictly increasing** across the concatenated replay stream.
 //! - **Entry framing**: `[length:u32][entry_id:u64][crc32:u32][payload bytes...]`.
-//! - **Checksum**: `crc32fast` over the payload bytes.
+//! - **Checksum**: format v3 uses `crc32fast` over `length | entry_id | payload`.
+//!   Legacy v2 WAL segments used a payload-only checksum and remain readable.
 //!
 //! ## On-disk layout
 //!
@@ -27,7 +28,7 @@
 //! Entry frame:
 //!   [length:u32][entry_id:u64][crc32:u32][payload bytes...]
 //!   length covers the entire frame (4 + 8 + 4 + payload_len).
-//!   CRC covers only the payload bytes.
+//!   CRC covers length, entry_id, and payload bytes for v3 segments.
 //! ```
 //!
 //! All integers are little-endian.
@@ -203,6 +204,39 @@ pub struct WalSegmentHeader {
     pub segment_id: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum WalChecksumMode {
+    PayloadOnly,
+    Frame,
+}
+
+impl WalChecksumMode {
+    fn for_version(version: u32) -> PersistenceResult<Self> {
+        match version {
+            2 => Ok(Self::PayloadOnly),
+            WAL_FORMAT_VERSION => Ok(Self::Frame),
+            _ => Err(PersistenceError::Format(format!(
+                "WAL version mismatch (got {version}, expected {WAL_FORMAT_VERSION} or legacy 2)"
+            ))),
+        }
+    }
+
+    fn checksum(self, length: u32, entry_id: u64, payload: &[u8]) -> u32 {
+        match self {
+            Self::PayloadOnly => crc32fast::hash(payload),
+            Self::Frame => wal_frame_checksum(length, entry_id, payload),
+        }
+    }
+}
+
+fn wal_frame_checksum(length: u32, entry_id: u64, payload: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&length.to_le_bytes());
+    hasher.update(&entry_id.to_le_bytes());
+    hasher.update(payload);
+    hasher.finalize()
+}
+
 impl WalSegmentHeader {
     /// Number of bytes in the serialized header.
     pub const SIZE: usize = 4 + 4 + 8 + 8;
@@ -228,11 +262,7 @@ impl WalSegmentHeader {
         let mut buf8 = [0u8; 8];
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        if version != WAL_FORMAT_VERSION {
-            return Err(PersistenceError::Format(format!(
-                "WAL version mismatch (got {version}, expected {WAL_FORMAT_VERSION})"
-            )));
-        }
+        WalChecksumMode::for_version(version)?;
 
         reader.read_exact(&mut buf8)?;
         let start_entry_id = u64::from_le_bytes(buf8);
@@ -316,12 +346,11 @@ impl WalEntryOnDisk {
                 payload.len()
             )));
         }
-        let checksum = crc32fast::hash(payload);
-
         // Frame: [length:u32][entry_id:u64][crc32:u32][payload...]
         let length_u64 = 4u64 + 8u64 + 4u64 + (payload.len() as u64);
         let length = u32::try_from(length_u64)
             .map_err(|_| PersistenceError::Format("WAL entry too large".into()))?;
+        let checksum = wal_frame_checksum(length, entry_id, payload);
 
         let mut encoded = Vec::with_capacity(4 + 8 + 4 + payload.len());
         encoded.extend_from_slice(&length.to_le_bytes());
@@ -346,7 +375,15 @@ impl WalEntryOnDisk {
         reader: &mut R,
         mode: WalReplayMode,
     ) -> PersistenceResult<Option<(u64, Vec<u8>)>> {
-        let Some(decoded) = Self::decode_raw_until(reader, mode, None)? else {
+        Self::decode_raw_with_checksum(reader, mode, WalChecksumMode::Frame)
+    }
+
+    fn decode_raw_with_checksum<R: Read>(
+        reader: &mut R,
+        mode: WalReplayMode,
+        checksum_mode: WalChecksumMode,
+    ) -> PersistenceResult<Option<(u64, Vec<u8>)>> {
+        let Some(decoded) = Self::decode_raw_until(reader, mode, None, checksum_mode)? else {
             return Ok(None);
         };
         match decoded {
@@ -361,6 +398,7 @@ impl WalEntryOnDisk {
         reader: &mut R,
         mode: WalReplayMode,
         max_entry_id: Option<u64>,
+        checksum_mode: WalChecksumMode,
     ) -> PersistenceResult<Option<WalRawDecode>> {
         let Some(length) = Self::read_u32_len(reader, mode)? else {
             return Ok(None);
@@ -416,7 +454,7 @@ impl WalEntryOnDisk {
             Err(e) => return Err(e.into()),
         };
 
-        let computed = crc32fast::hash(&payload);
+        let computed = checksum_mode.checksum(length, entry_id, &payload);
         if computed != checksum {
             return Err(PersistenceError::CrcMismatch {
                 expected: checksum,
@@ -884,9 +922,12 @@ impl<E> WalWriter<E> {
             // Non-last segment: decode strictly and track monotone entry_id.
             let header = WalSegmentHeader::read(&mut f)?;
             validate_header_segment_id(header, *segment_id)?;
-            while let Some((entry_id, _payload)) =
-                WalEntryOnDisk::decode_raw(&mut f, WalReplayMode::Strict)?
-            {
+            let checksum_mode = WalChecksumMode::for_version(header.version)?;
+            while let Some((entry_id, _payload)) = WalEntryOnDisk::decode_raw_with_checksum(
+                &mut f,
+                WalReplayMode::Strict,
+                checksum_mode,
+            )? {
                 validate_next_entry_id(last_seen_entry_id, entry_id)?;
                 last_seen_entry_id = Some(entry_id);
                 last_entry_id = entry_id;
@@ -1203,13 +1244,18 @@ fn scan_last_segment_prefix(
         Err(e) => return Err(e),
     };
     validate_header_segment_id(header, segment_id)?;
+    let checksum_mode = WalChecksumMode::for_version(header.version)?;
 
     let mut first_entry_id_in_segment: Option<u64> = None;
     let mut last_id = last_seen_entry_id;
 
     loop {
         let start_pos = cur.position() as usize;
-        match WalEntryOnDisk::decode_raw(&mut cur, WalReplayMode::BestEffortTail)? {
+        match WalEntryOnDisk::decode_raw_with_checksum(
+            &mut cur,
+            WalReplayMode::BestEffortTail,
+            checksum_mode,
+        )? {
             Some((entry_id, _payload)) => {
                 if first_entry_id_in_segment.is_none() {
                     first_entry_id_in_segment = Some(entry_id);
@@ -1477,6 +1523,7 @@ impl<E> WalReader<E> {
                 Err(e) => return Err(e),
             };
             validate_header_segment_id(header, segment_id)?;
+            let checksum_mode = WalChecksumMode::for_version(header.version)?;
 
             let mut first_entry_id_in_segment: Option<u64> = None;
 
@@ -1493,10 +1540,18 @@ impl<E> WalReader<E> {
 
             loop {
                 let decoded = match max_entry_id {
-                    Some(max) => {
-                        WalEntryOnDisk::decode_raw_until(&mut file, segment_mode, Some(max))?
-                    }
-                    None => WalEntryOnDisk::decode_raw_until(&mut file, segment_mode, None)?,
+                    Some(max) => WalEntryOnDisk::decode_raw_until(
+                        &mut file,
+                        segment_mode,
+                        Some(max),
+                        checksum_mode,
+                    )?,
+                    None => WalEntryOnDisk::decode_raw_until(
+                        &mut file,
+                        segment_mode,
+                        None,
+                        checksum_mode,
+                    )?,
                 };
 
                 match decoded {
@@ -1583,11 +1638,14 @@ impl WalMaintenance {
             let mut f = self.directory.open_file(&path)?;
             let header = WalSegmentHeader::read(&mut f)?;
             validate_header_segment_id(header, segment_id)?;
+            let checksum_mode = WalChecksumMode::for_version(header.version)?;
             let mut end: Option<u64> = None;
             let mut first: Option<u64> = None;
-            while let Some((entry_id, _payload)) =
-                WalEntryOnDisk::decode_raw(&mut f, WalReplayMode::Strict)?
-            {
+            while let Some((entry_id, _payload)) = WalEntryOnDisk::decode_raw_with_checksum(
+                &mut f,
+                WalReplayMode::Strict,
+                checksum_mode,
+            )? {
                 validate_next_entry_id(last_seen_entry_id, entry_id)?;
                 if first.is_none() {
                     first = Some(entry_id);
@@ -1981,6 +2039,42 @@ mod tests {
         f.flush().unwrap();
     }
 
+    fn encode_legacy_wal_entry(entry_id: u64, entry: &WalEntry) -> Vec<u8> {
+        let payload = postcard::to_allocvec(entry).unwrap();
+        let length = u32::try_from(4usize + 8usize + 4usize + payload.len()).unwrap();
+        let checksum = crc32fast::hash(&payload);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&length.to_le_bytes());
+        bytes.extend_from_slice(&entry_id.to_le_bytes());
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        bytes
+    }
+
+    fn write_legacy_wal_segment(
+        dir: &Arc<dyn Directory>,
+        seg_id: u64,
+        start_entry_id: u64,
+        entries: &[(u64, WalEntry)],
+    ) {
+        dir.create_dir_all("wal").unwrap();
+        let path = format!("wal/wal_{seg_id}.log");
+        let mut f = dir.create_file(&path).unwrap();
+        WalSegmentHeader {
+            magic: WAL_MAGIC,
+            version: 2,
+            start_entry_id,
+            segment_id: seg_id,
+        }
+        .write(&mut f)
+        .unwrap();
+        for (eid, e) in entries {
+            f.write_all(&encode_legacy_wal_entry(*eid, e)).unwrap();
+        }
+        f.flush().unwrap();
+    }
+
     fn read_all(dir: &Arc<dyn Directory>, path: &str) -> Vec<u8> {
         let mut f = dir.open_file(path).unwrap();
         let mut buf = Vec::new();
@@ -2111,6 +2205,103 @@ mod tests {
         let err =
             WalEntryOnDisk::decode::<WalEntry, _>(&mut cur, WalReplayMode::Strict).unwrap_err();
         assert!(err.to_string().contains("crc mismatch"));
+    }
+
+    #[test]
+    fn wal_reader_rejects_entry_id_header_corruption() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        write_wal_segment(
+            &dir,
+            1,
+            1,
+            &[
+                (
+                    1,
+                    WalEntry::AddSegment {
+                        segment_id: 1,
+                        doc_count: 1,
+                    },
+                ),
+                (
+                    3,
+                    WalEntry::AddSegment {
+                        segment_id: 3,
+                        doc_count: 1,
+                    },
+                ),
+            ],
+        );
+
+        let mut bytes = read_all(&dir, "wal/wal_1.log");
+        let first = WalEntryOnDisk::encode(
+            1,
+            &WalEntry::AddSegment {
+                segment_id: 1,
+                doc_count: 1,
+            },
+        )
+        .unwrap();
+        let second_entry_id = WalSegmentHeader::SIZE + first.len() + 4;
+        bytes[second_entry_id] ^= 0x01; // 3 -> 2 in little-endian entry_id
+        dir.atomic_write("wal/wal_1.log", &bytes).unwrap();
+
+        let err = WalReader::<WalEntry>::new(dir).replay().unwrap_err();
+        assert!(matches!(err, PersistenceError::CrcMismatch { .. }));
+    }
+
+    #[test]
+    fn wal_reader_rejects_length_header_corruption() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        write_wal_segment(
+            &dir,
+            1,
+            1,
+            &[(
+                1,
+                WalEntry::AddSegment {
+                    segment_id: 1,
+                    doc_count: 1,
+                },
+            )],
+        );
+
+        let mut bytes = read_all(&dir, "wal/wal_1.log");
+        bytes[WalSegmentHeader::SIZE] += 1;
+        bytes.push(0xAA);
+        dir.atomic_write("wal/wal_1.log", &bytes).unwrap();
+
+        let err = WalReader::<WalEntry>::new(dir).replay().unwrap_err();
+        assert!(matches!(err, PersistenceError::CrcMismatch { .. }));
+    }
+
+    #[test]
+    fn wal_reader_replays_legacy_payload_only_checksum_segment() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        write_legacy_wal_segment(
+            &dir,
+            1,
+            1,
+            &[
+                (
+                    1,
+                    WalEntry::AddSegment {
+                        segment_id: 1,
+                        doc_count: 1,
+                    },
+                ),
+                (
+                    2,
+                    WalEntry::DeleteDocuments {
+                        deletes: vec![(1, 0)],
+                    },
+                ),
+            ],
+        );
+
+        let records = WalReader::<WalEntry>::new(dir).replay().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].entry_id, 1);
+        assert_eq!(records[1].entry_id, 2);
     }
 
     #[test]

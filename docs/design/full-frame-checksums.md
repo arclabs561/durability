@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: implemented
 date: 2026-07-09
 scope: checkpoint and WAL on-disk formats
 grounded-in:
@@ -15,8 +15,8 @@ grounded-in:
 
 ## Problem
 
-`checkpoint` and `walog` currently CRC-check payload bytes, not the full durable
-record boundary.
+Legacy `checkpoint` and `walog` formats CRC-checked payload bytes, not the full
+durable record boundary.
 
 - Checkpoints store `last_applied_id` and `payload_len` in the header. A bit flip
   in `last_applied_id` can make recovery skip or replay the wrong WAL suffix
@@ -26,8 +26,8 @@ record boundary.
   flip that still matches the expected sequence can pass with a valid payload
   CRC.
 
-The current checks are useful, but they are not a complete integrity proof for
-the record boundary that recovery actually trusts.
+Those checks were useful, but they were not a complete integrity proof for the
+record boundary that recovery actually trusts.
 
 ## External Evidence
 
@@ -51,14 +51,14 @@ The adjacent Rust storage crates draw a useful boundary:
 Keep `durability` a primitive layer. Do not add B-tree/LSM storage, query APIs,
 transactions, MVCC, compaction policy, or reader visibility here.
 
-For the next on-disk format revision, make the existing checksum fields cover
-the durable record boundary:
+The on-disk format revision makes the existing checksum fields cover the
+durable record boundary:
 
-- `checkpoint` writes a new format version whose `checksum` field is
+- `checkpoint` writes format version 2. Its `checksum` field is
   `crc32(header_prefix || payload)`, where `header_prefix` is:
   `magic | version | last_applied_id | payload_len`. The checksum field itself
   is excluded.
-- `walog` writes a new WAL segment format version whose frame checksum is
+- `walog` writes WAL segment format version 3. Its frame checksum is
   `crc32(length | entry_id | payload)`. The checksum field itself is excluded,
   so the frame size does not change.
 - Readers should accept the previous format versions as legacy read-only inputs
@@ -93,16 +93,12 @@ Rejected for now. `okaywal` has useful ideas around fsync batching and recovery
 callbacks, but adopting its lifecycle would duplicate existing `publish` and
 `recover` contracts. The immediate issue is checksum coverage, not WAL ownership.
 
-## Implementation Gates
+## Implementation Notes
 
-1. Add failing tests that corrupt checkpoint `last_applied_id`, checkpoint
-   `payload_len`, WAL `entry_id`, and WAL `length` while leaving payload bytes
-   unchanged.
-2. Add version-aware decode paths for legacy checkpoint and WAL formats.
-3. Switch new checkpoint and WAL writes to the full-frame checksum semantics.
-4. Extend fuzz/property tests so random header corruption either errors or
-   yields a documented torn-tail prefix, never a trusted wrong metadata value.
-5. Publish as a minor `0.x` release because new writes use a new on-disk format.
+The implementation added regression tests for checkpoint `last_applied_id`,
+checkpoint `payload_len`, WAL `entry_id`, and WAL `length` corruption, plus
+legacy checkpoint v1 and WAL v2 read paths. Existing parser property tests
+continue to cover arbitrary header bytes without panics or eager allocation.
 
 ## Non-Goals
 

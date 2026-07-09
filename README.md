@@ -182,7 +182,7 @@ let data = bridge.read_file("data.bin").await.unwrap();
 
 - **Prefix property**: best-effort replay returns a prefix of the valid stream.
 - **Narrow best-effort**: tolerance applies only to the final segment's torn tail. Corruption in non-final segments is an error.
-- **Checksum coverage**: the current checkpoint and WAL formats CRC-check payload bytes. Full-frame checksum coverage is tracked in [docs/design/full-frame-checksums.md](docs/design/full-frame-checksums.md).
+- **Checksum coverage**: current checkpoint and WAL writes CRC-check the durable metadata they trust plus the payload. Legacy checkpoint v1 and WAL v2 files with payload-only CRCs remain readable.
 - **Deterministic checkpoints**: payloads are written with stable ordering.
 
 ## Running

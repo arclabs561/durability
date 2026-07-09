@@ -7,14 +7,16 @@
 //!
 //! ## Public invariants (must not change without a format bump)
 //!
-//! - **Header**: `[CHECKPOINT_MAGIC][FORMAT_VERSION][last_applied_id:u64][payload_len:u64][crc32:u32]`
+//! - **Header**: `[CHECKPOINT_MAGIC][CHECKPOINT_FORMAT_VERSION][last_applied_id:u64][payload_len:u64][crc32:u32]`
 //!   (little-endian for integers).
-//! - **Checksum**: `crc32fast` over the payload bytes.
+//! - **Checksum**: format v2 uses `crc32fast` over
+//!   `magic | version | last_applied_id | payload_len | payload`.
+//!   Legacy v1 checkpoints used a payload-only checksum and remain readable.
 //! - **`last_applied_id` semantics**: replay log entries with id \(>\) `last_applied_id`.
 //! - **Atomicity**: `CheckpointFile` writes via `Directory::atomic_write`.
 
 use crate::error::{PersistenceError, PersistenceResult};
-use crate::formats::{CHECKPOINT_MAGIC, FORMAT_VERSION};
+use crate::formats::{CHECKPOINT_FORMAT_VERSION, CHECKPOINT_MAGIC, FORMAT_VERSION};
 use crate::storage::{self, Directory};
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -38,7 +40,7 @@ pub struct CheckpointHeader {
     pub last_applied_id: u64,
     /// Payload length in bytes.
     pub payload_len: u64,
-    /// CRC32 computed over payload bytes.
+    /// CRC32 computed over the version-specific covered bytes.
     pub checksum: u32,
 }
 
@@ -50,7 +52,7 @@ impl CheckpointHeader {
     pub(crate) fn new(last_applied_id: u64, payload_len: u64, checksum: u32) -> Self {
         Self {
             magic: CHECKPOINT_MAGIC,
-            version: FORMAT_VERSION,
+            version: CHECKPOINT_FORMAT_VERSION,
             last_applied_id,
             payload_len,
             checksum,
@@ -78,10 +80,10 @@ impl CheckpointHeader {
         let mut buf8 = [0u8; 8];
         r.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        if version != FORMAT_VERSION {
-            return Err(PersistenceError::Format(
-                "checkpoint version mismatch".into(),
-            ));
+        if version != FORMAT_VERSION && version != CHECKPOINT_FORMAT_VERSION {
+            return Err(PersistenceError::Format(format!(
+                "checkpoint version mismatch (got {version}, expected {CHECKPOINT_FORMAT_VERSION} or legacy {FORMAT_VERSION})"
+            )));
         }
         r.read_exact(&mut buf8)?;
         let last_applied_id = u64::from_le_bytes(buf8);
@@ -97,6 +99,25 @@ impl CheckpointHeader {
             checksum,
         })
     }
+}
+
+fn checkpoint_checksum(
+    version: u32,
+    last_applied_id: u64,
+    payload_len: u64,
+    payload: &[u8],
+) -> u32 {
+    if version == FORMAT_VERSION {
+        return crc32fast::hash(payload);
+    }
+
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&CHECKPOINT_MAGIC);
+    hasher.update(&version.to_le_bytes());
+    hasher.update(&last_applied_id.to_le_bytes());
+    hasher.update(&payload_len.to_le_bytes());
+    hasher.update(payload);
+    hasher.finalize()
 }
 
 /// Read/write checkpoint files in a `Directory`.
@@ -148,7 +169,12 @@ impl CheckpointFile {
                 MAX_CHECKPOINT_PAYLOAD_BYTES
             )));
         }
-        let checksum = crc32fast::hash(payload);
+        let checksum = checkpoint_checksum(
+            CHECKPOINT_FORMAT_VERSION,
+            last_applied_id,
+            payload.len() as u64,
+            payload,
+        );
         let h = CheckpointHeader::new(last_applied_id, payload.len() as u64, checksum);
         let mut buf = Vec::with_capacity(CheckpointHeader::SIZE + payload.len());
         h.write(&mut buf)?;
@@ -200,7 +226,7 @@ impl CheckpointFile {
             )));
         }
         let payload = storage::read_exact_bounded(&mut *f, len)?;
-        let got = crc32fast::hash(&payload);
+        let got = checkpoint_checksum(h.version, h.last_applied_id, h.payload_len, &payload);
         if got != h.checksum {
             return Err(PersistenceError::CrcMismatch {
                 expected: h.checksum,
@@ -273,6 +299,7 @@ impl CheckpointFile {
 mod raw_tests {
     use super::*;
     use crate::storage::MemoryDirectory;
+    use std::io::Read;
 
     #[test]
     fn checkpoint_roundtrip_bytes() {
@@ -283,6 +310,59 @@ mod raw_tests {
         let (last_id, out) = ckpt.read_bytes("c.bin").unwrap();
         assert_eq!(last_id, 42);
         assert_eq!(out, b"raw snapshot");
+    }
+
+    #[test]
+    fn checkpoint_rejects_last_applied_id_corruption() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let ckpt = CheckpointFile::new(dir.clone());
+        ckpt.write_bytes("c.bin", 42, b"raw snapshot").unwrap();
+
+        let mut f = dir.open_file("c.bin").unwrap();
+        let mut bytes = Vec::new();
+        f.read_to_end(&mut bytes).unwrap();
+        bytes[8] ^= 0x01; // first byte of last_applied_id
+        dir.atomic_write("c.bin", &bytes).unwrap();
+
+        let err = ckpt.read_bytes("c.bin").unwrap_err();
+        assert!(matches!(err, PersistenceError::CrcMismatch { .. }));
+    }
+
+    #[test]
+    fn checkpoint_rejects_payload_len_corruption() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let ckpt = CheckpointFile::new(dir.clone());
+        ckpt.write_bytes("c.bin", 42, b"raw snapshot").unwrap();
+
+        let mut f = dir.open_file("c.bin").unwrap();
+        let mut bytes = Vec::new();
+        f.read_to_end(&mut bytes).unwrap();
+        bytes[16] ^= 0x01; // first byte of payload_len
+        bytes.push(0);
+        dir.atomic_write("c.bin", &bytes).unwrap();
+
+        let err = ckpt.read_bytes("c.bin").unwrap_err();
+        assert!(matches!(err, PersistenceError::CrcMismatch { .. }));
+    }
+
+    #[test]
+    fn checkpoint_reads_legacy_payload_only_checksum() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let ckpt = CheckpointFile::new(dir.clone());
+        let payload = b"legacy snapshot";
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&CHECKPOINT_MAGIC);
+        bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&7u64.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        dir.atomic_write("legacy.bin", &bytes).unwrap();
+
+        let (last_id, out) = ckpt.read_bytes("legacy.bin").unwrap();
+        assert_eq!(last_id, 7);
+        assert_eq!(out, payload);
     }
 }
 
