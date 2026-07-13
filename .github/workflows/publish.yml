@@ -13,11 +13,12 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
+          toolchain: "stable"
           components: rustfmt, clippy
 
       - name: Verify version matches tag
@@ -86,7 +87,7 @@ jobs:
 
       - name: cargo-semver-checks
         if: steps.crates.outputs.published != 'true'
-        uses: obi1kenobi/cargo-semver-checks-action@v2
+        uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
 
       - name: Authenticate (OIDC trusted publishing)
         if: steps.crates.outputs.published != 'true'
@@ -94,7 +95,7 @@ jobs:
         # publish a sliding `v1` major tag, so `@v1` resolves to v1.0.0
         # (Node 20). v1.0.4 uses Node 24 and avoids the deprecation
         # warning enforced June 2026.
-        uses: rust-lang/crates-io-auth-action@v1.0.4
+        uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
         id: auth
 
       - name: Publish
