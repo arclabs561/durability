@@ -191,3 +191,8 @@ let data = bridge.read_file("data.bin").await.unwrap();
 - Property tests: `PROPTEST_CASES=512 cargo test --test prop_wal_resume`
 - Benches: `cargo bench`
 - Fuzzing: `cargo fuzz run fuzz_wal_entry_decode` (see `fuzz/`)
+
+## License
+
+Licensed under either the [Apache License, Version 2.0](LICENSE-APACHE) or
+the [MIT license](LICENSE-MIT), at your option.
