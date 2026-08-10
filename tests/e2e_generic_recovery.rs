@@ -398,9 +398,9 @@ fn point_in_time_with_cutoff_zero_applies_nothing() {
 #[test]
 fn generic_recovery_on_fs_directory() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir: Arc<dyn Directory> = Arc::new(FsDirectory::new(tmp.path()).unwrap());
+    let writer_dir: Arc<dyn Directory> = Arc::new(FsDirectory::new(tmp.path()).unwrap());
 
-    let mut w = WalWriter::<KvOp>::new(dir.clone());
+    let mut w = WalWriter::<KvOp>::new(writer_dir.clone());
     w.append(&KvOp::Put {
         key: "fs_key".into(),
         value: "fs_val".into(),
@@ -408,9 +408,14 @@ fn generic_recovery_on_fs_directory() {
     .unwrap();
     w.flush().unwrap();
     drop(w);
+    drop(writer_dir);
+
+    // Reconstruct the filesystem backend to model recovery in a fresh process,
+    // rather than relying on state retained by the writer's Directory object.
+    let reader_dir: Arc<dyn Directory> = Arc::new(FsDirectory::new(tmp.path()).unwrap());
 
     let result = recover_with_wal::<KvCheckpoint, KvOp, _>(
-        &dir,
+        &reader_dir,
         None,
         RecoveryOptions::strict(),
         kv_init,
