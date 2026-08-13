@@ -913,7 +913,6 @@ impl<E> WalWriter<E> {
         let mut w = Self::with_options(directory.clone(), FlushPolicy::EveryN(64), 64 * 1024);
         w.acquire_wal_lock()?;
 
-        let mut last_entry_id: u64 = 0;
         let mut last_seen_entry_id: Option<u64> = None;
 
         for (i, (segment_id, wal_file)) in wal_segments.iter().enumerate() {
@@ -933,16 +932,11 @@ impl<E> WalWriter<E> {
                     bytes.truncate(valid_len);
                 }
 
-                if let Some(id) = last_in_file {
-                    last_entry_id = id;
-                }
-
                 w.wal_dir_ready = true;
                 w.current_segment_id = *segment_id;
-                w.current_entry_id = if last_in_file.is_some() {
-                    checked_next_entry_id(last_entry_id)?
-                } else {
-                    1
+                w.current_entry_id = match last_in_file.or(last_seen_entry_id) {
+                    Some(id) => checked_next_entry_id(id)?,
+                    None => 1,
                 };
                 w.current_offset = u64::try_from(bytes.len()).map_err(|_| {
                     PersistenceError::Format("WAL file length overflows u64".into())
@@ -963,7 +957,6 @@ impl<E> WalWriter<E> {
             )? {
                 validate_next_entry_id(last_seen_entry_id, entry_id)?;
                 last_seen_entry_id = Some(entry_id);
-                last_entry_id = entry_id;
             }
         }
 
