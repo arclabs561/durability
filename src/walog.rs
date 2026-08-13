@@ -767,11 +767,17 @@ impl<E> WalWriter<E> {
         self.current_offset + self.write_buffer.len() as u64
     }
 
-    /// Append multiple entries atomically (single flush).
+    /// Append multiple entries with pre-encoding and a single flush.
     ///
-    /// All entries are buffered and written together, then flushed once.
-    /// This amortizes the cost of `flush()` across multiple entries without
-    /// thread coordination.
+    /// All entries are encoded before any are written. This prevents an encode
+    /// failure partway through the input from appending only the encodable
+    /// prefix. The encoded entries are then appended in order and flushed once,
+    /// amortizing the cost of `flush()` without thread coordination.
+    ///
+    /// This is **not** a transactional or crash-atomic batch. Each entry has its
+    /// own frame and checksum, so recovery after a torn write may return a valid
+    /// prefix of the batch. Use domain-level transaction records when several
+    /// entries must become visible as one logical operation.
     ///
     /// Returns the entry IDs assigned to each entry (in order).
     /// If any entry fails to encode, no entries are written.
@@ -1839,7 +1845,10 @@ impl<E> SyncWalWriter<E> {
             .append(entry)
     }
 
-    /// Append multiple entries as a batch.
+    /// Append multiple entries with pre-encoding and one flush.
+    ///
+    /// This has the same non-transactional crash semantics as
+    /// [`WalWriter::append_batch`]: recovery may observe a valid prefix.
     #[cfg(feature = "postcard")]
     pub fn append_batch(&self, entries: &[E]) -> PersistenceResult<Vec<u64>>
     where
@@ -2765,7 +2774,7 @@ mod tests {
     }
 
     #[test]
-    fn wal_append_batch_writes_atomically() {
+    fn wal_append_batch_writes_all_entries_in_order() {
         let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
         let mut w = WalWriter::<WalEntry>::new(dir.clone());
 
