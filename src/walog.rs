@@ -567,6 +567,12 @@ fn validate_next_entry_id(prev: Option<u64>, entry_id: u64) -> PersistenceResult
     Ok(())
 }
 
+fn checked_next_entry_id(entry_id: u64) -> PersistenceResult<u64> {
+    entry_id.checked_add(1).ok_or_else(|| {
+        PersistenceError::InvalidState(format!("WAL entry id space exhausted after {entry_id}"))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // WalWriter (generic)
 // ---------------------------------------------------------------------------
@@ -803,6 +809,12 @@ impl<E> WalWriter<E> {
             return Ok(Vec::new());
         }
 
+        // Validate the complete ID range before opening or writing a segment.
+        // The writer must always retain a representable ID for the next append.
+        for (entry_id, _) in &encoded_pairs {
+            checked_next_entry_id(*entry_id)?;
+        }
+
         // Write all entries.
         let mut ids = Vec::with_capacity(encoded_pairs.len());
         for (entry_id, encoded) in encoded_pairs {
@@ -813,7 +825,7 @@ impl<E> WalWriter<E> {
             if let Some(obs) = &self.observer {
                 obs.on_append(entry_id, encoded_len);
             }
-            self.current_entry_id = entry_id + 1;
+            self.current_entry_id = checked_next_entry_id(entry_id)?;
             ids.push(entry_id);
         }
 
@@ -829,7 +841,18 @@ impl<E> WalWriter<E> {
     {
         // Pre-encode all entries to detect errors before writing any.
         let mut encoded_pairs: Vec<(u64, Vec<u8>)> = Vec::with_capacity(entries.len());
-        for (next_id, entry) in (self.current_entry_id..).zip(entries.iter()) {
+        let entry_count = u64::try_from(entries.len())
+            .map_err(|_| PersistenceError::InvalidState("WAL batch length exceeds u64".into()))?;
+        let end_entry_id = self
+            .current_entry_id
+            .checked_add(entry_count)
+            .ok_or_else(|| {
+                PersistenceError::InvalidState(format!(
+                    "WAL entry id space exhausted after {}",
+                    self.current_entry_id
+                ))
+            })?;
+        for (next_id, entry) in (self.current_entry_id..end_entry_id).zip(entries.iter()) {
             let encoded = WalEntryOnDisk::encode(next_id, entry)?;
             encoded_pairs.push((next_id, encoded));
         }
@@ -916,7 +939,11 @@ impl<E> WalWriter<E> {
 
                 w.wal_dir_ready = true;
                 w.current_segment_id = *segment_id;
-                w.current_entry_id = last_entry_id.saturating_add(1).max(1);
+                w.current_entry_id = if last_in_file.is_some() {
+                    checked_next_entry_id(last_entry_id)?
+                } else {
+                    1
+                };
                 w.current_offset = u64::try_from(bytes.len()).map_err(|_| {
                     PersistenceError::Format("WAL file length overflows u64".into())
                 })?;
@@ -1209,6 +1236,7 @@ impl<E> WalWriter<E> {
                 "WAL writer is poisoned after a prior write error".into(),
             ));
         }
+        let next_entry_id = checked_next_entry_id(entry_id)?;
         let _wal_path = self.ensure_segment_open(entry_id)?;
         let encoded_len = encoded.len();
 
@@ -1220,7 +1248,7 @@ impl<E> WalWriter<E> {
             obs.on_append(entry_id, encoded_len);
         }
 
-        self.current_entry_id += 1;
+        self.current_entry_id = next_entry_id;
         Ok(entry_id)
     }
 }
@@ -2048,6 +2076,15 @@ mod tests {
         f.flush().unwrap();
     }
 
+    fn wal_segment_bytes(dir: &Arc<dyn Directory>, segment_id: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        dir.open_file(&format!("wal/wal_{segment_id}.log"))
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        bytes
+    }
+
     fn encode_legacy_wal_entry(entry_id: u64, entry: &WalEntry) -> Vec<u8> {
         let payload = postcard::to_allocvec(entry).unwrap();
         let length = u32::try_from(4usize + 8usize + 4usize + payload.len()).unwrap();
@@ -2497,6 +2534,94 @@ mod tests {
         let r = WalReader::<WalEntry>::new(dir);
         let err = r.replay().unwrap_err();
         assert!(err.to_string().contains("entry_id overflow"));
+    }
+
+    #[test]
+    fn wal_resume_rejects_exhausted_entry_id_without_mutating_segment() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        write_wal_segment(
+            &dir,
+            1,
+            u64::MAX,
+            &[(
+                u64::MAX,
+                WalEntry::AddSegment {
+                    segment_id: 1,
+                    doc_count: 1,
+                },
+            )],
+        );
+        let before = wal_segment_bytes(&dir, 1);
+
+        let err = match WalWriter::<WalEntry>::resume(dir.clone()) {
+            Ok(_) => panic!("an exhausted WAL must not resume for appends"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, PersistenceError::InvalidState(_)));
+        assert!(err.to_string().contains("entry id space exhausted"));
+        assert_eq!(wal_segment_bytes(&dir, 1), before);
+    }
+
+    #[test]
+    fn wal_append_rejects_last_unrepresentable_id_without_mutating_segment() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        write_wal_segment(
+            &dir,
+            1,
+            u64::MAX - 1,
+            &[(
+                u64::MAX - 1,
+                WalEntry::AddSegment {
+                    segment_id: 1,
+                    doc_count: 1,
+                },
+            )],
+        );
+        let before = wal_segment_bytes(&dir, 1);
+        let mut writer = WalWriter::<WalEntry>::resume(dir.clone()).unwrap();
+
+        let err = writer
+            .append(&WalEntry::AddSegment {
+                segment_id: 2,
+                doc_count: 2,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, PersistenceError::InvalidState(_)));
+        assert!(err.to_string().contains("entry id space exhausted"));
+        assert_eq!(writer.next_entry_id(), u64::MAX);
+        assert_eq!(wal_segment_bytes(&dir, 1), before);
+    }
+
+    #[test]
+    fn wal_append_batch_rejects_entry_id_overflow_without_mutating_segment() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        write_wal_segment(
+            &dir,
+            1,
+            u64::MAX - 1,
+            &[(
+                u64::MAX - 1,
+                WalEntry::AddSegment {
+                    segment_id: 1,
+                    doc_count: 1,
+                },
+            )],
+        );
+        let before = wal_segment_bytes(&dir, 1);
+        let mut writer = WalWriter::<WalEntry>::resume(dir.clone()).unwrap();
+        let entries = [WalEntry::AddSegment {
+            segment_id: 2,
+            doc_count: 2,
+        }];
+
+        let err = writer.append_batch(&entries).unwrap_err();
+
+        assert!(matches!(err, PersistenceError::InvalidState(_)));
+        assert!(err.to_string().contains("entry id space exhausted"));
+        assert_eq!(writer.next_entry_id(), u64::MAX);
+        assert_eq!(wal_segment_bytes(&dir, 1), before);
     }
 
     #[test]
