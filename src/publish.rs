@@ -1,4 +1,4 @@
-//! Crash-safe checkpoint publishing and WAL truncation helpers.
+//! Checkpoint publishing and WAL truncation helpers with explicit sync steps.
 //!
 //! This module exists because "checkpoint + WAL + truncation" is where real systems most
 //! often get the durability story wrong. The safe rule is:

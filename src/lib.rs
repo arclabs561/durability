@@ -1,5 +1,5 @@
 #![warn(missing_docs)]
-//! `durability`: crash-consistent persistence primitives.
+//! `durability`: persistence primitives with explicit recovery and sync contracts.
 //!
 //! Scope:
 //! - directory abstraction (`Directory`)
@@ -22,7 +22,7 @@
 //!
 //! This crate is designed around two different “strength levels”:
 //!
-//! - **Crash-consistent + integrity-checked** (default)
+//! - **Integrity-checked recovery** (default)
 //!   - Detects corruption (CRC/magic/version/type mismatches) and errors loudly.
 //!   - Supports best-effort recovery of a **torn tail** (partial record write) in the **final**
 //!     log segment.
@@ -31,7 +31,8 @@
 //! - **Stable-storage durability** (opt-in)
 //!   - Requires explicit barriers (`fsync`/`sync_all`) and sometimes **parent directory sync**.
 //!   - Use [`storage::sync_file`] / [`storage::sync_parent_dir`] and `flush_and_sync()` helpers
-//!     where you need “survives power loss after success” semantics.
+//!     where the filesystem and storage stack provide the required persistence
+//!     semantics. The crate does not make a universal power-loss guarantee.
 //!
 //! Terminology:
 //! - `flush()` is a **visibility boundary**, not a stable-storage guarantee.

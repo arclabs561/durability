@@ -169,7 +169,7 @@ let data = bridge.read_file("data.bin").await.unwrap();
 | `recordlog` | Append-only single-file log with CRC framing |
 | `checkpoint` | CRC-validated snapshot files |
 | `recover` | Generic `recover_with_wal()` + segment-specific `RecoveryManager` (feature `postcard`) |
-| `publish` | Crash-safe checkpoint publish + WAL truncation (feature `postcard`) |
+| `publish` | Checkpoint publish + WAL truncation with explicit sync steps (feature `postcard`) |
 | `async_dir` | `AsyncDirectory` trait + `BlockingBridge` (feature `async`) |
 
 ## Not provided
