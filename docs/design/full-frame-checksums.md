@@ -3,7 +3,6 @@ status: implemented
 date: 2026-07-09
 scope: checkpoint and WAL on-disk formats
 grounded-in:
-  - /Users/arc/Documents/dev/_notes/perplexity-2026-07-09_160739-durability-segstore-critique-round-3-consumer-ecosystem.md
   - https://github.com/khonsulabs/okaywal
   - https://github.com/cberner/redb
   - https://docs.rs/sled/latest/sled/
