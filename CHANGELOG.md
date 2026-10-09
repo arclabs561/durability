@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-10-09
+
+### Fixed
+
+- `WalWriter::resume` no longer truncates the last segment at a frame whose
+  length runs past EOF when a valid frame follows it. A flipped bit in a
+  length field previously looked like a torn tail, so resume deleted every
+  later synced record and reused their entry IDs; it now returns an error.
+- `RecordLogWriter` cuts a torn tail before appending to an existing log.
+  Records appended after a partial record (from a crash or a full disk) were
+  unreadable because every read stopped at the torn bytes with
+  `CrcMismatch`.
+- `wal/.lock` is now held with an OS file lock (`fs4`) instead of a file
+  created with `O_EXCL` and removed on drop. A crash no longer leaves a stale
+  lock that blocks `resume`, and `resume_after_crash` no longer deletes the
+  lock of a live writer.
+- Strictly decoded (non-final) WAL segments treat zero padding through EOF as
+  the end of the segment. A crash during rotation with preallocation could
+  leave an older segment zero-padded, which made the whole WAL unreadable.
+  The rotation shrink is now checked and synced.
+- Resuming after a torn final segment continues entry IDs from the previous
+  segment instead of restarting at 1.
+- Appends that would overflow the `u64` entry ID space return an error
+  instead of wrapping or saturating.
+
+### Changed
+
+- Narrowed the documented persistence guarantees: the crate provides
+  integrity-checked recovery and explicit sync steps, not a universal
+  power-loss guarantee.
+
+### Upgrade note
+
+- A 0.7.2 process and a 0.7.3 process do not exclude each other on the same
+  WAL directory, because they use different lock mechanisms. Stop all writers
+  before upgrading.
+
+## [0.7.2] - 2026-07-09
+
+### Changed
+
+- WAL and checkpoint metadata are now covered by the CRCs.
+
 ## [0.7.1] - 2026-07-04
 
 ### Changed
