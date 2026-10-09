@@ -1292,6 +1292,19 @@ fn scan_last_segment_prefix(
             }
             None => {
                 let prefix = start_pos.max(WalSegmentHeader::SIZE).min(bytes.len());
+                // A torn final write leaves nothing valid behind it. A damaged
+                // length field mid-segment can look the same (its payload
+                // "runs past EOF"), but valid records follow it. Truncating
+                // there would delete synced records, so refuse instead.
+                if let Some(offset) =
+                    find_valid_frame_after(&bytes[prefix..], checksum_mode, last_id)
+                {
+                    return Err(PersistenceError::Format(format!(
+                        "WAL mid-segment corruption: record at offset {prefix} is unreadable \
+                         but a valid record follows at offset {}; refusing to truncate",
+                        prefix + offset
+                    )));
+                }
                 if let Some(first) = first_entry_id_in_segment {
                     if first != header.start_entry_id {
                         return Err(PersistenceError::Format(format!(
@@ -1304,6 +1317,39 @@ fn scan_last_segment_prefix(
             }
         }
     }
+}
+
+/// Offset of the first well-formed frame in `tail` with a matching checksum
+/// and an entry id after `last_id`, if any.
+///
+/// Only called on the recovery path, after decoding stopped early, so a
+/// byte-by-byte scan of the remainder is acceptable. Empty payloads are
+/// skipped: under the payload-only checksum, 16 bytes of garbage with a zero
+/// CRC would otherwise look valid.
+fn find_valid_frame_after(
+    tail: &[u8],
+    checksum_mode: WalChecksumMode,
+    last_id: Option<u64>,
+) -> Option<usize> {
+    const FRAME_HEADER: usize = 16;
+    // Offset 0 is the frame that just failed to decode.
+    (1..tail.len().saturating_sub(FRAME_HEADER)).find(|&off| {
+        let frame = &tail[off..];
+        let length = u32::from_le_bytes(frame[0..4].try_into().expect("4 bytes"));
+        let len = length as usize;
+        if len <= FRAME_HEADER
+            || len > frame.len()
+            || len - FRAME_HEADER > MAX_WAL_ENTRY_PAYLOAD_BYTES
+        {
+            return false;
+        }
+        let entry_id = u64::from_le_bytes(frame[4..12].try_into().expect("8 bytes"));
+        if last_id.is_some_and(|last| entry_id <= last) {
+            return false;
+        }
+        let checksum = u32::from_le_bytes(frame[12..16].try_into().expect("4 bytes"));
+        checksum_mode.checksum(length, entry_id, &frame[FRAME_HEADER..len]) == checksum
+    })
 }
 
 impl<E> Drop for WalWriter<E> {
