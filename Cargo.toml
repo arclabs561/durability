@@ -13,6 +13,7 @@ publish = true
 readme = "README.md"
 keywords = ["persistence", "wal", "checkpoint", "write-ahead-log", "recovery"]
 categories = ["filesystem", "database-implementations"]
+include = ["/src", "/tests", "/examples", "/benches", "/README.md", "/CHANGELOG.md", "/LICENSE*"]
 
 [package.metadata.docs.rs]
 all-features = true
