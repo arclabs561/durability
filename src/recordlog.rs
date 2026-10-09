@@ -164,20 +164,7 @@ impl RecordLogWriter {
             return Ok(());
         }
         if self.dir.exists(&self.path) {
-            let mut r = self.dir.open_file(&self.path)?;
-            let mut magic = [0u8; 4];
-            r.read_exact(&mut magic)?;
-            if magic != RECORDLOG_MAGIC {
-                return Err(PersistenceError::Format("invalid recordlog magic".into()));
-            }
-            let mut vbuf = [0u8; 4];
-            r.read_exact(&mut vbuf)?;
-            let version = u32::from_le_bytes(vbuf);
-            if version != FORMAT_VERSION {
-                return Err(PersistenceError::Format(
-                    "recordlog version mismatch".into(),
-                ));
-            }
+            self.repair_existing_log()?;
             self.header_checked = true;
             return Ok(());
         }
@@ -199,6 +186,55 @@ impl RecordLogWriter {
         }
         self.header_checked = true;
         Ok(())
+    }
+
+    /// Validate an existing log and cut it back to its last valid record.
+    ///
+    /// A crash or a full disk can leave a partial record (or a partial file
+    /// header) at the end. Readers tolerate that torn tail in best-effort
+    /// mode, but appending behind it would bury the garbage mid-file, where
+    /// every later read fails with `CrcMismatch`. This mirrors
+    /// [`crate::walog::WalWriter::resume`]. Damage with valid records after it
+    /// is not a torn tail; the log is left untouched and an error returned.
+    fn repair_existing_log(&mut self) -> PersistenceResult<()> {
+        let mut bytes = Vec::new();
+        self.dir.open_file(&self.path)?.read_to_end(&mut bytes)?;
+
+        let mut header = [0u8; 8];
+        header[..4].copy_from_slice(&RECORDLOG_MAGIC);
+        header[4..].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+
+        if bytes.len() < header.len() {
+            // Created, but the header never fully reached disk.
+            if !header.starts_with(&bytes) {
+                return Err(PersistenceError::Format("invalid recordlog magic".into()));
+            }
+            return self.dir.atomic_write(&self.path, &header);
+        }
+        if bytes[..4] != RECORDLOG_MAGIC {
+            return Err(PersistenceError::Format("invalid recordlog magic".into()));
+        }
+        if bytes[4..8] != header[4..] {
+            return Err(PersistenceError::Format(
+                "recordlog version mismatch".into(),
+            ));
+        }
+
+        let body = &bytes[header.len()..];
+        let valid = valid_record_prefix_len(body);
+        if valid == body.len() {
+            return Ok(());
+        }
+        if let Some(offset) = find_valid_record_after(&body[valid..]) {
+            return Err(PersistenceError::Format(format!(
+                "recordlog mid-file corruption: record at offset {} is unreadable but a \
+                 valid record follows at offset {}; refusing to truncate",
+                header.len() + valid,
+                header.len() + valid + offset
+            )));
+        }
+        self.dir
+            .atomic_write(&self.path, &bytes[..header.len() + valid])
     }
 
     fn ensure_writer(&mut self) -> PersistenceResult<()> {
@@ -326,6 +362,40 @@ impl RecordLogWriter {
             postcard::to_allocvec(value).map_err(|e| PersistenceError::Encode(e.to_string()))?;
         self.append_bytes(&payload)
     }
+}
+
+/// Parse one `len | crc | payload` frame at the start of `bytes`, returning
+/// its total size if it is complete and its CRC matches.
+fn valid_record_len(bytes: &[u8]) -> Option<usize> {
+    let len = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
+    if len > MAX_RECORD_BYTES {
+        return None;
+    }
+    let crc = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);
+    let end = 8usize.checked_add(len as usize)?;
+    let payload = bytes.get(8..end)?;
+    (crc32fast::hash(payload) == crc).then_some(end)
+}
+
+/// Length of the longest prefix of `body` made of complete, valid records.
+fn valid_record_prefix_len(body: &[u8]) -> usize {
+    let mut off = 0;
+    while let Some(n) = valid_record_len(&body[off..]) {
+        off += n;
+    }
+    off
+}
+
+/// Offset of the first valid non-empty record in `tail` after offset 0.
+///
+/// Recovery path only, so a byte-by-byte scan is acceptable. Empty records
+/// are skipped: eight zero bytes are a "valid" empty record (crc32 of nothing
+/// is 0), and zero padding must not count as surviving data.
+fn find_valid_record_after(tail: &[u8]) -> Option<usize> {
+    (1..tail.len()).find(|&off| {
+        let frame = &tail[off..];
+        frame.len() > 8 && frame[..4] != [0; 4] && valid_record_len(frame).is_some()
+    })
 }
 
 /// Sequential record log reader.
