@@ -100,8 +100,11 @@ fn corrupt_length_field_under_16_errors_in_best_effort() {
 }
 
 #[test]
-fn zero_length_is_eof_in_best_effort_but_error_in_strict() {
-    // length==0 is EOF in BestEffortTail, error in Strict.
+fn zero_padding_is_eof_but_a_zero_length_before_data_is_an_error() {
+    // Preallocation leaves zeros after the last frame, and a crash can keep
+    // them on a non-last segment, which is decoded strictly. Zeros through
+    // EOF are therefore the end of the segment in both modes. A zero length
+    // followed by non-zero bytes is still corruption in Strict mode.
     // Ensures C-1 fix didn't break the zero-padding path.
     let dir = MemoryDirectory::arc();
 
@@ -133,9 +136,15 @@ fn zero_length_is_eof_in_best_effort_but_error_in_strict() {
     let entries = reader.replay_best_effort().unwrap();
     assert_eq!(entries.len(), 1);
 
-    // Strict: error (EOF mid-frame)
-    let reader2 = WalReader::<WalEntry>::new(dir);
-    assert!(reader2.replay().is_err());
+    // Strict: zero padding through EOF is the end of the segment.
+    let reader2 = WalReader::<WalEntry>::new(dir.clone());
+    assert_eq!(reader2.replay().unwrap().len(), 1);
+
+    // Strict: a zero length with data after it is corruption.
+    data.extend_from_slice(&[0xAB; 4]);
+    dir.atomic_write(&wal_path, &data).unwrap();
+    let reader3 = WalReader::<WalEntry>::new(dir);
+    assert!(reader3.replay().is_err());
 }
 
 #[test]

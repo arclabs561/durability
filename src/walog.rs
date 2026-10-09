@@ -327,6 +327,19 @@ impl WalEntryOnDisk {
         if len == 0 && mode == WalReplayMode::BestEffortTail {
             return Ok(None);
         }
+        // Strict mode reads non-last segments. A segment whose post-rotation
+        // shrink did not survive a crash is still zero-padded to its
+        // preallocated size; zeros through EOF are its end, not corruption.
+        if len == 0 {
+            let mut rest = Vec::new();
+            reader.read_to_end(&mut rest)?;
+            if rest.iter().all(|&b| b == 0) {
+                return Ok(None);
+            }
+            return Err(PersistenceError::Format(
+                "WAL entry length is 0 but non-zero bytes follow".into(),
+            ));
+        }
 
         // Validate minimum frame size before the caller reads entry_id + checksum.
         // Without this check, a corrupt length in [1, 15] would cause the caller to
@@ -1141,18 +1154,20 @@ impl<E> WalWriter<E> {
     /// Truncate the current segment to its actual written size.
     ///
     /// Called on segment rotation and drop to reclaim preallocated space.
-    fn truncate_current_segment(&self) {
+    /// Shrink the current preallocated segment to its written length and make
+    /// the new size durable before the next segment is created.
+    fn truncate_current_segment(&self) -> PersistenceResult<()> {
         if self.preallocate_bytes == 0 {
-            return;
+            return Ok(());
         }
         if let Some(path) = self.current_path.as_deref() {
             if let Some(fs_path) = self.directory.file_path(path) {
-                let _ = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&fs_path)
-                    .and_then(|f| f.set_len(self.current_offset));
+                let f = std::fs::OpenOptions::new().write(true).open(&fs_path)?;
+                f.set_len(self.current_offset)?;
+                f.sync_all()?;
             }
         }
+        Ok(())
     }
 
     /// Rotate to a new segment if size or age limits are exceeded.
@@ -1165,7 +1180,7 @@ impl<E> WalWriter<E> {
         };
         if (size_exceeded || age_exceeded) && self.current_offset > WalSegmentHeader::SIZE as u64 {
             self.flush()?;
-            self.truncate_current_segment();
+            self.truncate_current_segment()?;
             let old_segment_id = self.current_segment_id;
             self.current_segment_id += 1;
             self.current_offset = 0;

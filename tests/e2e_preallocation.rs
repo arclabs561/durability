@@ -153,3 +153,65 @@ fn resume_after_preallocated_write() {
     let records = r.replay().unwrap();
     assert_eq!(records.len(), 6);
 }
+
+/// A crash between rotating to a new segment and shrinking the previous
+/// preallocated one leaves that earlier segment zero-padded to its full
+/// preallocation. Non-last segments are decoded strictly, and strict decode
+/// used to reject the zero length, so the whole WAL became unreadable and
+/// unresumable. Zero padding after the last frame is the end of the segment.
+#[test]
+fn zero_padded_non_last_segment_stays_readable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir: Arc<dyn Directory> = Arc::new(FsDirectory::new(tmp.path()).unwrap());
+
+    let mut w = WalWriter::<WalEntry>::with_options(
+        dir.clone(),
+        durability::storage::FlushPolicy::PerAppend,
+        0,
+    );
+    w.set_segment_size_limit_bytes(128);
+    w.set_preallocate_bytes(4096);
+    for i in 1..=12u64 {
+        w.append(&WalEntry::AddSegment {
+            segment_id: i,
+            doc_count: 1,
+        })
+        .unwrap();
+    }
+    w.flush().unwrap();
+    drop(w);
+
+    let mut segments: Vec<String> = dir
+        .list_dir("wal")
+        .unwrap()
+        .into_iter()
+        .filter(|s| s.ends_with(".log"))
+        .collect();
+    segments.sort_by_key(|s| {
+        s.trim_start_matches("wal_")
+            .trim_end_matches(".log")
+            .parse::<u64>()
+            .unwrap()
+    });
+    assert!(segments.len() >= 3, "need several segments: {segments:?}");
+
+    // Simulate the shrink of the first segment never reaching disk.
+    let first = dir.file_path(&format!("wal/{}", segments[0])).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&first)
+        .unwrap()
+        .set_len(4096)
+        .unwrap();
+
+    let records = WalReader::<WalEntry>::new(dir.clone()).replay().unwrap();
+    assert_eq!(records.len(), 12);
+    let mut w = WalWriter::<WalEntry>::resume(dir.clone()).unwrap();
+    let id = w
+        .append(&WalEntry::AddSegment {
+            segment_id: 13,
+            doc_count: 1,
+        })
+        .unwrap();
+    assert_eq!(id, 13);
+}
