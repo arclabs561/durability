@@ -1,3 +1,4 @@
+#![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 //! `durability`: persistence primitives with explicit recovery and sync contracts.
 //!

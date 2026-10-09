@@ -10,6 +10,10 @@ record logs, checkpoint files, CRC validation, and sync helpers.
 
 It does not own indexing, segment selection, compaction, or reader visibility.
 
+For a ready-made embedded key-value store, use redb or fjall, and for a
+standalone WAL crate, okaywal; use `durability` when your own index or store
+needs the logs, checkpoints and recovery steps as separate pieces.
+
 ## Quick start
 
 ```toml
@@ -64,7 +68,8 @@ cannot support mmap.
 
 The optional `mmap` feature provides `MappedFile` for read-only memory maps with
 advisory access hints. Higher-level crates decide which files are safe and useful
-to map.
+to map. `MappedFile::open` is `unsafe`: the caller promises that nothing
+truncates or rewrites the file while it is mapped.
 
 ## Thread-safe writer
 
