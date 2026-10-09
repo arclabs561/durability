@@ -1,7 +1,5 @@
-//! Tests derived from deep scrutiny findings (2026-03-30).
-//!
-//! Each test validates a specific edge case or bug fix identified during
-//! implementation review.
+//! WAL and directory recovery edge cases: preallocated zero tails, torn or
+//! header-only first segments, orphaned checkpoints, and reader visibility.
 #![cfg(feature = "postcard")]
 
 use durability::storage::{Directory, FsDirectory, MemoryDirectory};

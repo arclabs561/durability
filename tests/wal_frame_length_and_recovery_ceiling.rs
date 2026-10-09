@@ -1,4 +1,5 @@
-//! Regression tests for audit findings (2026-04-05).
+//! WAL frame-length validation, writer poisoning after a failed rotation,
+//! and point-in-time recovery ceilings.
 //!
 //! C-1: decode_raw length<16 check moved before reading entry_id/checksum
 //! C-2: rotate_if_needed poisons writer on segment creation failure
