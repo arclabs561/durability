@@ -174,7 +174,7 @@ let data = bridge.read_file("data.bin").await.unwrap();
 
 ## Not provided
 
-- **Multi-process locking**: single-writer-per-directory assumed. Advisory lockfile catches in-process double-instantiation only.
+- **Multi-process locking**: one `WalWriter` per directory. On a filesystem `wal/.lock` is an OS lock that excludes other processes and is released on exit; `RecordLogWriter` takes no lock, so callers (e.g. segstore) must hold their own.
 - **Per-write fsync by default**: writes are buffered. Use `flush_and_sync()` for a durability barrier.
 - **fsync failure recovery**: a failed fsync poisons the writer. Callers should treat this as unrecoverable and restart from WAL.
 

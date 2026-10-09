@@ -579,11 +579,12 @@ fn checked_next_entry_id(entry_id: u64) -> PersistenceResult<u64> {
 
 /// WAL writer that appends entries to numbered segment files under `wal/`.
 ///
-/// An advisory lockfile (`wal/.lock`) is created when the writer initializes
-/// its WAL directory and removed on drop. This catches accidental
-/// double-instantiation (two `WalWriter` instances against the same directory)
-/// but does not guarantee cross-process exclusion -- for that, use OS-level
-/// file locking.
+/// The writer locks `wal/.lock` when it initializes its WAL directory. On a
+/// filesystem-backed [`Directory`] this is an exclusive OS lock (flock /
+/// LockFileEx) held until drop: it excludes a second writer in this or any
+/// other process, and the OS releases it when the process exits, so a crash
+/// cannot leave a stale lock. Other backends use a marker file that only
+/// catches double-instantiation within one process.
 ///
 /// # Example
 ///
@@ -623,6 +624,9 @@ pub struct WalWriter<E> {
     write_buffer: Vec<u8>,
     write_buffer_limit: usize,
     holds_lock: bool,
+    /// Kernel lock on `wal/.lock` for filesystem backends, released by the OS
+    /// when the process exits (so a crash cannot leave it stale).
+    lock_file: Option<std::fs::File>,
     preallocate_bytes: u64,
     poisoned: bool,
     observer: Option<Arc<dyn WalObserver>>,
@@ -672,6 +676,7 @@ impl<E> WalWriter<E> {
             write_buffer: Vec::new(),
             write_buffer_limit: write_buffer_limit_bytes,
             holds_lock: false,
+            lock_file: None,
             preallocate_bytes: 0,
             poisoned: false,
             observer: None,
@@ -879,18 +884,21 @@ impl<E> WalWriter<E> {
     /// If the last segment has a **torn tail record**, this function repairs it by
     /// truncating the file back to the last valid record boundary, then continues.
     ///
-    /// This respects the active-writer lock. If a prior process crashed while
-    /// holding `wal/.lock`, remove the stale lock yourself or use
+    /// This respects the active-writer lock. On a filesystem a crashed
+    /// writer's lock is released by the OS, so no cleanup is needed. On other
+    /// backends a crash leaves the marker file; use
     /// [`WalWriter::resume_after_crash`].
     pub fn resume(directory: impl Into<Arc<dyn Directory>>) -> PersistenceResult<Self> {
         let directory: Arc<dyn Directory> = directory.into();
         Self::resume_inner(directory, false)
     }
 
-    /// Resume after a known writer crash by removing `wal/.lock` first.
+    /// Resume after a known writer crash.
     ///
-    /// Only call this when the process that held the writer is known to be gone.
-    /// Calling it against a live writer defeats the advisory single-writer guard.
+    /// On a filesystem this is the same as [`WalWriter::resume`]: the OS lock is
+    /// already gone with the crashed process, and a live writer is still
+    /// refused. On other backends it removes the `wal/.lock` marker first, so
+    /// only call it when the previous writer is known to be gone.
     pub fn resume_after_crash(directory: impl Into<Arc<dyn Directory>>) -> PersistenceResult<Self> {
         let directory: Arc<dyn Directory> = directory.into();
         Self::resume_inner(directory, true)
@@ -900,7 +908,10 @@ impl<E> WalWriter<E> {
         directory: Arc<dyn Directory>,
         remove_stale_lock: bool,
     ) -> PersistenceResult<Self> {
-        if remove_stale_lock {
+        // On a filesystem the kernel lock already ignores a crashed writer's
+        // leftover file, and deleting it would let this writer lock a fresh
+        // inode beside a live one. Only the in-memory marker needs removing.
+        if remove_stale_lock && directory.file_path("wal/.lock").is_none() {
             let _ = directory.delete("wal/.lock");
         }
 
@@ -967,28 +978,29 @@ impl<E> WalWriter<E> {
 
     fn acquire_wal_lock(&mut self) -> PersistenceResult<()> {
         self.directory.create_dir_all("wal")?;
-        // Advisory lockfile: catch accidental double-instantiation.
-        // Use O_CREAT|O_EXCL (create_new) on real filesystems for atomic acquire.
-        // Falls back to exists()+write() for non-filesystem backends (e.g. MemoryDirectory).
+        // Single-writer lock. On real filesystems: an exclusive flock /
+        // LockFileEx on `wal/.lock`, held for the writer's lifetime. The OS
+        // releases it when the process exits, so a crash never leaves a stale
+        // lock, and it excludes writers in other processes. Non-filesystem
+        // backends (e.g. MemoryDirectory) fall back to a marker file.
         if let Some(lock_fs_path) = self.directory.file_path("wal/.lock") {
             if let Some(parent) = lock_fs_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            match std::fs::OpenOptions::new()
+            let file = std::fs::OpenOptions::new()
                 .write(true)
-                .create_new(true)
-                .open(&lock_fs_path)
-            {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    return Err(PersistenceError::InvalidState(
-                        "WAL lockfile wal/.lock exists; another WalWriter may be active. \
-                         Remove the lockfile manually if this is a stale lock from a crash."
-                            .into(),
-                    ));
-                }
-                Err(e) => return Err(e.into()),
+                .create(true)
+                .truncate(false)
+                .open(&lock_fs_path)?;
+            use fs4::fs_std::FileExt;
+            // fs4 reports contention as `Ok(false)`, not as an error.
+            if !file.try_lock_exclusive()? {
+                return Err(PersistenceError::InvalidState(
+                    "WAL lockfile wal/.lock is held; another WalWriter is active".into(),
+                ));
             }
+            self.lock_file = Some(file);
+            return Ok(());
         } else {
             // Non-filesystem backend: best-effort TOCTOU check.
             if self.directory.exists("wal/.lock") {
