@@ -13,7 +13,8 @@
 //! use durability::mmap::{AccessPattern, MappedFile};
 //!
 //! // WAL replay: the kernel should prefetch pages sequentially.
-//! let f = MappedFile::open("wal/segment-001.bin", AccessPattern::Sequential).unwrap();
+//! // SAFETY: nothing truncates or rewrites this segment while `f` is alive.
+//! let f = unsafe { MappedFile::open("wal/segment-001.bin", AccessPattern::Sequential) }.unwrap();
 //! let bytes: &[u8] = f.as_slice();
 //! # }
 //! ```
@@ -60,10 +61,28 @@ impl MappedFile {
     /// Returns an error if the file cannot be opened, is empty, or the
     /// `mmap` call fails. `madvise` failures are returned as a separate
     /// `MadviseError` (not a fatal open error).
-    pub fn open(path: impl AsRef<Path>, pattern: AccessPattern) -> Result<Self, MappedFileError> {
+    ///
+    /// # Safety
+    ///
+    /// The returned [`MappedFile`] hands out `&[u8]` views of the file's
+    /// pages. For as long as it is alive, no process may truncate the file
+    /// (a later read of a vanished page raises `SIGBUS`) or modify its
+    /// contents (the bytes behind a shared reference would change). Writers
+    /// that replace a mapped file should write a new file and rename it over
+    /// the old path instead of rewriting it in place.
+    ///
+    /// Calling it without `unsafe` does not compile:
+    ///
+    /// ```compile_fail,E0133
+    /// use durability::mmap::{AccessPattern, MappedFile};
+    /// let _ = MappedFile::open("segment.bin", AccessPattern::Normal);
+    /// ```
+    pub unsafe fn open(
+        path: impl AsRef<Path>,
+        pattern: AccessPattern,
+    ) -> Result<Self, MappedFileError> {
         let file = std::fs::File::open(path.as_ref()).map_err(MappedFileError::Io)?;
-        // SAFETY: the caller must ensure the file is not concurrently truncated.
-        // For WAL replay and checkpoint read-back, this is true by construction.
+        // SAFETY: the caller upholds the no-truncate, no-modify contract above.
         let map = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(MappedFileError::Io)?;
 
         let mapped = MappedFile { map };
@@ -184,6 +203,12 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn open(path: &Path, pattern: AccessPattern) -> Result<MappedFile, MappedFileError> {
+        // SAFETY: each test owns its temp file and never truncates or writes
+        // it while the mapping is alive.
+        unsafe { MappedFile::open(path, pattern) }
+    }
+
     fn write_temp_file(content: &[u8]) -> tempfile::NamedTempFile {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(content).unwrap();
@@ -194,21 +219,21 @@ mod tests {
     #[test]
     fn open_sequential_no_panic() {
         let tmp = write_temp_file(b"hello world");
-        let mapped = MappedFile::open(tmp.path(), AccessPattern::Sequential).unwrap();
+        let mapped = open(tmp.path(), AccessPattern::Sequential).unwrap();
         assert_eq!(&*mapped, b"hello world");
     }
 
     #[test]
     fn open_random_no_panic() {
         let tmp = write_temp_file(b"random access data");
-        let mapped = MappedFile::open(tmp.path(), AccessPattern::Random).unwrap();
+        let mapped = open(tmp.path(), AccessPattern::Random).unwrap();
         assert_eq!(&*mapped, b"random access data");
     }
 
     #[test]
     fn open_normal_no_panic() {
         let tmp = write_temp_file(b"normal hint");
-        let mapped = MappedFile::open(tmp.path(), AccessPattern::Normal).unwrap();
+        let mapped = open(tmp.path(), AccessPattern::Normal).unwrap();
         assert_eq!(&*mapped, b"normal hint");
     }
 
@@ -216,7 +241,7 @@ mod tests {
     fn open_willneed_full_range_no_panic() {
         let data = vec![0u8; 4096];
         let tmp = write_temp_file(&data);
-        let mapped = MappedFile::open(tmp.path(), AccessPattern::WillNeed(0..4096)).unwrap();
+        let mapped = open(tmp.path(), AccessPattern::WillNeed(0..4096)).unwrap();
         assert_eq!(mapped.len(), 4096);
     }
 
@@ -225,7 +250,7 @@ mod tests {
         let data = vec![1u8; 8192];
         let tmp = write_temp_file(&data);
         // Range clamped to file length — should not panic.
-        let mapped = MappedFile::open(tmp.path(), AccessPattern::WillNeed(1024..3072)).unwrap();
+        let mapped = open(tmp.path(), AccessPattern::WillNeed(1024..3072)).unwrap();
         assert_eq!(mapped.len(), 8192);
     }
 
@@ -234,14 +259,14 @@ mod tests {
         let data = vec![2u8; 512];
         let tmp = write_temp_file(&data);
         // Range extends past file length — should be clamped, not panic.
-        let mapped = MappedFile::open(tmp.path(), AccessPattern::WillNeed(0..1_000_000)).unwrap();
+        let mapped = open(tmp.path(), AccessPattern::WillNeed(0..1_000_000)).unwrap();
         assert_eq!(mapped.len(), 512);
     }
 
     #[test]
     fn reapply_hints_no_panic() {
         let tmp = write_temp_file(b"reapply test");
-        let mapped = MappedFile::open(tmp.path(), AccessPattern::Normal).unwrap();
+        let mapped = open(tmp.path(), AccessPattern::Normal).unwrap();
         // Re-apply a different hint on the same mapping.
         mapped.apply_hints(&AccessPattern::Sequential).unwrap();
         mapped.apply_hints(&AccessPattern::Random).unwrap();
@@ -253,7 +278,7 @@ mod tests {
     #[test]
     fn len_and_is_empty() {
         let tmp = write_temp_file(b"five!");
-        let mapped = MappedFile::open(tmp.path(), AccessPattern::Normal).unwrap();
+        let mapped = open(tmp.path(), AccessPattern::Normal).unwrap();
         assert_eq!(mapped.len(), 5);
         assert!(!mapped.is_empty());
     }

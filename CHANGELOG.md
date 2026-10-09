@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `mmap::MappedFile::open` is now an `unsafe fn` (breaking). The mapping hands
+  out `&[u8]` views of the file, so truncating the file while it is mapped
+  raised `SIGBUS` in safe code, and rewriting it changed bytes behind a shared
+  reference. Callers now state that nothing truncates or modifies the file
+  while the `MappedFile` is alive; writers should write a new file and rename
+  it into place.
+
 ## [0.7.1] - 2026-07-04
 
 ### Changed
