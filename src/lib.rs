@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
+#![forbid(unsafe_code)]
 //! `durability`: persistence primitives with explicit recovery and sync contracts.
 //!
 //! Scope:
@@ -14,7 +15,6 @@
 //!
 //! - `postcard` (default): serde/postcard typed WAL, checkpoint, recovery, and publish helpers.
 //! - `async`: tokio-compatible async directory abstraction.
-//! - `mmap`: mmap and advisory helpers.
 //!
 //! With `default-features = false`, the crate still provides the directory abstraction,
 //! raw record logs, raw checkpoint payloads, WAL framing/maintenance, and sync helpers.
@@ -57,9 +57,6 @@ pub mod walog;
 
 #[cfg(feature = "async")]
 pub mod async_dir;
-
-#[cfg(feature = "mmap")]
-pub mod mmap;
 
 pub use error::{PersistenceError, PersistenceResult};
 pub use storage::{Directory, FsDirectory, MemoryDirectory};

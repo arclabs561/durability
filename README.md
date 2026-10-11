@@ -62,14 +62,10 @@ maintenance, and sync helpers.
 ## Backends
 
 `FsDirectory` is the stable-storage backend. It exposes filesystem paths for
-fsync, parent-directory sync, and mmap helpers. `MemoryDirectory` is useful for
-tests and process-local stores; it does not provide power-loss durability and
-cannot support mmap.
+fsync and parent-directory sync. `MemoryDirectory` is useful for tests and
+process-local stores; it does not provide power-loss durability.
 
-The optional `mmap` feature provides `MappedFile` for read-only memory maps with
-advisory access hints. Higher-level crates decide which files are safe and useful
-to map. `MappedFile::open` is `unsafe`: the caller promises that nothing
-truncates or rewrites the file while it is mapped.
+The crate contains no `unsafe` code (`#![forbid(unsafe_code)]`).
 
 ## Thread-safe writer
 

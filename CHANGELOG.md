@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- The `mmap` feature and `mmap::MappedFile` (breaking). A memory map that
+  another process truncates raises `SIGBUS` in safe code, so 0.8 made
+  `MappedFile::open` unsafe. Its only user, vicinity, reads files with a
+  block cache instead from its next release (vicinity 0.11 still uses
+  durability 0.7's `mmap`). The crate now
+  has no `unsafe` code and is `#![forbid(unsafe_code)]`, and the optional
+  `memmap2` and `libc` dependencies are gone.
+
 ## [0.8.0] - 2026-10-09
 
 Includes every fix in 0.7.3.
