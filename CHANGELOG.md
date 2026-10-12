@@ -7,15 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-12
+
 ### Removed
 
 - The `mmap` feature and `mmap::MappedFile` (breaking). A memory map that
   another process truncates raises `SIGBUS` in safe code, so 0.8 made
-  `MappedFile::open` unsafe. Its only user, vicinity, reads files with a
-  block cache instead from its next release (vicinity 0.11 still uses
-  durability 0.7's `mmap`). The crate now
+  `MappedFile::open` unsafe. The crate now
   has no `unsafe` code and is `#![forbid(unsafe_code)]`, and the optional
   `memmap2` and `libc` dependencies are gone.
+
+### Fixed
+
+- `WalWriter::resume` preserves the file and returns an error when a damaged
+  length is followed by a valid empty v3 frame. Empty payload frames now count
+  as suffix evidence after their header-inclusive CRC validates, including a
+  frame ending exactly at EOF. Legacy v2 empty-payload CRC handling is unchanged.
+
+### Changed
+
+- Remove the `mmap` Cargo feature and uses of `mmap::MappedFile`,
+  `MappedFileError` and `AccessPattern`. Use owned file reads or an application
+  block cache as appropriate; there is no replacement memory-mapping API.
+- Align dependencies that exchange public `Directory` types on the same
+  durability version; types from separate 0.x versions are distinct.
 
 ## [0.8.0] - 2026-10-09
 
@@ -288,3 +303,6 @@ Includes every fix in 0.7.3.
 
 ### Added
 - Initial release: write-ahead log with crash recovery.
+
+[Unreleased]: https://github.com/arclabs561/durability/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/arclabs561/durability/compare/v0.8.0...v0.9.0
