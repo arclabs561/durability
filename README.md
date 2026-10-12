@@ -18,7 +18,7 @@ needs the logs, checkpoints and recovery steps as separate pieces.
 
 ```toml
 [dependencies]
-durability = "0.7"
+durability = "0.9"
 ```
 
 ```rust
@@ -147,7 +147,7 @@ The `async` feature provides `AsyncDirectory` and `BlockingBridge` for tokio:
 
 ```toml
 [dependencies]
-durability = { version = "0.7", features = ["async"] }
+durability = { version = "0.9", features = ["async"] }
 ```
 
 ```rust,no_run
