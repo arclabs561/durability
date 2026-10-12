@@ -1350,9 +1350,9 @@ fn scan_last_segment_prefix(
 /// and an entry id after `last_id`, if any.
 ///
 /// Only called on the recovery path, after decoding stopped early, so a
-/// byte-by-byte scan of the remainder is acceptable. Empty payloads are
-/// skipped: under the payload-only checksum, 16 bytes of garbage with a zero
-/// CRC would otherwise look valid.
+/// byte-by-byte scan of the remainder is acceptable. Empty payloads require
+/// the frame checksum: under the legacy payload-only checksum, 16 bytes of
+/// garbage with a zero CRC would otherwise look valid.
 fn find_valid_frame_after(
     tail: &[u8],
     checksum_mode: WalChecksumMode,
@@ -1360,11 +1360,12 @@ fn find_valid_frame_after(
 ) -> Option<usize> {
     const FRAME_HEADER: usize = 16;
     // Offset 0 is the frame that just failed to decode.
-    (1..tail.len().saturating_sub(FRAME_HEADER)).find(|&off| {
+    (1..=tail.len().saturating_sub(FRAME_HEADER)).find(|&off| {
         let frame = &tail[off..];
         let length = u32::from_le_bytes(frame[0..4].try_into().expect("4 bytes"));
         let len = length as usize;
-        if len <= FRAME_HEADER
+        if len < FRAME_HEADER
+            || (len == FRAME_HEADER && matches!(checksum_mode, WalChecksumMode::PayloadOnly))
             || len > frame.len()
             || len - FRAME_HEADER > MAX_WAL_ENTRY_PAYLOAD_BYTES
         {
