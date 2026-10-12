@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-12
+
 ### Removed
 
 - The `mmap` feature and `mmap::MappedFile` (breaking). A memory map that
@@ -22,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as suffix evidence after their header-inclusive CRC validates, including a
   frame ending exactly at EOF. Legacy v2 empty-payload CRC handling is unchanged.
 
-### Migration
+### Changed
 
 - Remove the `mmap` Cargo feature and uses of `mmap::MappedFile`,
   `MappedFileError` and `AccessPattern`. Use owned file reads or an application
@@ -301,3 +303,6 @@ Includes every fix in 0.7.3.
 
 ### Added
 - Initial release: write-ahead log with crash recovery.
+
+[Unreleased]: https://github.com/arclabs561/durability/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/arclabs561/durability/compare/v0.8.0...v0.9.0
