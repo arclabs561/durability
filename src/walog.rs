@@ -63,7 +63,9 @@
 //! Kafka/Bitcask/SQLite-style systems: scan forward validating checksums and stop at
 //! the first *truncated* tail record (torn write) in the **final** segment.
 //!
-//! Corruption in non-final segments is always an error.
+//! Corruption in non-final segments is always an error. CRC failures remain
+//! errors even in the final segment; see [`WalReplayMode::BestEffortTail`] and
+//! [`WalWriter::set_preallocate_bytes`] for the preallocation boundary.
 //!
 //! ## Error policy
 //!
@@ -762,6 +764,11 @@ impl<E> WalWriter<E> {
     /// truncated to actual size on segment rotation or writer drop.
     /// Set to 0 (default) to disable preallocation.
     ///
+    /// After a crash, padding after complete frames is recoverable. A partially
+    /// written frame followed by preallocated zeros may instead fail its CRC;
+    /// replay and resume reject that corruption rather than discard the frame.
+    /// Preallocation does not make writes atomic.
+    ///
     /// Only effective on filesystem-backed directories (requires `file_path()`).
     pub fn set_preallocate_bytes(&mut self, bytes: u64) {
         self.preallocate_bytes = bytes;
@@ -894,8 +901,12 @@ impl<E> WalWriter<E> {
     /// Resume appending to an existing WAL (if present).
     ///
     /// If no `wal/` files exist, this is equivalent to `WalWriter::new`.
-    /// If the last segment has a **torn tail record**, this function repairs it by
-    /// truncating the file back to the last valid record boundary, then continues.
+    /// If the last segment has a record truncated at physical EOF, this function
+    /// repairs it by truncating back to the last valid record boundary, provided
+    /// no valid later frame is found. Zero padding after complete frames is also
+    /// removed. CRC/decode failures remain errors: a partially written frame
+    /// followed by preallocated zeros can fail its CRC instead of reaching EOF.
+    /// A failed CRC scan leaves the segment unchanged.
     ///
     /// This respects the active-writer lock. On a filesystem a crashed
     /// writer's lock is released by the OS, so no cleanup is needed. On other
@@ -1905,9 +1916,12 @@ impl<E> SyncWalWriter<E> {
         Ok(Self::from_writer(WalWriter::resume(directory)?))
     }
 
-    /// Resume after a known writer crash by removing `wal/.lock` first.
+    /// Resume after a known writer crash.
     ///
-    /// Only call this when the process that held the writer is known to be gone.
+    /// On a filesystem this is the same as [`Self::resume`]: the OS releases a
+    /// crashed writer's lock, and a live writer is still refused. On marker-based
+    /// backends this removes `wal/.lock` first; only call it when the previous
+    /// writer is known to be gone. See [`WalWriter::resume_after_crash`].
     pub fn resume_after_crash(directory: impl Into<Arc<dyn Directory>>) -> PersistenceResult<Self> {
         Ok(Self::from_writer(WalWriter::resume_after_crash(directory)?))
     }
