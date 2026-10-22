@@ -59,6 +59,11 @@ With `default-features = false`, `durability` still provides `Directory`,
 `CheckpointFile::{write_bytes, read_bytes}`, raw WAL append/replay, WAL
 maintenance, and sync helpers.
 
+Rust 1.80 is checked with a compatible dependency resolution: the MSRV job
+selects Tokio 1.53.3 for the optional `async` feature. Newer Tokio versions may
+require a newer compiler. Stable CI checks the latest dependency resolution;
+the crate does not impose a Tokio upper-version bound.
+
 ## Backends
 
 `FsDirectory` is the stable-storage backend. It exposes filesystem paths for
@@ -182,7 +187,7 @@ let data = bridge.read_file("data.bin").await.unwrap();
 ## Contract
 
 - **Prefix property**: best-effort replay returns a prefix of the valid stream.
-- **Narrow best-effort**: tolerance applies only to the final segment's torn tail. Corruption in non-final segments is an error.
+- **Narrow best-effort**: tolerance applies only to the final segment's tail truncated at physical EOF. Zero padding after complete frames is supported, but a partial frame followed by preallocated zeros can fail its CRC and prevent replay/resume. CRC failures remain errors, including in the final segment; corruption in non-final segments is also an error.
 - **Checksum coverage**: current checkpoint and WAL writes CRC-check the durable metadata they trust plus the payload. Legacy checkpoint v1 and WAL v2 files with payload-only CRCs remain readable.
 - **Deterministic checkpoints**: payloads are written with stable ordering.
 

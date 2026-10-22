@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- Clarify preallocated WAL recovery: padding after complete frames and physical-EOF
+  truncation differ from partial frames that fail CRC validation. Add filesystem
+  regression coverage for refusal without modification and recoverable controls;
+  recovery behavior and the on-disk format are unchanged.
+
+### Maintenance
+
+- Check Rust 1.80 with Tokio 1.53.3 in the MSRV job after newer Tokio releases
+  raised their compiler requirement. Stable CI retains latest dependency
+  resolution; the manifest's Tokio range is unchanged.
+
 ## [0.9.0] - 2026-10-12
 
 ### Removed
