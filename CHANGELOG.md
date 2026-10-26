@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `WalMaintenance::truncate_prefix` and `truncate_to_recycle` no longer remove the
+  newest segment. Deleting it let a resumed writer restart entry ids at 1.
+- `WalWriter::flush_and_sync` also syncs segments rotated out since the previous
+  sync. Without preallocation, rotation only flushed the outgoing segment, so its
+  tail was never made durable.
+- `WalWriter::flush` and `flush_and_sync` return `InvalidState` once the writer is
+  poisoned, so a retried sync cannot report durability after a failed one.
+
 ### Documentation
 
 - Clarify preallocated WAL recovery: padding after complete frames and physical-EOF
