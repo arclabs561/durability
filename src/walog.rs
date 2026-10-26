@@ -644,6 +644,9 @@ pub struct WalWriter<E> {
     lock_file: Option<std::fs::File>,
     preallocate_bytes: u64,
     poisoned: bool,
+    /// Segments rotated out since the last `flush_and_sync`. Their flushed
+    /// bytes are not yet durable, so the next sync must cover them too.
+    rotated_unsynced: Vec<String>,
     observer: Option<Arc<dyn WalObserver>>,
     last_flush_at: std::time::Instant,
     segment_created_at: Option<std::time::Instant>,
@@ -694,6 +697,7 @@ impl<E> WalWriter<E> {
             lock_file: None,
             preallocate_bytes: 0,
             poisoned: false,
+            rotated_unsynced: Vec::new(),
             observer: None,
             last_flush_at: std::time::Instant::now(),
             segment_created_at: None,
@@ -1125,8 +1129,20 @@ impl<E> WalWriter<E> {
         Ok(())
     }
 
+    fn check_not_poisoned(&self) -> PersistenceResult<()> {
+        if self.poisoned {
+            return Err(PersistenceError::InvalidState(
+                "WAL writer is poisoned after a prior write error".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Flush the current segment file if open.
+    ///
+    /// Returns `InvalidState` if the writer is poisoned.
     pub fn flush(&mut self) -> PersistenceResult<()> {
+        self.check_not_poisoned()?;
         self.drain_buffer_to_file()?;
         if let Some(f) = self.current_file.as_mut() {
             f.flush()?;
@@ -1138,13 +1154,28 @@ impl<E> WalWriter<E> {
 
     /// Flush buffered bytes and attempt to make the current WAL segment durable.
     ///
-    /// On sync failure, the writer is **poisoned** -- subsequent appends will
-    /// return `InvalidState`. This prevents callers from continuing to write
-    /// under a false impression of durability.
+    /// Segments rotated out since the previous call are synced first, so every
+    /// entry appended so far is covered, not only the current segment's.
+    ///
+    /// On sync failure, the writer is **poisoned** -- subsequent appends,
+    /// flushes and syncs return `InvalidState`. A retried sync cannot prove
+    /// durability after the kernel may have dropped the failed pages.
     ///
     /// Returns `NotSupported` if the underlying `Directory` does not provide `file_path()`.
     pub fn flush_and_sync(&mut self) -> PersistenceResult<()> {
         self.flush()?;
+        for path in &self.rotated_unsynced {
+            match storage::sync_file(&*self.directory, path) {
+                // Truncated or recycled since rotation: nothing left to sync.
+                Err(PersistenceError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    self.poisoned = true;
+                    return Err(e);
+                }
+                Ok(()) => {}
+            }
+        }
+        self.rotated_unsynced.clear();
         let Some(path) = self.current_path.as_deref() else {
             return Ok(());
         };
@@ -1193,9 +1224,14 @@ impl<E> WalWriter<E> {
             self.flush()?;
             self.truncate_current_segment()?;
             let old_segment_id = self.current_segment_id;
+            // With preallocation, truncate_current_segment already synced it.
+            if let Some(old_path) = self.current_path.take() {
+                if self.preallocate_bytes == 0 {
+                    self.rotated_unsynced.push(old_path);
+                }
+            }
             self.current_segment_id += 1;
             self.current_offset = 0;
-            self.current_path = None;
             self.current_file = None;
             self.since_flush = 0;
             if let Some(obs) = &self.observer {
@@ -1786,6 +1822,9 @@ impl WalMaintenance {
 
     /// Delete WAL segments that are fully covered by a checkpoint at `last_entry_id`.
     ///
+    /// The newest segment is always kept, even when fully covered: it is the
+    /// writer's active segment, and resume derives the next entry id from it.
+    ///
     /// Returns the number of deleted segment files. To recycle deleted segments
     /// instead of destroying them, use [`truncate_to_recycle`](Self::truncate_to_recycle)
     /// and feed the returned paths to [`WalWriter::recycle_segment`].
@@ -1799,7 +1838,8 @@ impl WalMaintenance {
     /// The caller is responsible for either deleting them or recycling them
     /// via [`WalWriter::recycle_segment`].
     pub fn truncate_to_recycle(&self, last_entry_id: u64) -> PersistenceResult<Vec<String>> {
-        let ranges = self.segment_ranges_strict()?;
+        let mut ranges = self.segment_ranges_strict()?;
+        ranges.pop(); // keep the newest segment; see truncate_prefix
         let mut paths = Vec::new();
         for seg in ranges {
             let Some(end) = seg.end_entry_id else {
@@ -1822,7 +1862,8 @@ impl WalMaintenance {
         last_entry_id: u64,
         observer: Option<&dyn WalObserver>,
     ) -> PersistenceResult<usize> {
-        let ranges = self.segment_ranges_strict()?;
+        let mut ranges = self.segment_ranges_strict()?;
+        ranges.pop(); // keep the newest segment; see truncate_prefix
         let mut deleted = 0usize;
         for seg in ranges {
             let Some(end) = seg.end_entry_id else {
@@ -2124,6 +2165,86 @@ mod raw_tests {
                 .collect::<Vec<_>>(),
             vec![b"alpha".as_slice(), b"beta".as_slice()]
         );
+    }
+
+    /// Write `count` single-byte entries with a tiny segment limit so every
+    /// entry after the first rotates into a new segment.
+    fn rotating_writer(dir: &Arc<dyn Directory>, count: u8) -> WalWriter<()> {
+        let mut w = WalWriter::<()>::with_options(dir.clone(), FlushPolicy::PerAppend, 0);
+        w.set_segment_size_limit_bytes(40);
+        for i in 0..count {
+            w.append_bytes(&[i]).unwrap();
+        }
+        w
+    }
+
+    #[test]
+    fn truncate_prefix_keeps_the_newest_segment_so_ids_continue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir: Arc<dyn Directory> =
+            Arc::new(crate::storage::FsDirectory::new(tmp.path()).unwrap());
+        let mut w = rotating_writer(&dir, 3);
+        w.flush_and_sync().unwrap();
+        drop(w);
+
+        // A checkpoint covering every entry must not delete the active segment:
+        // without it, resume starts entry ids at 1 again.
+        let deleted = WalMaintenance::new(dir.clone()).truncate_prefix(3).unwrap();
+        assert_eq!(deleted, 2);
+        assert_eq!(
+            WalMaintenance::new(dir.clone())
+                .truncate_to_recycle(3)
+                .unwrap(),
+            Vec::<String>::new()
+        );
+
+        let mut resumed = WalWriter::<()>::resume(dir).unwrap();
+        assert_eq!(resumed.append_bytes(b"next").unwrap(), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn flush_and_sync_syncs_segments_rotated_since_the_last_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir: Arc<dyn Directory> =
+            Arc::new(crate::storage::FsDirectory::new(tmp.path()).unwrap());
+        let mut w = rotating_writer(&dir, 2);
+        assert_eq!(w.current_segment_id(), 2);
+
+        // Make the rotated-out segment unopenable. If flush_and_sync syncs it
+        // as it must, that surfaces as an error; if it only syncs the current
+        // segment, this passes silently.
+        use std::os::unix::fs::PermissionsExt;
+        let old = tmp.path().join("wal/wal_1.log");
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = w.flush_and_sync();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn flush_and_sync_skips_a_rotated_segment_removed_by_truncation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir: Arc<dyn Directory> =
+            Arc::new(crate::storage::FsDirectory::new(tmp.path()).unwrap());
+        let mut w = rotating_writer(&dir, 2);
+        assert_eq!(WalMaintenance::new(dir).truncate_prefix(1).unwrap(), 1);
+        w.flush_and_sync().unwrap();
+    }
+
+    #[test]
+    fn flush_and_sync_after_poison_is_refused() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        let mut w = WalWriter::<()>::new(dir);
+        w.append_bytes(b"one").unwrap();
+        // A failed sync sets this; a retry must not report durability that the
+        // kernel may already have dropped.
+        w.poisoned = true;
+        assert!(matches!(w.flush(), Err(PersistenceError::InvalidState(_))));
+        assert!(matches!(
+            w.flush_and_sync(),
+            Err(PersistenceError::InvalidState(_))
+        ));
     }
 }
 
