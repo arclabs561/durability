@@ -5,14 +5,15 @@
 
 Durability primitives for local persistence.
 
+## Overview
+
 `durability` provides filesystem and in-memory directories, atomic writes, WALs,
 record logs, checkpoint files, CRC validation, and sync helpers.
 
 It does not own indexing, segment selection, compaction, or reader visibility.
 
-For a ready-made embedded key-value store, use redb or fjall, and for a
-standalone WAL crate, okaywal; use `durability` when your own index or store
-needs the logs, checkpoints and recovery steps as separate pieces.
+Use `durability` when your own index or store needs logs, checkpoints, and
+recovery steps as separate pieces.
 
 ## Quick start
 
@@ -88,10 +89,11 @@ let dir = FsDirectory::arc("/tmp/wal-demo").unwrap();
 let sw = Arc::new(SyncWalWriter::<Op>::open(dir).unwrap());
 
 let sw2 = sw.clone();
-std::thread::spawn(move || {
+let worker = std::thread::spawn(move || {
     sw2.append_durable(&Op::Set("hello".into())).unwrap();
 });
 sw.append_durable(&Op::Set("world".into())).unwrap();
+worker.join().unwrap();
 ```
 
 ## Generic recovery
@@ -178,9 +180,9 @@ let data = bridge.read_file("data.bin").await.unwrap();
 | `publish` | Checkpoint publish + WAL truncation with explicit sync steps (feature `postcard`) |
 | `async_dir` | `AsyncDirectory` trait + `BlockingBridge` (feature `async`) |
 
-## Not provided
+## Operational limits
 
-- **Multi-process locking**: one `WalWriter` per directory. On a filesystem `wal/.lock` is an OS lock that excludes other processes and is released on exit; `RecordLogWriter` takes no lock, so callers (e.g. segstore) must hold their own.
+- **Writer ownership**: one `WalWriter` per directory. On a filesystem `wal/.lock` is an OS lock that excludes other processes and is released on exit; `RecordLogWriter` takes no lock, so callers (e.g. segstore) must hold their own.
 - **Per-write fsync by default**: writes are buffered. Use `flush_and_sync()` for a durability barrier.
 - **fsync failure recovery**: a failed fsync poisons the writer. Callers should treat this as unrecoverable and restart from WAL.
 

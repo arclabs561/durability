@@ -4,7 +4,7 @@ Thanks for your interest. durability provides crash-consistent persistence primi
 
 ## Before you start
 
-For non-trivial work (new storage backends, on-disk format changes, recovery-protocol changes), open an issue first to align on scope. Drive-by bug fixes and doc patches don't need an issue.
+For non-trivial work (new storage backends, on-disk format changes, changes to the recovery protocol), open an issue first to align on scope. Drive-by bug fixes and doc patches don't need an issue.
 
 ## Setup
 
@@ -25,8 +25,8 @@ cargo test --all-features
 
 ## Testing
 
-- `cargo test --all-features` for the full matrix.
-- Crash-consistency invariants: any change to WAL replay, checkpointing, or recovery needs a property test that exercises kill-then-recover. Don't add a code path that can succeed at write time but corrupt on recover.
+- `cargo test --all-features` to test with all features enabled.
+- Crash consistency: any change to WAL replay, checkpointing, or recovery needs a property test that exercises kill-then-recover. Don't add a code path that can succeed at write time but corrupt on recover.
 - Format changes are append-breaking unless covered by a versioned reader. State the migration story in the PR.
 
 ## On-disk format
