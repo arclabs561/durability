@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `WalWriter::open_with_options` and `WalWriter::resume_with_options` take the
+  flush policy and write buffer size of `WalWriter::with_options`. `open` and
+  `resume` always use the default buffered policy, so a WAL written with
+  `FlushPolicy::PerAppend` became buffered after a restart. The README's tuning
+  example uses `open_with_options`, so it also works on an existing WAL.
+- `formats::RECORDLOG_FORMAT_VERSION` (2).
+
+### Changed
+
+- **Record log format change (next minor release).** New record logs are
+  written as format version 2, whose record checksum covers `len | payload`
+  instead of the payload alone. Version 1 logs are still read, and writers
+  keep appending version 1 records to them; older releases cannot read
+  version 2 logs. In version 1, eight zero bytes are a valid empty record
+  (crc32 of no bytes is 0), so a zero-filled tail left by a crash replayed as
+  phantom empty records, even in strict mode, and a reopened writer appended
+  after them. In version 2 a tail of zeros is a torn tail: best-effort replay
+  stops before it, strict replay returns an error, and a reopened writer cuts
+  it off. `formats::FORMAT_VERSION` keeps its value (1) and now names the
+  legacy version.
+- Dropping a `WalWriter` flushes its write buffer to the segment file, like
+  `std::io::BufWriter`. Errors are ignored and nothing is synced; a poisoned
+  writer is left alone. Appends acknowledged under a buffering policy were
+  discarded when the writer was dropped without `flush`.
+- Documented that dropping a `BlockingBridge` future does not cancel the
+  operation: the blocking task still runs, so a dropped write can land after
+  a newer write to the same path.
+
 ### Fixed
 
 - Best-effort WAL replay returns an error when the final segment has an unreadable

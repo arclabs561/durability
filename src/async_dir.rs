@@ -10,6 +10,8 @@
 //! - [`BlockingBridge`]: wraps any sync `Directory` for use from async code by running
 //!   each operation inside [`tokio::task::spawn_blocking`]. This is the fastest path
 //!   to using durability from a tokio application without blocking the runtime.
+//!   Dropping one of its futures does not cancel an operation already
+//!   started; see [`BlockingBridge`].
 //!
 //! # Example
 //!
@@ -74,6 +76,14 @@ pub trait AsyncDirectory: Send + Sync {
 ///
 /// Each operation runs inside [`tokio::task::spawn_blocking`], so the async
 /// runtime's worker threads are never blocked by filesystem I/O.
+///
+/// # Cancellation
+///
+/// Dropping a returned future does not cancel the operation. Once the future
+/// has been polled, the blocking task runs to completion even if the caller
+/// gives up on it (a timeout or a `select!` branch that loses), so a dropped
+/// write can still land after a newer write to the same path. Await each
+/// write, or serialize writers to a path, when a later value must win.
 pub struct BlockingBridge<D> {
     inner: Arc<D>,
 }

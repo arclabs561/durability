@@ -11,11 +11,19 @@
 //!
 //! ## Public invariants (must not change without a format bump)
 //!
-//! - **File header**: `[RECORDLOG_MAGIC][FORMAT_VERSION]` at byte 0.
+//! - **File header**: `[RECORDLOG_MAGIC][version:u32]` at byte 0. New logs use
+//!   [`RECORDLOG_FORMAT_VERSION`] (2); version 1 ([`FORMAT_VERSION`]) logs are
+//!   still read, and writers append version 1 frames to them.
 //! - **Record framing** (little-endian):
 //!   `len:u32 | crc32:u32 | payload bytes...`
-//! - **Checksum**: `crc32fast` over the payload bytes.
+//! - **Checksum**: `crc32fast` over `len | payload` in version 2, over the
+//!   payload bytes only in version 1.
 //! - **Limits**: payload length is capped at `MAX_RECORD_BYTES`.
+//!
+//! In version 1 the checksum of an empty payload is 0, so eight zero bytes
+//! decode as a valid empty record, and a zero-filled tail left by a crash
+//! (file size persisted, data blocks not) replays as phantom records. Version 2
+//! rejects such frames: a tail that is all zeros is treated as a torn tail.
 //!
 //! ## Recovery posture
 //!
@@ -28,7 +36,7 @@
 //! appends return `InvalidState` instead of extending a possibly ambiguous log.
 
 use crate::error::{PersistenceError, PersistenceResult};
-use crate::formats::{FORMAT_VERSION, RECORDLOG_MAGIC};
+use crate::formats::{FORMAT_VERSION, RECORDLOG_FORMAT_VERSION, RECORDLOG_MAGIC};
 use crate::storage::{self, Directory, FlushPolicy};
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -83,6 +91,9 @@ pub struct RecordLogWriter {
     dir: Arc<dyn Directory>,
     path: String,
     header_checked: bool,
+    /// Format version of the file being appended to (known once the header
+    /// is checked).
+    version: u32,
     w: Option<Box<dyn Write + Send>>,
     flush_policy: FlushPolicy,
     since_flush: usize,
@@ -132,6 +143,7 @@ impl RecordLogWriter {
             dir: dir.into(),
             path: path.into(),
             header_checked: false,
+            version: RECORDLOG_FORMAT_VERSION,
             w: None,
             flush_policy,
             since_flush: 0,
@@ -174,7 +186,7 @@ impl RecordLogWriter {
             self.poison();
             return Err(e.into());
         }
-        if let Err(e) = w.write_all(&FORMAT_VERSION.to_le_bytes()) {
+        if let Err(e) = w.write_all(&RECORDLOG_FORMAT_VERSION.to_le_bytes()) {
             self.poison();
             return Err(e.into());
         }
@@ -184,6 +196,7 @@ impl RecordLogWriter {
                 return Err(e.into());
             }
         }
+        self.version = RECORDLOG_FORMAT_VERSION;
         self.header_checked = true;
         Ok(())
     }
@@ -200,41 +213,47 @@ impl RecordLogWriter {
         let mut bytes = Vec::new();
         self.dir.open_file(&self.path)?.read_to_end(&mut bytes)?;
 
-        let mut header = [0u8; 8];
-        header[..4].copy_from_slice(&RECORDLOG_MAGIC);
-        header[4..].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        const HEADER_LEN: usize = 8;
+        let header = |version: u32| {
+            let mut header = [0u8; HEADER_LEN];
+            header[..4].copy_from_slice(&RECORDLOG_MAGIC);
+            header[4..].copy_from_slice(&version.to_le_bytes());
+            header
+        };
 
-        if bytes.len() < header.len() {
+        if bytes.len() < HEADER_LEN {
             // Created, but the header never fully reached disk.
-            if !header.starts_with(&bytes) {
+            if !header(RECORDLOG_FORMAT_VERSION).starts_with(&bytes)
+                && !header(FORMAT_VERSION).starts_with(&bytes)
+            {
                 return Err(PersistenceError::Format("invalid recordlog magic".into()));
             }
-            return self.dir.atomic_write(&self.path, &header);
+            self.version = RECORDLOG_FORMAT_VERSION;
+            return self
+                .dir
+                .atomic_write(&self.path, &header(RECORDLOG_FORMAT_VERSION));
         }
         if bytes[..4] != RECORDLOG_MAGIC {
             return Err(PersistenceError::Format("invalid recordlog magic".into()));
         }
-        if bytes[4..8] != header[4..] {
-            return Err(PersistenceError::Format(
-                "recordlog version mismatch".into(),
-            ));
-        }
+        let version = check_version(u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes")))?;
+        self.version = version;
 
-        let body = &bytes[header.len()..];
-        let valid = valid_record_prefix_len(body);
+        let body = &bytes[HEADER_LEN..];
+        let valid = valid_record_prefix_len(body, version);
         if valid == body.len() {
             return Ok(());
         }
-        if let Some(offset) = find_valid_record_after(&body[valid..]) {
+        if let Some(offset) = find_valid_record_after(&body[valid..], version) {
             return Err(PersistenceError::Format(format!(
                 "recordlog mid-file corruption: record at offset {} is unreadable but a \
                  valid record follows at offset {}; refusing to truncate",
-                header.len() + valid,
-                header.len() + valid + offset
+                HEADER_LEN + valid,
+                HEADER_LEN + valid + offset
             )));
         }
         self.dir
-            .atomic_write(&self.path, &bytes[..header.len() + valid])
+            .atomic_write(&self.path, &bytes[..HEADER_LEN + valid])
     }
 
     fn ensure_writer(&mut self) -> PersistenceResult<()> {
@@ -319,7 +338,7 @@ impl RecordLogWriter {
             .map_err(|_| PersistenceError::Format("record length overflows u32".into()))?;
 
         // Small optimization: write the fixed 8-byte header in one call.
-        let crc = crc32fast::hash(payload);
+        let crc = record_crc(self.version, len_u32, payload);
         let mut header = [0u8; 8];
         header[..4].copy_from_slice(&len_u32.to_le_bytes());
         header[4..].copy_from_slice(&crc.to_le_bytes());
@@ -364,9 +383,32 @@ impl RecordLogWriter {
     }
 }
 
+/// Return `version` if this crate can read record logs of that version.
+fn check_version(version: u32) -> PersistenceResult<u32> {
+    if version == RECORDLOG_FORMAT_VERSION || version == FORMAT_VERSION {
+        Ok(version)
+    } else {
+        Err(PersistenceError::Format(format!(
+            "recordlog version mismatch (got {version}, expected \
+             {RECORDLOG_FORMAT_VERSION} or legacy {FORMAT_VERSION})"
+        )))
+    }
+}
+
+/// Record checksum for a log of the given format version.
+fn record_crc(version: u32, len: u32, payload: &[u8]) -> u32 {
+    if version == FORMAT_VERSION {
+        return crc32fast::hash(payload);
+    }
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&len.to_le_bytes());
+    hasher.update(payload);
+    hasher.finalize()
+}
+
 /// Parse one `len | crc | payload` frame at the start of `bytes`, returning
 /// its total size if it is complete and its CRC matches.
-fn valid_record_len(bytes: &[u8]) -> Option<usize> {
+fn valid_record_len(bytes: &[u8], version: u32) -> Option<usize> {
     let len = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
     if len > MAX_RECORD_BYTES {
         return None;
@@ -374,28 +416,47 @@ fn valid_record_len(bytes: &[u8]) -> Option<usize> {
     let crc = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);
     let end = 8usize.checked_add(len as usize)?;
     let payload = bytes.get(8..end)?;
-    (crc32fast::hash(payload) == crc).then_some(end)
+    (record_crc(version, len, payload) == crc).then_some(end)
 }
 
 /// Length of the longest prefix of `body` made of complete, valid records.
-fn valid_record_prefix_len(body: &[u8]) -> usize {
+fn valid_record_prefix_len(body: &[u8], version: u32) -> usize {
     let mut off = 0;
-    while let Some(n) = valid_record_len(&body[off..]) {
+    while let Some(n) = valid_record_len(&body[off..], version) {
         off += n;
     }
     off
 }
 
-/// Offset of the first valid non-empty record in `tail` after offset 0.
+/// Offset of the first valid record in `tail` after offset 0.
 ///
-/// Recovery path only, so a byte-by-byte scan is acceptable. Empty records
-/// are skipped: eight zero bytes are a "valid" empty record (crc32 of nothing
-/// is 0), and zero padding must not count as surviving data.
-fn find_valid_record_after(tail: &[u8]) -> Option<usize> {
+/// Recovery path only, so a byte-by-byte scan is acceptable. In version 1
+/// logs empty records are skipped: eight zero bytes are a "valid" empty
+/// record there (crc32 of nothing is 0), and zero padding must not count as
+/// surviving data. Version 2 checksums cover the length, so zeros never
+/// validate and a real empty record counts.
+fn find_valid_record_after(tail: &[u8], version: u32) -> Option<usize> {
     (1..tail.len()).find(|&off| {
         let frame = &tail[off..];
-        frame.len() > 8 && frame[..4] != [0; 4] && valid_record_len(frame).is_some()
+        frame.len() >= 8
+            && (version != FORMAT_VERSION || (frame.len() > 8 && frame[..4] != [0; 4]))
+            && valid_record_len(frame, version).is_some()
     })
+}
+
+/// Consume `r` to EOF, returning whether every remaining byte is zero.
+fn rest_is_zero(r: &mut dyn Read) -> std::io::Result<bool> {
+    let mut buf = [0u8; 8192];
+    let mut all_zero = true;
+    loop {
+        let n = match r.read(&mut buf) {
+            Ok(0) => return Ok(all_zero),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        all_zero &= buf[..n].iter().all(|&b| b == 0);
+    }
 }
 
 /// Sequential record log reader.
@@ -413,7 +474,9 @@ impl RecordLogReader {
         }
     }
 
-    pub(crate) fn open_stream(&self) -> PersistenceResult<Box<dyn Read + Send>> {
+    /// Open the log and validate its header, returning the stream positioned
+    /// at the first record and the log's format version.
+    pub(crate) fn open_stream(&self) -> PersistenceResult<(Box<dyn Read + Send>, u32)> {
         let mut f = self.dir.open_file(&self.path)?;
 
         let mut magic = [0u8; 4];
@@ -423,18 +486,14 @@ impl RecordLogReader {
         }
         let mut vbuf = [0u8; 4];
         f.read_exact(&mut vbuf)?;
-        let version = u32::from_le_bytes(vbuf);
-        if version != FORMAT_VERSION {
-            return Err(PersistenceError::Format(
-                "recordlog version mismatch".into(),
-            ));
-        }
-        Ok(f)
+        let version = check_version(u32::from_le_bytes(vbuf))?;
+        Ok((f, version))
     }
 
     pub(crate) fn next_record_inner(
         &self,
         r: &mut dyn Read,
+        version: u32,
         mode: RecordLogReadMode,
     ) -> PersistenceResult<Option<Record>> {
         // Tail-aware length decode:
@@ -476,6 +535,22 @@ impl RecordLogReader {
                 Err(e) => return Err(e.into()),
             }
         };
+        if version != FORMAT_VERSION && len == 0 && expected_crc == 0 {
+            // No version 2 frame has this header (its checksum covers the
+            // length). Zeros through EOF are a torn tail: the file size reached
+            // disk but its data did not.
+            if !rest_is_zero(r)? {
+                return Err(PersistenceError::Format(
+                    "recordlog corruption: zeroed record header followed by data".into(),
+                ));
+            }
+            return match mode {
+                RecordLogReadMode::Strict => Err(PersistenceError::Format(
+                    "recordlog has a zero-filled tail".into(),
+                )),
+                RecordLogReadMode::BestEffort => Ok(None),
+            };
+        }
         let payload = match storage::read_exact_bounded(&mut *r, len as usize) {
             Ok(p) => p,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -486,7 +561,7 @@ impl RecordLogReader {
             }
             Err(e) => return Err(e.into()),
         };
-        let got = crc32fast::hash(&payload);
+        let got = record_crc(version, len, &payload);
         if got != expected_crc {
             return Err(PersistenceError::CrcMismatch {
                 expected: expected_crc,
@@ -501,8 +576,8 @@ impl RecordLogReader {
         if !self.dir.exists(&self.path) {
             return Ok(vec![]);
         }
-        let mut f = match self.open_stream() {
-            Ok(f) => f,
+        let (mut f, version) = match self.open_stream() {
+            Ok(opened) => opened,
             Err(PersistenceError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 // Best-effort recovery: if the file exists but is too small to even contain a
                 // header, treat it as an empty log (crash during initial creation).
@@ -514,7 +589,7 @@ impl RecordLogReader {
             Err(e) => return Err(e),
         };
         let mut out = Vec::new();
-        while let Some(rec) = self.next_record_inner(&mut *f, mode)? {
+        while let Some(rec) = self.next_record_inner(&mut *f, version, mode)? {
             out.push(rec);
         }
         Ok(out)
