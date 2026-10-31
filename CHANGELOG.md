@@ -11,9 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `WalMaintenance::truncate_prefix` and `truncate_to_recycle` no longer remove the
   newest segment. Deleting it let a resumed writer restart entry ids at 1.
-- `WalWriter::flush_and_sync` also syncs segments rotated out since the previous
-  sync. Without preallocation, rotation only flushed the outgoing segment, so its
-  tail was never made durable.
 - `WalWriter::flush` and `flush_and_sync` return `InvalidState` once the writer is
   poisoned, so a retried sync cannot report durability after a failed one.
 - WAL replay, resume and `segment_ranges_strict` check that each segment header's
@@ -30,6 +27,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `recover_with_wal` returns `InvalidState` when given a checkpoint path and the
   WAL starts after the checkpoint's last entry + 1 (checkpoint missing, older than
   a prefix truncation, or ignored as corrupt), instead of skipping entries.
+- WAL rotation syncs the outgoing segment and its directory entry before creating
+  the next segment. Without preallocation it only flushed, so a crash could keep
+  the new segment but lose the old segment's tail or name, leaving a gap that
+  blocked replay of entries `flush_and_sync` had reported durable. A sync failure
+  during rotation poisons the writer. `flush_and_sync` and rotation now sync
+  through `Directory::durable_sync_file` and `durable_sync_parent_dir`, so a
+  backend's overrides of those methods take effect; the defaults are unchanged.
+- `recover_with_wal` and `RecoveryManager::recover` without a checkpoint path
+  return `InvalidState` when the WAL does not start at entry 1 (for example after
+  a checkpoint publish truncated its prefix), instead of returning the state of
+  the remaining entries alone. `RecoveryManager::recover_latest` recovers such a
+  WAL through the checkpoint it records.
 
 ### Documentation
 
