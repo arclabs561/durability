@@ -240,7 +240,7 @@ pub trait Directory: Send + Sync {
             ));
         }
 
-        let tmp = format!("{path}.tmp");
+        let tmp = unique_temp_path(path);
         if let Err(e) = (|| -> PersistenceResult<()> {
             let mut w = self.create_file(&tmp)?;
             w.write_all(data)?;
@@ -263,6 +263,17 @@ pub trait Directory: Send + Sync {
 
         Ok(())
     }
+}
+
+/// Temporary sibling path for an atomic write to `path`.
+///
+/// Unique per call (process id plus a process-wide counter): with one fixed
+/// name, concurrent writers to the same path truncate and rename each other's
+/// temporary file, so readers can see a partly written file and writers fail.
+fn unique_temp_path(path: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{path}.tmp.{}.{n}", std::process::id())
 }
 
 /// Filesystem-backed `Directory` rooted at a local path.
@@ -377,7 +388,7 @@ impl Directory for FsDirectory {
     }
 
     fn atomic_write(&self, path: &str, data: &[u8]) -> PersistenceResult<()> {
-        let temp_path = format!("{path}.tmp");
+        let temp_path = unique_temp_path(path);
         let full_temp_path = self.resolve_path(&temp_path)?;
         if let Some(parent) = full_temp_path.parent() {
             std::fs::create_dir_all(parent)?;
