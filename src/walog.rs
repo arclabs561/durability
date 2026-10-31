@@ -516,6 +516,21 @@ pub enum WalReplayMode {
 // WAL segment enumeration
 // ---------------------------------------------------------------------------
 
+/// The in-memory copy of a segment when replay read one, else its file.
+fn segment_reader<'a>(
+    tail: &'a mut Option<std::io::Cursor<Vec<u8>>>,
+    file: &'a mut Box<dyn Read + Send>,
+) -> &'a mut dyn Read {
+    match tail {
+        Some(cursor) => cursor,
+        None => file,
+    }
+}
+
+/// Where a recycled segment file gets its new header before it is renamed to
+/// its new segment name. Not a `wal_N.log` name, so replay ignores it.
+const RECYCLE_STAGING_PATH: &str = "wal/recycle.tmp";
+
 /// List WAL segment files, returning (segment_id, filename) pairs sorted by segment_id.
 fn enumerate_wal_segments(dir: &dyn Directory) -> PersistenceResult<Vec<(u64, String)>> {
     let wal_files = dir.list_dir("wal")?;
@@ -764,8 +779,13 @@ impl<E> WalWriter<E> {
     /// of deleted segments. If the pool is full, the oldest recycled file is deleted.
     ///
     /// Note: the caller must ensure the path still exists and is no longer needed
-    /// for replay.
+    /// for replay. A path already in the pool is ignored, so feeding the result
+    /// of every [`WalMaintenance::truncate_to_recycle`] call is safe even when
+    /// it repeats paths that no rotation has reused yet.
     pub fn recycle_segment(&mut self, path: String) {
+        if self.recycle_pool.contains(&path) {
+            return;
+        }
         if self.recycle_capacity == 0 {
             let _ = self.directory.delete(&path);
             return;
@@ -1181,21 +1201,23 @@ impl<E> WalWriter<E> {
         };
 
         if self.current_offset == 0 {
-            // Try to reuse a recycled segment file.
-            if let Some(recycled) = self.recycle_pool.pop_front() {
-                self.directory.atomic_rename(&recycled, &wal_path)?;
-            }
-            let mut file = self.directory.create_file(&wal_path)?;
-            WalSegmentHeader {
+            let header = WalSegmentHeader {
                 magic: WAL_MAGIC,
                 version: WAL_FORMAT_VERSION,
                 start_entry_id,
                 segment_id: self.current_segment_id,
-            }
-            .write(&mut file)?;
-            if self.flush_policy == FlushPolicy::PerAppend {
-                file.flush()?;
-            }
+            };
+            let file = match self.recycle_pool.pop_front() {
+                Some(recycled) => self.reuse_recycled_segment(&recycled, &wal_path, header)?,
+                None => {
+                    let mut file = self.directory.create_file(&wal_path)?;
+                    header.write(&mut file)?;
+                    if self.flush_policy == FlushPolicy::PerAppend {
+                        file.flush()?;
+                    }
+                    file
+                }
+            };
             self.segment_created_at = Some(std::time::Instant::now());
             // Preallocate on filesystem backends to avoid block allocation on write path.
             if self.preallocate_bytes > 0 {
@@ -1214,6 +1236,31 @@ impl<E> WalWriter<E> {
             self.current_file = Some(self.directory.append_file(&wal_path)?);
         }
         Ok(wal_path)
+    }
+
+    /// Turn a recycled segment file into the new segment at `wal_path`.
+    ///
+    /// The file is moved out of the WAL's namespace and given its new header
+    /// before it is renamed into place. Renaming it straight to `wal_path`
+    /// would leave a segment named for the new id but holding the old header
+    /// if the header write failed or the process crashed in between, and
+    /// replay refuses such a WAL.
+    fn reuse_recycled_segment(
+        &self,
+        recycled: &str,
+        wal_path: &str,
+        header: WalSegmentHeader,
+    ) -> PersistenceResult<Box<dyn Write + Send>> {
+        self.directory
+            .atomic_rename(recycled, RECYCLE_STAGING_PATH)?;
+        {
+            let mut staging = self.directory.create_file(RECYCLE_STAGING_PATH)?;
+            header.write(&mut staging)?;
+            staging.flush()?;
+        }
+        self.directory
+            .atomic_rename(RECYCLE_STAGING_PATH, wal_path)?;
+        self.directory.append_file(wal_path)
     }
 
     fn drain_buffer_to_file(&mut self) -> PersistenceResult<()> {
@@ -1356,7 +1403,13 @@ impl<E> WalWriter<E> {
         };
         if (size_exceeded || age_exceeded) && self.current_offset > WalSegmentHeader::SIZE as u64 {
             self.flush()?;
-            self.truncate_current_segment()?;
+            if let Err(e) = self.truncate_current_segment() {
+                // The shrink ends in a sync. After a failed sync a retry can
+                // report success although the kernel dropped the dirty pages,
+                // so the outgoing segment's durability is unknown.
+                self.poisoned = true;
+                return Err(e);
+            }
             self.sync_outgoing_segment()?;
             let old_segment_id = self.current_segment_id;
             self.current_path = None;
@@ -1478,7 +1531,9 @@ fn scan_last_segment_prefix(
         header: None,
         has_frames: false,
     };
-    if bytes.len() < WalSegmentHeader::SIZE {
+    // An all-zero segment is a preallocated file whose size reached disk but
+    // whose header did not: a torn header, rewritten like a short one.
+    if bytes.len() < WalSegmentHeader::SIZE || bytes.iter().all(|&b| b == 0) {
         return Ok(torn);
     }
 
@@ -1811,7 +1866,21 @@ impl<E> WalReader<E> {
         for (segment_id, wal_file) in wal_segments {
             let wal_path = format!("wal/{wal_file}");
             let mut file = self.directory.open_file(&wal_path)?;
-            let header = match WalSegmentHeader::read(&mut file) {
+            // Best-effort replay reads the final segment into memory so that,
+            // where decoding stops, it can tell a torn tail from a damaged
+            // record that valid records follow (as resume does).
+            let mut tail: Option<std::io::Cursor<Vec<u8>>> = None;
+            if mode == WalReplayMode::BestEffortTail && Some(segment_id) == last_segment_id {
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)?;
+                // A preallocated segment whose size reached disk but whose
+                // header did not reads as zeros: a torn header.
+                if bytes.iter().all(|&b| b == 0) {
+                    break;
+                }
+                tail = Some(std::io::Cursor::new(bytes));
+            }
+            let header = match WalSegmentHeader::read(&mut segment_reader(&mut tail, &mut file)) {
                 Ok(h) => h,
                 Err(PersistenceError::Io(e))
                     if e.kind() == std::io::ErrorKind::UnexpectedEof
@@ -1852,20 +1921,13 @@ impl<E> WalReader<E> {
             }
 
             loop {
-                let decoded = match max_entry_id {
-                    Some(max) => WalEntryOnDisk::decode_raw_until(
-                        &mut file,
-                        segment_mode,
-                        Some(max),
-                        checksum_mode,
-                    )?,
-                    None => WalEntryOnDisk::decode_raw_until(
-                        &mut file,
-                        segment_mode,
-                        None,
-                        checksum_mode,
-                    )?,
-                };
+                let start_pos = tail.as_ref().map(|c| c.position() as usize);
+                let decoded = WalEntryOnDisk::decode_raw_until(
+                    &mut segment_reader(&mut tail, &mut file),
+                    segment_mode,
+                    max_entry_id,
+                    checksum_mode,
+                )?;
 
                 if decoded.is_some() {
                     if let Some(e) = header_gap.take() {
@@ -1898,7 +1960,25 @@ impl<E> WalReader<E> {
                         }
                         return Ok(count);
                     }
-                    None => break,
+                    None => {
+                        if let (Some(cursor), Some(start)) = (tail.as_ref(), start_pos) {
+                            let bytes = cursor.get_ref();
+                            let start = start.min(bytes.len());
+                            if let Some(offset) = find_valid_frame_after(
+                                &bytes[start..],
+                                checksum_mode,
+                                last_seen_entry_id,
+                            ) {
+                                return Err(PersistenceError::Format(format!(
+                                    "WAL mid-segment corruption in segment {segment_id}: record \
+                                     at offset {start} is unreadable but a valid record follows \
+                                     at offset {}",
+                                    start + offset
+                                )));
+                            }
+                        }
+                        break;
+                    }
                 }
             }
 

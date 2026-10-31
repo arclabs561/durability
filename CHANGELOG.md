@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Best-effort WAL replay returns an error when the final segment has an unreadable
+  record followed by valid records, as `WalWriter::resume` already did. It treated
+  a damaged length field as a torn tail and returned only the records before it.
+- A final WAL segment that is all zeros (a preallocated segment whose size reached
+  disk but whose header did not) is treated as a torn header: best-effort replay
+  stops before it and resume rewrites it, instead of failing with "invalid WAL
+  magic" and blocking recovery of every earlier entry.
+- A failed shrink-and-sync of a preallocated segment during rotation poisons the
+  writer. The next append used to retry, and a retried sync can report success
+  after the kernel dropped the failed pages.
+- A recycled segment file gets its new header under a staging name before it is
+  renamed to its new segment name. Renaming it first left a segment named for the
+  new id with the old header when the create failed or the process crashed in
+  between, and replay then refused the whole WAL.
+- `WalWriter::recycle_segment` ignores a path already in the recycle pool.
+  `WalMaintenance::truncate_to_recycle` reports covered segments until a rotation
+  reuses them, so recycling after every checkpoint queued a path twice and the
+  second rotation to reach it failed and poisoned the writer.
+- `FsDirectory::atomic_write` and `Directory::atomic_write_durable` use a unique
+  temporary file per call. Concurrent writers to the same path shared one
+  `{path}.tmp`, so writes failed and readers saw partly written files.
+
 ## [0.10.0] - 2026-10-31
 
 ### Fixed
