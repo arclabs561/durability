@@ -19,7 +19,7 @@ recovery steps as separate pieces.
 
 ```toml
 [dependencies]
-durability = "0.9"
+durability = "0.10"
 ```
 
 ```rust
@@ -154,7 +154,7 @@ The `async` feature provides `AsyncDirectory` and `BlockingBridge` for tokio:
 
 ```toml
 [dependencies]
-durability = { version = "0.9", features = ["async"] }
+durability = { version = "0.10", features = ["async"] }
 ```
 
 ```rust,no_run
