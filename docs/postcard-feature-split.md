@@ -121,4 +121,4 @@ methods, so it should ship in a minor 0.x release rather than a patch release.
   recovery helper rather than reintroducing postcard as unconditional.
 
 ---
-Decided: 2026-06-29 | Session: Codex handoff from Claude 03edba07
+Decided: 2026-06-29
