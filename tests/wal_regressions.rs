@@ -8,6 +8,7 @@ use durability::publish::CheckpointPublisher;
 use durability::recover::{recover_with_wal, RecoveryOptions};
 use durability::storage::{Directory, FlushPolicy, FsDirectory, MemoryDirectory};
 use durability::walog::{WalMaintenance, WalReader, WalWriter};
+use durability::PersistenceError;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -186,13 +187,38 @@ fn b3_best_effort_recovery_with_corrupt_checkpoint_silently_skips_truncated_pref
     );
 }
 
+#[test]
+fn b4_recovery_without_a_checkpoint_refuses_a_truncated_wal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = publish_scenario(tmp.path());
+    for options in [RecoveryOptions::strict(), RecoveryOptions::best_effort()] {
+        let r = recover_with_wal::<u64, Op, _>(&dir, None, options, |c| c.unwrap_or(0), count);
+        eprintln!(
+            "B4: true counter = 13; recovery without a checkpoint -> {:?}",
+            r.as_ref().map(|r| (r.state, r.last_entry_id))
+        );
+        assert!(
+            matches!(r, Err(PersistenceError::InvalidState(_))),
+            "recovery without a checkpoint replayed a WAL whose prefix was truncated"
+        );
+    }
+    // The checkpoint the WAL records still recovers the full state.
+    let latest = recover_with_wal::<u64, Op, _>(
+        &dir,
+        Some("c2.bin"),
+        RecoveryOptions::strict(),
+        |c| c.unwrap_or(0),
+        count,
+    )
+    .unwrap();
+    assert_eq!(latest.state, 13);
+}
+
 // ---------------------------------------------------------------------------
 // D. Rotation without preallocation does not sync the outgoing segment;
 //    a legal crash image makes the whole WAL unrecoverable.
 //
-// The bug hunt's `d1_` test is not included: it requires best-effort replay
-// to tolerate a truncated non-final segment, which the README contract
-// ("corruption in non-final segments is also an error") rules out.
+// The crash images this allows are checked in `wal_rotation_crash_images.rs`.
 // ---------------------------------------------------------------------------
 
 fn rotation_scenario() -> (tempfile::TempDir, Arc<dyn Directory>) {

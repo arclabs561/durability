@@ -87,10 +87,13 @@ pub struct Recovery<S> {
 /// The `apply` closure folds each WAL entry (with entry_id > checkpoint's
 /// `last_applied_id`) into the working state.
 ///
-/// When `checkpoint_path` is given, the WAL must continue from the checkpoint:
-/// if its first entry is past the checkpoint's last id + 1 (for example the
-/// checkpoint is missing, older than a prefix truncation, or ignored as
-/// corrupt), recovery returns `InvalidState` instead of skipping entries.
+/// The WAL must continue from the checkpoint: if its first entry is past the
+/// checkpoint's last id + 1 (for example the checkpoint is missing, older than
+/// a prefix truncation, or ignored as corrupt), recovery returns
+/// `InvalidState` instead of skipping entries. Without a checkpoint
+/// (`checkpoint_path` is `None`), the WAL must start at entry 1, so a WAL
+/// whose prefix was truncated after a checkpoint publish needs that
+/// checkpoint (see [`RecoveryManager::recover_latest`]).
 ///
 /// # Example
 ///
@@ -163,18 +166,22 @@ where
     let wal = WalReader::<E>::new(dir.clone());
     let since = last_entry_id;
     let ceiling = options.up_to_entry_id;
-    // With a checkpoint path, the WAL must reach back to the entry after the
-    // checkpoint. If its prefix was truncated past that point (checkpoint
-    // missing, older than the truncation, or ignored as corrupt), replay
-    // would skip entries.
-    let mut required_first = checkpoint_path.and(since.checked_add(1));
+    // The WAL must reach back to the entry after the checkpoint, or to entry 1
+    // without one. If its prefix was truncated past that point (no checkpoint
+    // given, checkpoint missing, older than the truncation, or ignored as
+    // corrupt), replay would skip entries.
+    let mut required_first = since.checked_add(1);
 
     wal.replay_each_with_mode_until(options.wal_mode, ceiling, |record| {
         if let Some(required) = required_first.take() {
             if record.entry_id > required {
+                let covered = if since == 0 {
+                    "no checkpoint was loaded".to_string()
+                } else {
+                    format!("the checkpoint covers entries through {since}")
+                };
                 return Err(PersistenceError::InvalidState(format!(
-                    "WAL starts at entry {} but the checkpoint covers entries through {since}; \
-                     entries {required}..{} are unavailable",
+                    "WAL starts at entry {} but {covered}; entries {required}..{} are unavailable",
                     record.entry_id, record.entry_id
                 )));
             }
