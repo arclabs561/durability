@@ -189,7 +189,7 @@ let data = bridge.read_file("data.bin").await.unwrap();
 ## Contract
 
 - **Prefix property**: best-effort replay returns a prefix of the valid stream.
-- **Narrow best-effort**: tolerance applies only to the final segment's tail truncated at physical EOF. Zero padding after complete frames is supported, but a partial frame followed by preallocated zeros can fail its CRC and prevent replay/resume. CRC failures remain errors, including in the final segment; corruption in non-final segments is also an error.
+- **Narrow best-effort**: tolerance applies only to the final segment's tail truncated at physical EOF. Zero padding after complete frames is supported, but a partial frame followed by preallocated zeros can fail its CRC and prevent replay/resume. CRC failures remain errors, including in the final segment; corruption in non-final segments is also an error. A final segment holding only its header counts as a torn tail: best-effort replay ignores it, and resume rewrites its header to continue the previous segment.
 - **Checksum coverage**: current checkpoint and WAL writes CRC-check the durable metadata they trust plus the payload. Legacy checkpoint v1 and WAL v2 files with payload-only CRCs remain readable.
 - **Deterministic checkpoints**: payloads are written with stable ordering.
 

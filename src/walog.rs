@@ -582,6 +582,40 @@ fn validate_next_entry_id(prev: Option<u64>, entry_id: u64) -> PersistenceResult
     Ok(())
 }
 
+/// Entry id the segment after this one must start at: one past its last
+/// frame, or its own `start_entry_id` if it holds no frames. `None` when the
+/// id space is exhausted (any later frame then fails `validate_next_entry_id`).
+fn next_segment_start(header: WalSegmentHeader, last_in_segment: Option<u64>) -> Option<u64> {
+    match last_in_segment {
+        Some(id) => id.checked_add(1),
+        None => Some(header.start_entry_id),
+    }
+}
+
+/// A segment's header must continue the entry ids of the segment before it.
+/// Frame checks alone miss this when a segment holds only its header.
+fn validate_segment_start(
+    expected: Option<u64>,
+    header: WalSegmentHeader,
+    segment_id: u64,
+) -> PersistenceResult<()> {
+    match expected {
+        Some(expected) if header.start_entry_id != expected => Err(segment_start_mismatch(
+            segment_id,
+            header.start_entry_id,
+            expected,
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn segment_start_mismatch(segment_id: u64, start: u64, expected: u64) -> PersistenceError {
+    PersistenceError::Format(format!(
+        "WAL segment {segment_id} start_entry_id gap or reorder \
+         (header={start}, expected={expected})"
+    ))
+}
+
 fn checked_next_entry_id(entry_id: u64) -> PersistenceResult<u64> {
     entry_id.checked_add(1).ok_or_else(|| {
         PersistenceError::InvalidState(format!("WAL entry id space exhausted after {entry_id}"))
@@ -912,6 +946,11 @@ impl<E> WalWriter<E> {
     /// followed by preallocated zeros can fail its CRC instead of reaching EOF.
     /// A failed CRC scan leaves the segment unchanged.
     ///
+    /// A last segment holding only its header continues from that header's
+    /// `start_entry_id`; if the previous segment ends earlier (its tail was
+    /// lost), the header is rewritten to continue it. A last segment in the
+    /// legacy v2 format is left as is and appends go to a new segment.
+    ///
     /// This respects the active-writer lock. On a filesystem a crashed
     /// writer's lock is released by the OS, so no cleanup is needed. On other
     /// backends a crash leaves the marker file; use
@@ -943,16 +982,19 @@ impl<E> WalWriter<E> {
             let _ = directory.delete("wal/.lock");
         }
 
-        let wal_segments = enumerate_wal_segments(&*directory)?;
-
-        if wal_segments.is_empty() {
+        if enumerate_wal_segments(&*directory)?.is_empty() {
             return Ok(Self::new(directory));
         }
 
         let mut w = Self::with_options(directory.clone(), FlushPolicy::EveryN(64), 64 * 1024);
         w.acquire_wal_lock()?;
+        // List again under the lock: a writer that held it during the first
+        // listing may have rotated since, and resuming from a stale listing
+        // would reuse its entry ids and recreate its newest segment.
+        let wal_segments = enumerate_wal_segments(&*directory)?;
 
         let mut last_seen_entry_id: Option<u64> = None;
+        let mut next_start: Option<u64> = None;
 
         for (i, (segment_id, wal_file)) in wal_segments.iter().enumerate() {
             let wal_path = format!("wal/{wal_file}");
@@ -963,24 +1005,91 @@ impl<E> WalWriter<E> {
                 let mut bytes = Vec::new();
                 f.read_to_end(&mut bytes)?;
 
-                let (valid_len, last_in_file) =
-                    scan_last_segment_prefix(&bytes, last_seen_entry_id, *segment_id)?;
+                let scan = scan_last_segment_prefix(&bytes, last_seen_entry_id, *segment_id)?;
+                let mut valid_len = scan.valid_len;
 
-                if valid_len < bytes.len() {
+                // A segment holding only its header carries no data, so like a
+                // torn tail it is repaired rather than trusted: its header must
+                // continue the previous segment, and is rewritten when the
+                // frames it was created for were lost with the previous tail.
+                let mut header_rewrite: Option<u64> = None;
+                let next_entry_id = match scan.header {
+                    Some(header) if scan.has_frames => {
+                        validate_segment_start(next_start, header, *segment_id)?;
+                        let last = scan.last_entry_id.ok_or_else(|| {
+                            PersistenceError::InvalidState(
+                                "WAL resume internal error: frames without an entry id".into(),
+                            )
+                        })?;
+                        checked_next_entry_id(last)?
+                    }
+                    Some(header) => {
+                        let start = match next_start {
+                            Some(expected) if header.start_entry_id < expected => {
+                                return Err(segment_start_mismatch(
+                                    *segment_id,
+                                    header.start_entry_id,
+                                    expected,
+                                ));
+                            }
+                            Some(expected) => expected,
+                            None if header.start_entry_id == 0 => {
+                                return Err(PersistenceError::Format(format!(
+                                    "WAL segment {segment_id} has start_entry_id 0"
+                                )));
+                            }
+                            None => header.start_entry_id,
+                        };
+                        if start != header.start_entry_id || header.version != WAL_FORMAT_VERSION {
+                            header_rewrite = Some(start);
+                        }
+                        start
+                    }
+                    // Torn header: the segment is rewritten from scratch.
+                    None => match (next_start, last_seen_entry_id) {
+                        (Some(expected), _) => expected,
+                        (None, Some(id)) => checked_next_entry_id(id)?,
+                        (None, None) => 1,
+                    },
+                };
+
+                if let Some(start) = header_rewrite {
+                    let mut header = Vec::with_capacity(WalSegmentHeader::SIZE);
+                    WalSegmentHeader {
+                        magic: WAL_MAGIC,
+                        version: WAL_FORMAT_VERSION,
+                        start_entry_id: start,
+                        segment_id: *segment_id,
+                    }
+                    .write(&mut header)?;
+                    directory.atomic_write(&wal_path, &header)?;
+                    valid_len = header.len();
+                } else if valid_len < bytes.len() {
                     directory.atomic_write(&wal_path, &bytes[..valid_len])?;
-                    bytes.truncate(valid_len);
                 }
 
                 w.wal_dir_ready = true;
-                w.current_segment_id = *segment_id;
-                w.current_entry_id = match last_in_file.or(last_seen_entry_id) {
-                    Some(id) => checked_next_entry_id(id)?,
-                    None => 1,
-                };
-                w.current_offset = u64::try_from(bytes.len()).map_err(|_| {
-                    PersistenceError::Format("WAL file length overflows u64".into())
-                })?;
-                w.current_path = Some(wal_path);
+                w.current_entry_id = next_entry_id;
+                let legacy_frames =
+                    scan.has_frames && scan.header.is_some_and(|h| h.version != WAL_FORMAT_VERSION);
+                if legacy_frames {
+                    // Frames carry no version; readers take the checksum mode
+                    // from the segment header. Never append current-format
+                    // frames to a legacy segment: start a new one instead.
+                    w.current_segment_id = segment_id.checked_add(1).ok_or_else(|| {
+                        PersistenceError::Format(format!(
+                            "WAL segment id overflow after {segment_id}"
+                        ))
+                    })?;
+                    w.current_offset = 0;
+                    w.current_path = None;
+                } else {
+                    w.current_segment_id = *segment_id;
+                    w.current_offset = u64::try_from(valid_len).map_err(|_| {
+                        PersistenceError::Format("WAL file length overflows u64".into())
+                    })?;
+                    w.current_path = Some(wal_path);
+                }
                 w.current_file = None;
                 return Ok(w);
             }
@@ -988,7 +1097,9 @@ impl<E> WalWriter<E> {
             // Non-last segment: decode strictly and track monotone entry_id.
             let header = WalSegmentHeader::read(&mut f)?;
             validate_header_segment_id(header, *segment_id)?;
+            validate_segment_start(next_start, header, *segment_id)?;
             let checksum_mode = WalChecksumMode::for_version(header.version)?;
+            let mut last_in_segment = None;
             while let Some((entry_id, _payload)) = WalEntryOnDisk::decode_raw_with_checksum(
                 &mut f,
                 WalReplayMode::Strict,
@@ -996,7 +1107,9 @@ impl<E> WalWriter<E> {
             )? {
                 validate_next_entry_id(last_seen_entry_id, entry_id)?;
                 last_seen_entry_id = Some(entry_id);
+                last_in_segment = Some(entry_id);
             }
+            next_start = next_segment_start(header, last_in_segment);
         }
 
         Err(PersistenceError::InvalidState(
@@ -1324,23 +1437,39 @@ impl<E> WalWriter<E> {
 // scan_last_segment_prefix (format-aware, type-agnostic)
 // ---------------------------------------------------------------------------
 
-/// Scan the last WAL segment bytes and return:
-/// - the valid prefix length (byte offset) that ends on a record boundary, and
-/// - the last entry id present in that valid prefix (if any).
+/// Result of scanning the last WAL segment on resume.
+struct LastSegmentScan {
+    /// Valid prefix length (byte offset) that ends on a record boundary.
+    valid_len: usize,
+    /// Last entry id in that prefix, or the last id seen before this segment.
+    last_entry_id: Option<u64>,
+    /// The segment header, or `None` if it is torn.
+    header: Option<WalSegmentHeader>,
+    /// Whether the valid prefix contains at least one frame.
+    has_frames: bool,
+}
+
+/// Scan the last WAL segment bytes for its valid prefix.
 fn scan_last_segment_prefix(
     bytes: &[u8],
     last_seen_entry_id: Option<u64>,
     segment_id: u64,
-) -> PersistenceResult<(usize, Option<u64>)> {
+) -> PersistenceResult<LastSegmentScan> {
+    let torn = LastSegmentScan {
+        valid_len: 0,
+        last_entry_id: last_seen_entry_id,
+        header: None,
+        has_frames: false,
+    };
     if bytes.len() < WalSegmentHeader::SIZE {
-        return Ok((0, None));
+        return Ok(torn);
     }
 
     let mut cur = std::io::Cursor::new(bytes);
     let header = match WalSegmentHeader::read(&mut cur) {
         Ok(h) => h,
         Err(PersistenceError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-            return Ok((0, None));
+            return Ok(torn);
         }
         Err(e) => return Err(e),
     };
@@ -1387,7 +1516,12 @@ fn scan_last_segment_prefix(
                         )));
                     }
                 }
-                return Ok((prefix, last_id));
+                return Ok(LastSegmentScan {
+                    valid_len: prefix,
+                    last_entry_id: last_id,
+                    header: Some(header),
+                    has_frames: first_entry_id_in_segment.is_some(),
+                });
             }
         }
     }
@@ -1655,6 +1789,7 @@ impl<E> WalReader<E> {
         let last_segment_id = wal_segments.last().map(|(id, _)| *id);
         let mut count = 0u64;
         let mut last_seen_entry_id: Option<u64> = None;
+        let mut next_start: Option<u64> = None;
 
         for (segment_id, wal_file) in wal_segments {
             let wal_path = format!("wal/{wal_file}");
@@ -1686,6 +1821,19 @@ impl<E> WalReader<E> {
                 }
             };
 
+            // Best-effort tolerates a final segment whose header skips ahead
+            // only if it holds no frames: it is then a torn tail left behind
+            // when the previous segment's unsynced tail was lost.
+            let mut header_gap: Option<PersistenceError> = None;
+            if let Err(e) = validate_segment_start(next_start, header, segment_id) {
+                let skips_ahead = next_start.is_some_and(|exp| header.start_entry_id > exp);
+                if segment_mode == WalReplayMode::BestEffortTail && skips_ahead {
+                    header_gap = Some(e);
+                } else {
+                    return Err(e);
+                }
+            }
+
             loop {
                 let decoded = match max_entry_id {
                     Some(max) => WalEntryOnDisk::decode_raw_until(
@@ -1701,6 +1849,12 @@ impl<E> WalReader<E> {
                         checksum_mode,
                     )?,
                 };
+
+                if decoded.is_some() {
+                    if let Some(e) = header_gap.take() {
+                        return Err(e);
+                    }
+                }
 
                 match decoded {
                     Some(WalRawDecode::Record { entry_id, payload }) => {
@@ -1739,6 +1893,8 @@ impl<E> WalReader<E> {
                     )));
                 }
             }
+            next_start =
+                next_segment_start(header, first_entry_id_in_segment.and(last_seen_entry_id));
         }
 
         Ok(count)
@@ -1781,11 +1937,13 @@ impl WalMaintenance {
 
         let mut out = Vec::new();
         let mut last_seen_entry_id: Option<u64> = None;
+        let mut next_start: Option<u64> = None;
         for (segment_id, wal_file) in wal_segments {
             let path = format!("wal/{wal_file}");
             let mut f = self.directory.open_file(&path)?;
             let header = WalSegmentHeader::read(&mut f)?;
             validate_header_segment_id(header, segment_id)?;
+            validate_segment_start(next_start, header, segment_id)?;
             let checksum_mode = WalChecksumMode::for_version(header.version)?;
             let mut end: Option<u64> = None;
             let mut first: Option<u64> = None;
@@ -1809,6 +1967,7 @@ impl WalMaintenance {
                     )));
                 }
             }
+            next_start = next_segment_start(header, end);
 
             out.push(WalSegmentRange {
                 segment_id,
@@ -2702,6 +2861,46 @@ mod tests {
         let r = WalReader::<WalEntry>::new(dir);
         let err = r.replay().unwrap_err();
         assert!(err.to_string().contains("entry_id gap"));
+    }
+
+    fn add_segment(id: u64) -> WalEntry {
+        WalEntry::AddSegment {
+            segment_id: id,
+            doc_count: 1,
+        }
+    }
+
+    /// Crash image: wal_1's unsynced tail (entry 2) was lost, while wal_2's
+    /// header (start 3) survived without its frame.
+    #[test]
+    fn wal_best_effort_tolerates_header_only_final_segment_that_skips_ahead() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        write_wal_segment(&dir, 1, 1, &[(1, add_segment(1))]);
+        write_wal_segment(&dir, 2, 3, &[]);
+
+        let r = WalReader::<WalEntry>::new(dir);
+        let err = r.replay().unwrap_err();
+        assert!(err.to_string().contains("start_entry_id gap"), "{err}");
+        let ids: Vec<u64> = r
+            .replay_best_effort()
+            .unwrap()
+            .iter()
+            .map(|rec| rec.entry_id)
+            .collect();
+        assert_eq!(ids, vec![1]);
+    }
+
+    /// A first segment holding only its header (start 1) followed by one
+    /// starting at entry 5 would hide entries 1..=4 if only frames were checked.
+    #[test]
+    fn wal_best_effort_rejects_skipped_ahead_final_segment_with_frames() {
+        let dir: Arc<dyn Directory> = Arc::new(MemoryDirectory::new());
+        write_wal_segment(&dir, 1, 1, &[]);
+        write_wal_segment(&dir, 2, 5, &[(5, add_segment(5))]);
+
+        let r = WalReader::<WalEntry>::new(dir);
+        let err = r.replay_best_effort().unwrap_err();
+        assert!(err.to_string().contains("start_entry_id gap"), "{err}");
     }
 
     #[test]

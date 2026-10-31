@@ -16,6 +16,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tail was never made durable.
 - `WalWriter::flush` and `flush_and_sync` return `InvalidState` once the writer is
   poisoned, so a retried sync cannot report durability after a failed one.
+- WAL replay, resume and `segment_ranges_strict` check that each segment header's
+  `start_entry_id` continues the previous segment. A segment holding only its header
+  was never checked, so strict replay could skip lost entries and resume could
+  restart entry ids at 1. Resume now continues from such a final segment's header,
+  rewriting it when the previous segment's tail was lost; best-effort replay
+  ignores it.
+- `WalWriter::resume` takes the writer lock before listing segments. A writer that
+  rotated between the listing and the lock made the resumed writer reuse its entry
+  ids and recreate its newest segment.
+- `WalWriter::resume` no longer appends current-format frames to a legacy (v2) final
+  segment, whose readers use the payload-only checksum; it starts a new segment.
+- `recover_with_wal` returns `InvalidState` when given a checkpoint path and the
+  WAL starts after the checkpoint's last entry + 1 (checkpoint missing, older than
+  a prefix truncation, or ignored as corrupt), instead of skipping entries.
 
 ### Documentation
 
