@@ -653,6 +653,12 @@ fn checked_next_entry_id(entry_id: u64) -> PersistenceResult<u64> {
 /// cannot leave a stale lock. Other backends use a marker file that only
 /// catches double-instantiation within one process.
 ///
+/// Dropping the writer flushes its write buffer to the segment file, like
+/// `std::io::BufWriter`, and ignores errors; it does not sync. Call
+/// [`flush`](Self::flush) or [`flush_and_sync`](Self::flush_and_sync) to
+/// observe failures or make entries durable. A poisoned writer does not flush
+/// on drop.
+///
 /// # Example
 ///
 /// ```
@@ -945,13 +951,32 @@ impl<E> WalWriter<E> {
     ///
     /// This is the recommended entry point: it calls [`WalWriter::resume`] if
     /// WAL segments already exist, or [`WalWriter::new`] if the directory is empty.
+    /// It uses the default flush policy of [`WalWriter::new`]; use
+    /// [`WalWriter::open_with_options`] to choose one.
     pub fn open(directory: impl Into<Arc<dyn Directory>>) -> PersistenceResult<Self> {
+        Self::open_with_options(directory, FlushPolicy::EveryN(64), 64 * 1024)
+    }
+
+    /// Like [`WalWriter::open`], with the flush policy and write buffer size of
+    /// [`WalWriter::with_options`].
+    ///
+    /// The options are not stored in the WAL, so a writer that needs a
+    /// particular policy must pass it on every open, including after a restart.
+    pub fn open_with_options(
+        directory: impl Into<Arc<dyn Directory>>,
+        flush_policy: FlushPolicy,
+        write_buffer_limit_bytes: usize,
+    ) -> PersistenceResult<Self> {
         let directory: Arc<dyn Directory> = directory.into();
         let segments = enumerate_wal_segments(&*directory)?;
         if segments.is_empty() {
-            Ok(Self::new(directory))
+            Ok(Self::with_options(
+                directory,
+                flush_policy,
+                write_buffer_limit_bytes,
+            ))
         } else {
-            Self::resume(directory)
+            Self::resume_with_options(directory, flush_policy, write_buffer_limit_bytes)
         }
     }
 
@@ -974,9 +999,22 @@ impl<E> WalWriter<E> {
     /// writer's lock is released by the OS, so no cleanup is needed. On other
     /// backends a crash leaves the marker file; use
     /// [`WalWriter::resume_after_crash`].
+    ///
+    /// The resumed writer uses the default flush policy of [`WalWriter::new`];
+    /// use [`WalWriter::resume_with_options`] to choose one.
     pub fn resume(directory: impl Into<Arc<dyn Directory>>) -> PersistenceResult<Self> {
+        Self::resume_with_options(directory, FlushPolicy::EveryN(64), 64 * 1024)
+    }
+
+    /// Like [`WalWriter::resume`], with the flush policy and write buffer size
+    /// of [`WalWriter::with_options`].
+    pub fn resume_with_options(
+        directory: impl Into<Arc<dyn Directory>>,
+        flush_policy: FlushPolicy,
+        write_buffer_limit_bytes: usize,
+    ) -> PersistenceResult<Self> {
         let directory: Arc<dyn Directory> = directory.into();
-        Self::resume_inner(directory, false)
+        Self::resume_inner(directory, false, flush_policy, write_buffer_limit_bytes)
     }
 
     /// Resume after a known writer crash.
@@ -987,12 +1025,14 @@ impl<E> WalWriter<E> {
     /// only call it when the previous writer is known to be gone.
     pub fn resume_after_crash(directory: impl Into<Arc<dyn Directory>>) -> PersistenceResult<Self> {
         let directory: Arc<dyn Directory> = directory.into();
-        Self::resume_inner(directory, true)
+        Self::resume_inner(directory, true, FlushPolicy::EveryN(64), 64 * 1024)
     }
 
     fn resume_inner(
         directory: Arc<dyn Directory>,
         remove_stale_lock: bool,
+        flush_policy: FlushPolicy,
+        write_buffer_limit_bytes: usize,
     ) -> PersistenceResult<Self> {
         // On a filesystem the kernel lock already ignores a crashed writer's
         // leftover file, and deleting it would let this writer lock a fresh
@@ -1002,10 +1042,14 @@ impl<E> WalWriter<E> {
         }
 
         if enumerate_wal_segments(&*directory)?.is_empty() {
-            return Ok(Self::new(directory));
+            return Ok(Self::with_options(
+                directory,
+                flush_policy,
+                write_buffer_limit_bytes,
+            ));
         }
 
-        let mut w = Self::with_options(directory.clone(), FlushPolicy::EveryN(64), 64 * 1024);
+        let mut w = Self::with_options(directory.clone(), flush_policy, write_buffer_limit_bytes);
         w.acquire_wal_lock()?;
         // List again under the lock: a writer that held it during the first
         // listing may have rotated since, and resuming from a stale listing
@@ -1635,14 +1679,12 @@ fn find_valid_frame_after(
 
 impl<E> Drop for WalWriter<E> {
     fn drop(&mut self) {
-        // Warn in debug builds if the write buffer has unflushed data.
-        // This catches the common mistake of dropping without calling flush().
-        #[cfg(debug_assertions)]
-        if !self.write_buffer.is_empty() {
-            eprintln!(
-                "durability: WalWriter dropped with {} unflushed bytes in write buffer",
-                self.write_buffer.len()
-            );
+        // Hand buffered entries to the file, as `std::io::BufWriter` does.
+        // Errors are ignored: call `flush` or `flush_and_sync` to observe
+        // them. A poisoned writer's file state is indeterminate, so it is
+        // left alone.
+        if !self.poisoned {
+            let _ = self.flush();
         }
         // Truncate preallocated segment to actual written size.
         if self.preallocate_bytes > 0 {

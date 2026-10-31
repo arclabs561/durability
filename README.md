@@ -139,9 +139,10 @@ use durability::walog::WalWriter;
 # #[derive(serde::Serialize, serde::Deserialize)] enum Op { X }
 
 let dir = FsDirectory::arc("/tmp/wal-tuning").unwrap();
-let mut w = WalWriter::<Op>::with_options(
+// Creates the WAL or resumes it with the same flush policy after a restart.
+let mut w = WalWriter::<Op>::open_with_options(
     dir, FlushPolicy::Interval(std::time::Duration::from_millis(10)), 64 * 1024,
-);
+).unwrap();
 w.set_segment_size_limit_bytes(64 * 1024 * 1024); // 64 MiB segments
 w.set_segment_max_age(std::time::Duration::from_secs(300)); // rotate after 5 min
 w.set_preallocate_bytes(4 * 1024 * 1024); // 4 MiB preallocation

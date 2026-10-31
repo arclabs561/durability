@@ -1,9 +1,9 @@
 //! Model-based property test for WAL crash recovery.
 //!
 //! Strategy (inspired by sled's quickcheck model testing):
-//! 1. Generate a random sequence of WAL operations (append, flush, drop+resume).
+//! 1. Generate a random sequence of WAL operations (append, flush, crash+resume).
 //! 2. Track a reference model of what should be durable after each flush.
-//! 3. At each "crash point" (drop without flush), verify that recovery
+//! 3. At each "crash point" (forget the writer, so nothing is flushed), verify that recovery
 //!    returns a prefix of the flushed entries.
 #![cfg(feature = "postcard")]
 
@@ -68,8 +68,10 @@ proptest! {
                     }
                 }
                 Op::CrashAndResume => {
-                    // Drop writer (simulates crash -- unflushed entries may be lost).
-                    drop(writer.take());
+                    // Crash: no destructor runs, so the write buffer is not
+                    // flushed and unflushed entries may be lost. (Dropping
+                    // the writer would flush them.)
+                    std::mem::forget(writer.take());
                     pending_ids.clear();
 
                     // Verify: recovery must return exactly the flushed entries.
@@ -110,8 +112,9 @@ proptest! {
                     // The model tracks only genuinely flushed entries; updating
                     // it here would make subsequent assertions tautological.
 
-                    // Resume the writer.
-                    writer = Some(WalWriter::resume(dir.clone()).unwrap());
+                    // Resume the writer. The crashed writer left its lock
+                    // marker behind on this in-memory backend.
+                    writer = Some(WalWriter::resume_after_crash(dir.clone()).unwrap());
                 }
             }
         }
