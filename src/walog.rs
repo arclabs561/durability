@@ -49,7 +49,9 @@
 //!   [`FlushPolicy::Interval`], or [`FlushPolicy::Manual`]. Controls when the write
 //!   buffer is pushed to the OS (not stable-storage sync -- use `flush_and_sync` for that).
 //! - **Segment rotation**: by size ([`WalWriter::set_segment_size_limit_bytes`]) and/or
-//!   age ([`WalWriter::set_segment_max_age`]).
+//!   age ([`WalWriter::set_segment_max_age`]). On backends with stable-storage syncs,
+//!   rotation syncs the outgoing segment and its directory entry before creating the
+//!   next one, so a crash cannot leave a later segment without its predecessor's tail.
 //! - **Preallocation**: [`WalWriter::set_preallocate_bytes`] avoids block allocation on
 //!   the write path.
 //! - **Segment recycling**: [`WalWriter::set_recycle_capacity`] + [`WalWriter::recycle_segment`]
@@ -70,13 +72,14 @@
 //! The writer **poisons** itself after:
 //! - A `write_all` failure during buffer drain (indeterminate file state).
 //! - A segment creation failure during rotation (inconsistent segment ID).
+//! - A failure to sync the outgoing segment during rotation.
 //! - A `flush_and_sync` failure (false durability).
 //!
 //! A poisoned writer rejects all subsequent appends with `InvalidState`.
 
 use crate::error::{PersistenceError, PersistenceResult};
 use crate::formats::{WAL_FORMAT_VERSION, WAL_MAGIC};
-use crate::storage::{self, Directory, FlushPolicy};
+use crate::storage::{Directory, FlushPolicy};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::marker::PhantomData;
@@ -676,9 +679,6 @@ pub struct WalWriter<E> {
     lock_file: Option<std::fs::File>,
     preallocate_bytes: u64,
     poisoned: bool,
-    /// Segments rotated out since the last `flush_and_sync`. Their flushed
-    /// bytes are not yet durable, so the next sync must cover them too.
-    rotated_unsynced: Vec<String>,
     observer: Option<Arc<dyn WalObserver>>,
     last_flush_at: std::time::Instant,
     segment_created_at: Option<std::time::Instant>,
@@ -729,7 +729,6 @@ impl<E> WalWriter<E> {
             lock_file: None,
             preallocate_bytes: 0,
             poisoned: false,
-            rotated_unsynced: Vec::new(),
             observer: None,
             last_flush_at: std::time::Instant::now(),
             segment_created_at: None,
@@ -1256,36 +1255,28 @@ impl<E> WalWriter<E> {
 
     /// Flush buffered bytes and attempt to make the current WAL segment durable.
     ///
-    /// Segments rotated out since the previous call are synced first, so every
-    /// entry appended so far is covered, not only the current segment's.
+    /// Segments rotated out earlier were synced, with their directory entries,
+    /// before the next segment was created, so every entry appended so far is
+    /// covered, not only the current segment's.
     ///
     /// On sync failure, the writer is **poisoned** -- subsequent appends,
     /// flushes and syncs return `InvalidState`. A retried sync cannot prove
     /// durability after the kernel may have dropped the failed pages.
     ///
-    /// Returns `NotSupported` if the underlying `Directory` does not provide `file_path()`.
+    /// Syncs through [`Directory::durable_sync_file`] and
+    /// [`Directory::durable_sync_parent_dir`]. With their default
+    /// implementations, returns `NotSupported` if the underlying `Directory`
+    /// does not provide `file_path()`.
     pub fn flush_and_sync(&mut self) -> PersistenceResult<()> {
         self.flush()?;
-        for path in &self.rotated_unsynced {
-            match storage::sync_file(&*self.directory, path) {
-                // Truncated or recycled since rotation: nothing left to sync.
-                Err(PersistenceError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    self.poisoned = true;
-                    return Err(e);
-                }
-                Ok(()) => {}
-            }
-        }
-        self.rotated_unsynced.clear();
         let Some(path) = self.current_path.as_deref() else {
             return Ok(());
         };
-        if let Err(e) = storage::sync_file(&*self.directory, path) {
+        if let Err(e) = self.directory.durable_sync_file(path) {
             self.poisoned = true;
             return Err(e);
         }
-        if let Err(e) = storage::sync_parent_dir(&*self.directory, path) {
+        if let Err(e) = self.directory.durable_sync_parent_dir(path) {
             self.poisoned = true;
             return Err(e);
         }
@@ -1314,6 +1305,36 @@ impl<E> WalWriter<E> {
         Ok(())
     }
 
+    /// Make the outgoing segment and its directory entry durable before the
+    /// next segment is created.
+    ///
+    /// Replay requires each segment to continue the previous one. If the next
+    /// segment could reach disk while this one's tail or name did not, a crash
+    /// would leave a gap that blocks replay of entries already reported
+    /// durable. Backends without stable-storage syncs (`NotSupported`) skip
+    /// this, as `flush_and_sync` cannot succeed on them either. Any other
+    /// failure poisons the writer.
+    fn sync_outgoing_segment(&mut self) -> PersistenceResult<()> {
+        let Some(path) = self.current_path.as_deref() else {
+            return Ok(());
+        };
+        // With preallocation on a filesystem, truncate_current_segment
+        // already synced the data.
+        let data = if self.preallocate_bytes == 0 || self.directory.file_path(path).is_none() {
+            self.directory.durable_sync_file(path)
+        } else {
+            Ok(())
+        };
+        let result = data.and_then(|()| self.directory.durable_sync_parent_dir(path));
+        match result {
+            Ok(()) | Err(PersistenceError::NotSupported(_)) => Ok(()),
+            Err(e) => {
+                self.poisoned = true;
+                Err(e)
+            }
+        }
+    }
+
     /// Rotate to a new segment if size or age limits are exceeded.
     fn rotate_if_needed(&mut self, entry_id: u64, encoded_len: u64) -> PersistenceResult<()> {
         let projected = self.current_offset + (self.write_buffer.len() as u64) + encoded_len;
@@ -1325,13 +1346,9 @@ impl<E> WalWriter<E> {
         if (size_exceeded || age_exceeded) && self.current_offset > WalSegmentHeader::SIZE as u64 {
             self.flush()?;
             self.truncate_current_segment()?;
+            self.sync_outgoing_segment()?;
             let old_segment_id = self.current_segment_id;
-            // With preallocation, truncate_current_segment already synced it.
-            if let Some(old_path) = self.current_path.take() {
-                if self.preallocate_bytes == 0 {
-                    self.rotated_unsynced.push(old_path);
-                }
-            }
+            self.current_path = None;
             self.current_segment_id += 1;
             self.current_offset = 0;
             self.current_file = None;
@@ -2349,22 +2366,24 @@ mod raw_tests {
 
     #[cfg(unix)]
     #[test]
-    fn flush_and_sync_syncs_segments_rotated_since_the_last_sync() {
+    fn rotation_syncs_the_outgoing_segment_before_creating_the_next() {
         let tmp = tempfile::tempdir().unwrap();
         let dir: Arc<dyn Directory> =
             Arc::new(crate::storage::FsDirectory::new(tmp.path()).unwrap());
-        let mut w = rotating_writer(&dir, 2);
-        assert_eq!(w.current_segment_id(), 2);
+        let mut w = rotating_writer(&dir, 1);
+        assert_eq!(w.current_segment_id(), 1);
 
-        // Make the rotated-out segment unopenable. If flush_and_sync syncs it
-        // as it must, that surfaces as an error; if it only syncs the current
-        // segment, this passes silently.
+        // Make the outgoing segment unopenable. If rotation syncs it as it
+        // must, that surfaces as an error and poisons the writer before the
+        // next segment exists; if it defers the sync, the append succeeds.
         use std::os::unix::fs::PermissionsExt;
         let old = tmp.path().join("wal/wal_1.log");
         std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let result = w.flush_and_sync();
+        let result = w.append_bytes(b"rotates");
         std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(result.is_err());
+        assert!(!tmp.path().join("wal/wal_2.log").exists());
+        assert!(matches!(w.flush(), Err(PersistenceError::InvalidState(_))));
     }
 
     #[test]

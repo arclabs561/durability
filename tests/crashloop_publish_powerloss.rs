@@ -178,9 +178,11 @@ fn run_seed(seed: u64) {
 
                 wal.flush().unwrap();
 
-                // Compute checkpoint from current strict recovery view.
+                // Compute checkpoint from current strict recovery view. After
+                // an earlier publish truncated the WAL prefix, only the latest
+                // checkpoint plus the WAL holds the full state.
                 let mgr = RecoveryManager::new(dir.clone());
-                let before = mgr.recover(None).unwrap();
+                let before = mgr.recover_latest().unwrap();
                 let ckpt_state = RecoveryManager::to_checkpoint_state(&before);
                 let last = before.last_entry_id;
 
