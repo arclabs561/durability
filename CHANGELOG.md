@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-31
+
+Backports the WAL durability fixes from 0.10.0 for dependents on 0.9. In 0.9.0,
+WAL rotation only flushed the outgoing segment, so a power failure could lose
+entries that `flush_and_sync` had reported durable. Upgrade if you use the WAL.
+
+### Fixed
+
+- `WalMaintenance::truncate_prefix` and `truncate_to_recycle` no longer remove the
+  newest segment. Deleting it let a resumed writer restart entry ids at 1.
+- `WalWriter::flush` and `flush_and_sync` return `InvalidState` once the writer is
+  poisoned, so a retried sync cannot report durability after a failed one.
+- WAL replay, resume and `segment_ranges_strict` check that each segment header's
+  `start_entry_id` continues the previous segment. A segment holding only its header
+  was never checked, so strict replay could skip lost entries and resume could
+  restart entry ids at 1. Resume now continues from such a final segment's header,
+  rewriting it when the previous segment's tail was lost; best-effort replay
+  ignores it.
+- `WalWriter::resume` takes the writer lock before listing segments. A writer that
+  rotated between the listing and the lock made the resumed writer reuse its entry
+  ids and recreate its newest segment.
+- `WalWriter::resume` no longer appends current-format frames to a legacy (v2) final
+  segment, whose readers use the payload-only checksum; it starts a new segment.
+- `recover_with_wal` returns `InvalidState` when given a checkpoint path and the
+  WAL starts after the checkpoint's last entry + 1 (checkpoint missing, older than
+  a prefix truncation, or ignored as corrupt), instead of skipping entries.
+- WAL rotation syncs the outgoing segment and its directory entry before creating
+  the next segment. Without preallocation it only flushed, so a crash could keep
+  the new segment but lose the old segment's tail or name, leaving a gap that
+  blocked replay of entries `flush_and_sync` had reported durable. A sync failure
+  during rotation poisons the writer. `flush_and_sync` and rotation now sync
+  through `Directory::durable_sync_file` and `durable_sync_parent_dir`, so a
+  backend's overrides of those methods take effect; the defaults are unchanged.
+- `recover_with_wal` and `RecoveryManager::recover` without a checkpoint path
+  return `InvalidState` when the WAL does not start at entry 1 (for example after
+  a checkpoint publish truncated its prefix), instead of returning the state of
+  the remaining entries alone. `RecoveryManager::recover_latest` recovers such a
+  WAL through the checkpoint it records.
+
 ## [0.9.0] - 2026-10-12
 
 ### Removed
