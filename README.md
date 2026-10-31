@@ -5,14 +5,15 @@
 
 Durability primitives for local persistence.
 
+## Overview
+
 `durability` provides filesystem and in-memory directories, atomic writes, WALs,
 record logs, checkpoint files, CRC validation, and sync helpers.
 
 It does not own indexing, segment selection, compaction, or reader visibility.
 
-For a ready-made embedded key-value store, use redb or fjall, and for a
-standalone WAL crate, okaywal; use `durability` when your own index or store
-needs the logs, checkpoints and recovery steps as separate pieces.
+Use `durability` when your own index or store needs logs, checkpoints, and
+recovery steps as separate pieces.
 
 ## Quick start
 
@@ -59,6 +60,11 @@ With `default-features = false`, `durability` still provides `Directory`,
 `CheckpointFile::{write_bytes, read_bytes}`, raw WAL append/replay, WAL
 maintenance, and sync helpers.
 
+Rust 1.80 is checked with a compatible dependency resolution: the MSRV job
+selects Tokio 1.53.3 for the optional `async` feature. Newer Tokio versions may
+require a newer compiler. Stable CI checks the latest dependency resolution;
+the crate does not impose a Tokio upper-version bound.
+
 ## Backends
 
 `FsDirectory` is the stable-storage backend. It exposes filesystem paths for
@@ -83,10 +89,11 @@ let dir = FsDirectory::arc("/tmp/wal-demo").unwrap();
 let sw = Arc::new(SyncWalWriter::<Op>::open(dir).unwrap());
 
 let sw2 = sw.clone();
-std::thread::spawn(move || {
+let worker = std::thread::spawn(move || {
     sw2.append_durable(&Op::Set("hello".into())).unwrap();
 });
 sw.append_durable(&Op::Set("world".into())).unwrap();
+worker.join().unwrap();
 ```
 
 ## Generic recovery
@@ -173,16 +180,16 @@ let data = bridge.read_file("data.bin").await.unwrap();
 | `publish` | Checkpoint publish + WAL truncation with explicit sync steps (feature `postcard`) |
 | `async_dir` | `AsyncDirectory` trait + `BlockingBridge` (feature `async`) |
 
-## Not provided
+## Operational limits
 
-- **Multi-process locking**: one `WalWriter` per directory. On a filesystem `wal/.lock` is an OS lock that excludes other processes and is released on exit; `RecordLogWriter` takes no lock, so callers (e.g. segstore) must hold their own.
+- **Writer ownership**: one `WalWriter` per directory. On a filesystem `wal/.lock` is an OS lock that excludes other processes and is released on exit; `RecordLogWriter` takes no lock, so callers (e.g. segstore) must hold their own.
 - **Per-write fsync by default**: writes are buffered. Use `flush_and_sync()` for a durability barrier.
 - **fsync failure recovery**: a failed fsync poisons the writer. Callers should treat this as unrecoverable and restart from WAL.
 
 ## Contract
 
 - **Prefix property**: best-effort replay returns a prefix of the valid stream.
-- **Narrow best-effort**: tolerance applies only to the final segment's torn tail. Corruption in non-final segments is an error.
+- **Narrow best-effort**: tolerance applies only to the final segment's tail truncated at physical EOF. Zero padding after complete frames is supported, but a partial frame followed by preallocated zeros can fail its CRC and prevent replay/resume. CRC failures remain errors, including in the final segment; corruption in non-final segments is also an error. A final segment holding only its header counts as a torn tail: best-effort replay ignores it, and resume rewrites its header to continue the previous segment.
 - **Checksum coverage**: current checkpoint and WAL writes CRC-check the durable metadata they trust plus the payload. Legacy checkpoint v1 and WAL v2 files with payload-only CRCs remain readable.
 - **Deterministic checkpoints**: payloads are written with stable ordering.
 
