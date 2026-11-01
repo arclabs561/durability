@@ -10,7 +10,8 @@ Durability primitives for local persistence.
 `durability` provides filesystem and in-memory directories, atomic writes, WALs,
 record logs, checkpoint files, CRC validation, and sync helpers.
 
-It does not own indexing, segment selection, compaction, or reader visibility.
+Indexing, segment selection, compaction, and reader visibility stay with the
+caller.
 
 Use `durability` when your own index or store needs logs, checkpoints, and
 recovery steps as separate pieces.
@@ -60,10 +61,9 @@ With `default-features = false`, `durability` still provides `Directory`,
 `CheckpointFile::{write_bytes, read_bytes}`, raw WAL append/replay, WAL
 maintenance, and sync helpers.
 
-Rust 1.80 is checked with a compatible dependency resolution: the MSRV job
-selects Tokio 1.53.3 for the optional `async` feature. Newer Tokio versions may
-require a newer compiler. Stable CI checks the latest dependency resolution;
-the crate does not impose a Tokio upper-version bound.
+The MSRV is Rust 1.80. CI checks it with Tokio pinned to 1.53.3 for the
+optional `async` feature; newer Tokio releases may need a newer compiler, and
+the crate does not cap the Tokio version.
 
 ## Backends
 
@@ -183,8 +183,8 @@ let data = bridge.read_file("data.bin").await.unwrap();
 
 ## Operational limits
 
-- **Writer ownership**: one `WalWriter` per directory. On a filesystem `wal/.lock` is an OS lock that excludes other processes and is released on exit; `RecordLogWriter` takes no lock, so callers (e.g. segstore) must hold their own.
-- **Per-write fsync by default**: writes are buffered. Use `flush_and_sync()` for a durability barrier.
+- **Writer ownership**: one `WalWriter` per directory. On a filesystem `wal/.lock` is an OS lock that excludes other processes and is released on exit; `RecordLogWriter` takes no lock, so callers must hold their own.
+- **No per-write fsync by default**: `WalWriter::open` and `new` buffer writes and flush every 64 appends (`FlushPolicy::EveryN(64)`) without fsync. Use `flush_and_sync()` for a durability barrier.
 - **fsync failure recovery**: a failed fsync poisons the writer. Callers should treat this as unrecoverable and restart from WAL.
 
 ## Contract
@@ -193,13 +193,6 @@ let data = bridge.read_file("data.bin").await.unwrap();
 - **Narrow best-effort**: tolerance applies only to the final segment's tail truncated at physical EOF. Zero padding after complete frames is supported, but a partial frame followed by preallocated zeros can fail its CRC and prevent replay/resume. CRC failures remain errors, including in the final segment; corruption in non-final segments is also an error. A final segment holding only its header counts as a torn tail: best-effort replay ignores it, and resume rewrites its header to continue the previous segment.
 - **Checksum coverage**: current checkpoint and WAL writes CRC-check the durable metadata they trust plus the payload. Legacy checkpoint v1 and WAL v2 files with payload-only CRCs remain readable.
 - **Deterministic checkpoints**: payloads are written with stable ordering.
-
-## Running
-
-- Tests: `cargo test`
-- Property tests: `PROPTEST_CASES=512 cargo test --test prop_wal_resume`
-- Benches: `cargo bench`
-- Fuzzing: `cargo fuzz run fuzz_wal_entry_decode` (see `fuzz/`)
 
 ## License
 
