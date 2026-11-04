@@ -60,6 +60,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `FsDirectory::atomic_write` and `Directory::atomic_write_durable` use a unique
   temporary file per call. Concurrent writers to the same path shared one
   `{path}.tmp`, so writes failed and readers saw partly written files.
+- `recover_with_wal` with `RecoveryOptions::up_to(n)` returns `InvalidState`
+  when the checkpoint covers entries past `n`. It returned the checkpoint's
+  later state, with `last_entry_id` past the requested target.
+- A failed flush of the WAL segment file poisons the writer. The append whose
+  frame had already reached the file returned an error without consuming its
+  entry id, so the next append reused the id and strict replay failed.
+- `WalWriter::set_segment_max_age` applies to the segment a resumed or reopened
+  writer continues, counting its age from the resume. Such a segment never
+  rotated by age.
+- The torn-tail check in `WalWriter::resume` and best-effort replay skips
+  candidate frames whose entry id cannot follow the damaged frame. A tail whose
+  words read as plausible frame lengths was checksummed once per byte offset,
+  so resume time grew with the square of the tail size (a 1 MiB tail took
+  6.2 s in a release build; it now takes about 10 ms).
 
 ## [0.10.0] - 2026-10-31
 

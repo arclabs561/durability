@@ -73,6 +73,7 @@
 //!
 //! The writer **poisons** itself after:
 //! - A `write_all` failure during buffer drain (indeterminate file state).
+//! - A `flush` failure of the segment file (indeterminate file state).
 //! - A segment creation failure during rotation (inconsistent segment ID).
 //! - A failure to sync the outgoing segment during rotation.
 //! - A `flush_and_sync` failure (false durability).
@@ -1152,6 +1153,9 @@ impl<E> WalWriter<E> {
                         PersistenceError::Format("WAL file length overflows u64".into())
                     })?;
                     w.current_path = Some(wal_path);
+                    // The segment's real creation time is unknown; count its
+                    // age from now so `set_segment_max_age` still applies.
+                    w.segment_created_at = Some(std::time::Instant::now());
                 }
                 w.current_file = None;
                 return Ok(w);
@@ -1348,7 +1352,12 @@ impl<E> WalWriter<E> {
         self.check_not_poisoned()?;
         self.drain_buffer_to_file()?;
         if let Some(f) = self.current_file.as_mut() {
-            f.flush()?;
+            if let Err(e) = f.flush() {
+                // Bytes handed to the file may or may not have reached it, so
+                // the entry ids they carry cannot be reassigned.
+                self.poisoned = true;
+                return Err(e.into());
+            }
         }
         self.since_flush = 0;
         self.last_flush_at = std::time::Instant::now();
@@ -1615,9 +1624,11 @@ fn scan_last_segment_prefix(
                 // length field mid-segment can look the same (its payload
                 // "runs past EOF"), but valid records follow it. Truncating
                 // there would delete synced records, so refuse instead.
-                if let Some(offset) =
-                    find_valid_frame_after(&bytes[prefix..], checksum_mode, last_id)
-                {
+                if let Some(offset) = find_valid_frame_after(
+                    &bytes[prefix..],
+                    checksum_mode,
+                    tail_prev_id(last_id, header),
+                ) {
                     return Err(PersistenceError::Format(format!(
                         "WAL mid-segment corruption: record at offset {prefix} is unreadable \
                          but a valid record follows at offset {}; refusing to truncate",
@@ -1643,17 +1654,38 @@ fn scan_last_segment_prefix(
     }
 }
 
+/// Id of the entry before the first undecodable frame of a segment: the last
+/// decoded id, or the id before the segment's first entry when that is later
+/// (no frame of this segment decoded yet).
+fn tail_prev_id(last_id: Option<u64>, header: WalSegmentHeader) -> u64 {
+    let before_segment = header.start_entry_id.saturating_sub(1);
+    last_id.map_or(before_segment, |last| last.max(before_segment))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes checksummed by `find_valid_frame_after` on this thread.
+    static FRAME_SCAN_CHECKSUM_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Offset of the first well-formed frame in `tail` with a matching checksum
-/// and an entry id after `last_id`, if any.
+/// and an entry id after `prev_id`, if any. `prev_id` is the id of the entry
+/// before the frame at offset 0.
 ///
 /// Only called on the recovery path, after decoding stopped early, so a
 /// byte-by-byte scan of the remainder is acceptable. Empty payloads require
 /// the frame checksum: under the legacy payload-only checksum, 16 bytes of
 /// garbage with a zero CRC would otherwise look valid.
+///
+/// Entry ids are dense and every frame is at least 16 bytes, so a real frame
+/// at offset `off` has an id of at most `prev_id + 1 + off / 16`. Candidates
+/// outside that range are rejected before their checksum is computed. Without
+/// that bound, a tail whose words read as plausible lengths cost a checksum of
+/// up to the tail's length at each offset, quadratic in the tail size.
 fn find_valid_frame_after(
     tail: &[u8],
     checksum_mode: WalChecksumMode,
-    last_id: Option<u64>,
+    prev_id: u64,
 ) -> Option<usize> {
     const FRAME_HEADER: usize = 16;
     // Offset 0 is the frame that just failed to decode.
@@ -1669,10 +1701,13 @@ fn find_valid_frame_after(
             return false;
         }
         let entry_id = u64::from_le_bytes(frame[4..12].try_into().expect("8 bytes"));
-        if last_id.is_some_and(|last| entry_id <= last) {
+        let max_id = prev_id.saturating_add(1 + (off / FRAME_HEADER) as u64);
+        if entry_id <= prev_id || entry_id > max_id {
             return false;
         }
         let checksum = u32::from_le_bytes(frame[12..16].try_into().expect("4 bytes"));
+        #[cfg(test)]
+        FRAME_SCAN_CHECKSUM_BYTES.with(|c| c.set(c.get() + len));
         checksum_mode.checksum(length, entry_id, &frame[FRAME_HEADER..len]) == checksum
     })
 }
@@ -2009,7 +2044,7 @@ impl<E> WalReader<E> {
                             if let Some(offset) = find_valid_frame_after(
                                 &bytes[start..],
                                 checksum_mode,
-                                last_seen_entry_id,
+                                tail_prev_id(last_seen_entry_id, header),
                             ) {
                                 return Err(PersistenceError::Format(format!(
                                     "WAL mid-segment corruption in segment {segment_id}: record \
@@ -4302,5 +4337,65 @@ mod tests {
             .unwrap();
         assert_eq!(id, 2);
         w3.flush().unwrap();
+    }
+
+    /// One valid entry, then a frame whose length runs past EOF, then `tail`.
+    fn torn_tail_wal(tail: &[u8]) -> Arc<dyn Directory> {
+        let dir: Arc<dyn Directory> = MemoryDirectory::arc();
+        {
+            let mut w = WalWriter::<()>::with_flush_policy(dir.clone(), FlushPolicy::PerAppend);
+            w.append_bytes(b"ok").unwrap();
+        }
+        let mut seg = Vec::new();
+        dir.open_file("wal/wal_1.log")
+            .unwrap()
+            .read_to_end(&mut seg)
+            .unwrap();
+        seg.extend_from_slice(&(u32::try_from(tail.len()).unwrap() + 64).to_le_bytes());
+        seg.extend_from_slice(&2u64.to_le_bytes());
+        seg.extend_from_slice(&0u32.to_le_bytes());
+        seg.extend_from_slice(tail);
+        dir.atomic_write("wal/wal_1.log", &seg).unwrap();
+        dir
+    }
+
+    /// The torn-tail check looks for a valid frame at every later offset. It
+    /// must not checksum a long candidate at each one: a tail whose words read
+    /// as plausible frame lengths made resume quadratic in the tail size.
+    #[test]
+    fn resume_torn_tail_scan_is_linear() {
+        for len in [4 * 1024usize, 32 * 1024] {
+            let half = u32::try_from(len / 2).unwrap().to_le_bytes();
+            let plausible: Vec<u8> = (0..len).map(|i| half[i % 4]).collect();
+            let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+            let random: Vec<u8> = (0..len)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 24) as u8
+                })
+                .collect();
+            for (shape, tail) in [("plausible lengths", plausible), ("random", random)] {
+                FRAME_SCAN_CHECKSUM_BYTES.with(|c| c.set(0));
+                let w = WalWriter::<()>::resume(torn_tail_wal(&tail)).unwrap();
+                assert_eq!(w.next_entry_id(), 2);
+                drop(w);
+                let resume_bytes = FRAME_SCAN_CHECKSUM_BYTES.with(|c| c.get());
+
+                FRAME_SCAN_CHECKSUM_BYTES.with(|c| c.set(0));
+                let replayed = WalReader::<()>::new(torn_tail_wal(&tail))
+                    .replay_bytes_best_effort()
+                    .unwrap();
+                assert_eq!(replayed.len(), 1);
+                let replay_bytes = FRAME_SCAN_CHECKSUM_BYTES.with(|c| c.get());
+
+                assert!(
+                    resume_bytes <= len && replay_bytes <= len,
+                    "{shape} tail of {len} bytes: checksummed {resume_bytes} bytes on resume, \
+                     {replay_bytes} on replay"
+                );
+            }
+        }
     }
 }

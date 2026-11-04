@@ -32,7 +32,9 @@ pub struct RecoveryOptions {
     /// If set, stop replaying WAL entries after this entry ID.
     ///
     /// Enables point-in-time recovery: replay only entries up to (and including)
-    /// the specified ID. Entries with higher IDs are ignored.
+    /// the specified ID. Entries with higher IDs are ignored. A checkpoint
+    /// that covers entries past this ID cannot be rolled back, so recovery
+    /// from it returns `InvalidState`.
     pub up_to_entry_id: Option<u64>,
 }
 
@@ -150,6 +152,15 @@ where
         Some(path) if dir.exists(path) => {
             let ckpt = CheckpointFile::new(dir.clone());
             match ckpt.read_postcard::<C>(path) {
+                Ok((last_id, _)) if options.up_to_entry_id.is_some_and(|up_to| up_to < last_id) => {
+                    // A checkpoint cannot be rolled back to an earlier entry.
+                    return Err(PersistenceError::InvalidState(format!(
+                        "point-in-time target {} is before checkpoint {path}, which covers \
+                         entries through {last_id}; recover from an older checkpoint or \
+                         without one",
+                        options.up_to_entry_id.unwrap_or_default()
+                    )));
+                }
                 Ok((last_id, checkpoint_state)) => (init(Some(checkpoint_state)), last_id),
                 Err(e) if options.ignore_corrupt_checkpoint => {
                     // Best-effort: skip corrupt checkpoint, start from empty.
