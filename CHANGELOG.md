@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-11-04
+
 ### Added
 
 - `WalWriter::open_with_options` and `WalWriter::resume_with_options` take the
