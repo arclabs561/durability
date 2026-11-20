@@ -834,6 +834,7 @@ impl<E> WalWriter<E> {
     /// Preallocation does not make writes atomic.
     ///
     /// Only effective on filesystem-backed directories (requires `file_path()`).
+    /// Segments taken from the recycle pool are not preallocated.
     pub fn set_preallocate_bytes(&mut self, bytes: u64) {
         self.preallocate_bytes = bytes;
     }
@@ -1255,20 +1256,30 @@ impl<E> WalWriter<E> {
                 start_entry_id,
                 segment_id: self.current_segment_id,
             };
-            let file = match self.recycle_pool.pop_front() {
-                Some(recycled) => self.reuse_recycled_segment(&recycled, &wal_path, header)?,
+            let (file, positioned) = match self.recycle_pool.pop_front() {
+                Some(recycled) => (
+                    self.reuse_recycled_segment(&recycled, &wal_path, header)?,
+                    false,
+                ),
                 None => {
                     let mut file = self.directory.create_file(&wal_path)?;
                     header.write(&mut file)?;
                     if self.flush_policy == FlushPolicy::PerAppend {
                         file.flush()?;
                     }
-                    file
+                    (file, true)
                 }
             };
             self.segment_created_at = Some(std::time::Instant::now());
             // Preallocate on filesystem backends to avoid block allocation on write path.
-            if self.preallocate_bytes > 0 {
+            //
+            // Only for a writer that keeps its own position. A recycled segment is
+            // reopened in append mode, where every write lands at the end of the
+            // file: extending it first would put all frames after the padding,
+            // while `current_offset` still pointed just past the header. Sealing
+            // or dropping the segment then truncated to `current_offset` and cut
+            // off every frame, including ones already fsynced.
+            if self.preallocate_bytes > 0 && positioned {
                 if let Some(fs_path) = self.directory.file_path(&wal_path) {
                     let target = self.preallocate_bytes.max(WalSegmentHeader::SIZE as u64);
                     let _ = std::fs::OpenOptions::new()
