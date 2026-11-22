@@ -159,10 +159,11 @@ durability = { version = "0.10", features = ["async"] }
 ```
 
 ```rust,no_run
+# #[cfg(feature = "async")]
+# async fn example() {
 use durability::async_dir::{AsyncDirectory, BlockingBridge};
 use durability::storage::FsDirectory;
 
-# async fn example() {
 let bridge = BlockingBridge::new(FsDirectory::new("/tmp/async-demo").unwrap());
 bridge.atomic_write("data.bin", b"hello".to_vec()).await.unwrap();
 let data = bridge.read_file("data.bin").await.unwrap();

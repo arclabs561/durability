@@ -2555,15 +2555,13 @@ mod raw_tests {
         let mut w = rotating_writer(&dir, 1);
         assert_eq!(w.current_segment_id(), 1);
 
-        // Make the outgoing segment unopenable. If rotation syncs it as it
-        // must, that surfaces as an error and poisons the writer before the
-        // next segment exists; if it defers the sync, the append succeeds.
-        use std::os::unix::fs::PermissionsExt;
-        let old = tmp.path().join("wal/wal_1.log");
-        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let result = w.append_bytes(b"rotates");
-        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(result.is_err());
+        // Unlink the open segment so the writer can still flush its handle,
+        // but the path-based durability barrier must fail even when run as root.
+        std::fs::remove_file(tmp.path().join("wal/wal_1.log")).unwrap();
+        assert!(matches!(
+            w.append_bytes(b"rotates"),
+            Err(PersistenceError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound
+        ));
         assert!(!tmp.path().join("wal/wal_2.log").exists());
         assert!(matches!(w.flush(), Err(PersistenceError::InvalidState(_))));
     }
