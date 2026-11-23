@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-11-22
+
+### Fixed
+
+- Recycled WAL segments retain acknowledged frames when filesystem preallocation
+  is enabled. Preallocation applies to newly created segments.
+- Fresh builds on Rust 1.80 resolve a compatible postcard release.
+
 ## [0.10.1] - 2026-11-04
 
 ### Added
@@ -422,5 +430,6 @@ Includes every fix in 0.7.3.
 ### Added
 - Initial release: write-ahead log with crash recovery.
 
-[Unreleased]: https://github.com/arclabs561/durability/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/arclabs561/durability/compare/v0.10.2...HEAD
+[0.10.2]: https://github.com/arclabs561/durability/compare/v0.10.1...v0.10.2
 [0.9.0]: https://github.com/arclabs561/durability/compare/v0.8.0...v0.9.0
